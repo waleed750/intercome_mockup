@@ -318,6 +318,65 @@
   }
   .btn-cmd-orange:hover:not(:disabled) { background: #2a2a40; }
 
+  .btn-cmd-green {
+    background: var(--surface2);
+    color: var(--green);
+    border: 1px solid var(--border);
+  }
+  .btn-cmd-green:hover:not(:disabled) { background: #1a3a2a; }
+  .btn-cmd-teal {
+    background: var(--surface2);
+    color: #26c6da;
+    border: 1px solid var(--border);
+  }
+  .btn-cmd-teal:hover:not(:disabled) { background: #1a2a3a; }
+  .btn-cmd-purple {
+    background: var(--surface2);
+    color: #ba68c8;
+    border: 1px solid var(--border);
+  }
+  .btn-cmd-purple:hover:not(:disabled) { background: #2a1a3a; }
+
+  .cmd-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px;
+    background: var(--bg);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+  .cmd-group-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    margin-bottom: 2px;
+  }
+  .cmd-select {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 12px;
+    font-family: 'Consolas', monospace;
+    outline: none;
+  }
+  .cmd-select:focus { border-color: var(--accent); }
+  .cmd-input {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 12px;
+    font-family: 'Consolas', monospace;
+    outline: none;
+    width: 100%;
+  }
+  .cmd-input:focus { border-color: var(--accent); }
+
   .card-hint {
     font-size: 10px;
     color: var(--text-dim);
@@ -468,14 +527,57 @@
       <div style="display:flex; flex-direction:column; gap:6px;">
         <div class="btn-row">
           <button class="btn btn-cmd btn-cmd-blue" onclick="sendCmd('GetCallInfo')">
-            <span class="icon">❓</span> GetCallInfo
+            ❓ GetCallInfo
           </button>
           <button class="btn btn-cmd btn-cmd-orange" onclick="sendCmd('deviceBusy')">
-            <span class="icon">🚫</span> DeviceBusy
+            🚫 DeviceBusy
+          </button>
+        </div>
+
+        <!-- Unlock variants -->
+        <div class="cmd-group">
+          <div class="cmd-group-label">Unlock Door</div>
+          <select id="unlockSelect" class="cmd-select">
+            <option value='{"command":"OpenDoor"}'>OpenDoor</option>
+            <option value='{"command":"OpenDoor","relay":0}'>OpenDoor + relay:0</option>
+            <option value='{"command":"Unlock"}'>Unlock</option>
+            <option value='{"command":"OpenLock","dstAddr":"999-000-1"}'>OpenLock + dstAddr</option>
+            <option value='{"command":"cmd_open_door","relay0_delay":1}'>cmd_open_door</option>
+          </select>
+          <button class="btn btn-cmd btn-cmd-green" onclick="sendRaw('unlockSelect')">
+            🔓 Send Unlock
+          </button>
+        </div>
+
+        <!-- Talk variants -->
+        <div class="cmd-group">
+          <div class="cmd-group-label">Talk / Audio</div>
+          <select id="talkSelect" class="cmd-select">
+            <option value='{"command":"StartTalk"}'>StartTalk</option>
+            <option value='{"command":"OpenTalk"}'>OpenTalk</option>
+            <option value='{"command":"Talk"}'>Talk</option>
+            <option value='{"command":"StartVoice"}'>StartVoice</option>
+            <option value='{"command":"AudioStart"}'>AudioStart</option>
+            <option value='{"command":"StartAudio"}'>StartAudio</option>
+            <option value='{"command":"OpenAudio"}'>OpenAudio</option>
+            <option value='{"command":"StartTalkback"}'>StartTalkback</option>
+            <option value='{"command":"Monitor"}'>Monitor</option>
+            <option value='{"command":"StartTalk","OtherAnswer":1}'>StartTalk + OtherAnswer</option>
+          </select>
+          <button class="btn btn-cmd btn-cmd-teal" onclick="sendRaw('talkSelect')">
+            🔊 Send Talk
+          </button>
+        </div>
+
+        <!-- Custom command -->
+        <div class="cmd-group">
+          <div class="cmd-group-label">Custom JSON</div>
+          <input type="text" id="customCmd" class="cmd-input" placeholder='{"command":"YourCommand"}'>
+          <button class="btn btn-cmd btn-cmd-purple" onclick="sendCustom()">
+            📤 Send
           </button>
         </div>
       </div>
-      <div class="card-hint">These simulate commands a real door station would send</div>
     </div>
 
     <!-- App Commands (received FROM app, shown as indicators) -->
@@ -766,6 +868,38 @@ function sendCmd(command, extra) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
+}
+
+function sendRaw(selectId) {
+  const select = document.getElementById(selectId);
+  const jsonStr = select.value;
+  try {
+    const parsed = JSON.parse(jsonStr);
+    fetch('/api/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(parsed)
+    });
+  } catch(e) {
+    alert('Invalid JSON: ' + e.message);
+  }
+}
+
+function sendCustom() {
+  const input = document.getElementById('customCmd');
+  const jsonStr = input.value.trim();
+  if (!jsonStr) return;
+  try {
+    const parsed = JSON.parse(jsonStr);
+    fetch('/api/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(parsed)
+    });
+    input.value = '';
+  } catch(e) {
+    alert('Invalid JSON: ' + e.message);
+  }
 }
 
 // Track inbound events from the app

@@ -127,9 +127,9 @@ def api_hangup():
 def api_command():
     data = request.get_json(silent=True) or {}
     command = data.get("command", "").strip()
-    extra = {k: v for k, v in data.items() if k != "command"}
     if not command:
         return jsonify({"error": "command required"}), 400
+    extra = {k: v for k, v in data.items() if k != "command"}
     if service:
         try:
             service.send_command(command, **extra)
