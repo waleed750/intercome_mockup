@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mock Door Intercom</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+<style>
+  :root {
+    --bg: #0f0f1a;
+    --surface: #1a1a2e;
+    --surface2: #222240;
+    --border: #2a2a4a;
+    --text: #e0e0f0;
+    --text-dim: #8888aa;
+    --accent: #6c63ff;
+    --green: #00c853;
+    --red: #ff1744;
+    --yellow: #ffd600;
+    --orange: #ff9100;
+    --blue: #448aff;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+
+  /* ---- header ---- */
+  .header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .header h1 {
+    font-size: 20px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .header h1 .icon { font-size: 26px; }
+  .status-badge {
+    padding: 6px 16px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    transition: all 0.3s ease;
+  }
+  .status-idle { background: #2a2a4a; color: var(--text-dim); }
+  .status-calling { background: #3d3200; color: var(--yellow); }
+  .status-connected { background: #003d1a; color: var(--green); }
+  .status-unlocked { background: #003d1a; color: var(--green); animation: pulse 1s ease 3; }
+  .status-busy { background: #3d2200; color: var(--orange); }
+
+  @keyframes pulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.08); }
+  }
+
+  /* ---- main layout ---- */
+  .main {
+    display: grid;
+    grid-template-columns: 340px 1fr;
+    gap: 0;
+    height: calc(100vh - 61px);
+  }
+
+  /* ---- sidebar ---- */
+  .sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    overflow-y: auto;
+  }
+
+  .card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+  }
+  .card-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+  }
+
+  /* ip input */
+  .ip-group {
+    display: flex;
+    gap: 8px;
+  }
+  .ip-input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    color: var(--text);
+    font-size: 15px;
+    font-family: 'Consolas', 'Fira Code', monospace;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .ip-input:focus { border-color: var(--accent); }
+
+  /* buttons */
+  .btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 12px 20px;
+    border: none;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    width: 100%;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+  .btn .icon { font-size: 18px; }
+
+  .btn-call {
+    background: linear-gradient(135deg, var(--green), #00a844);
+    color: #fff;
+  }
+  .btn-call:hover:not(:disabled) { box-shadow: 0 4px 20px rgba(0, 200, 83, 0.3); }
+
+  .btn-hangup {
+    background: linear-gradient(135deg, var(--red), #d50032);
+    color: #fff;
+  }
+  .btn-hangup:hover:not(:disabled) { box-shadow: 0 4px 20px rgba(255, 23, 68, 0.3); }
+
+  .btn-discovery {
+    background: var(--surface2);
+    color: var(--blue);
+    border: 1px solid var(--border);
+  }
+  .btn-discovery:hover:not(:disabled) { background: #2a2a50; }
+
+  .btn-clear {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    padding: 8px 14px;
+    font-size: 12px;
+  }
+  .btn-clear:hover { color: var(--text); border-color: var(--text-dim); }
+
+  .btn-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  /* stats */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .stat-box {
+    background: var(--bg);
+    border-radius: 8px;
+    padding: 10px 12px;
+    text-align: center;
+  }
+  .stat-value {
+    font-size: 20px;
+    font-weight: 700;
+    font-family: 'Consolas', monospace;
+  }
+  .stat-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+
+  /* ---- traffic panel ---- */
+  .traffic-panel {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .traffic-header {
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .traffic-header h2 {
+    font-size: 14px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .live-dot {
+    width: 8px;
+    height: 8px;
+    background: var(--green);
+    border-radius: 50%;
+    animation: blink 2s ease infinite;
+  }
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  .filter-bar {
+    display: flex;
+    gap: 4px;
+  }
+  .filter-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .filter-btn.active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  .filter-btn:hover:not(.active) { color: var(--text); border-color: var(--text-dim); }
+
+  .traffic-log {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0;
+    font-family: 'Consolas', 'Fira Code', monospace;
+    font-size: 12.5px;
+    line-height: 1.7;
+  }
+
+  .log-entry {
+    padding: 4px 20px;
+    border-bottom: 1px solid rgba(42, 42, 74, 0.4);
+    display: flex;
+    gap: 12px;
+    transition: background 0.1s;
+  }
+  .log-entry:hover { background: rgba(108, 99, 255, 0.05); }
+  .log-entry.highlight { animation: flash 1.5s ease; }
+
+  @keyframes flash {
+    0% { background: rgba(108, 99, 255, 0.2); }
+    100% { background: transparent; }
+  }
+
+  .log-time { color: var(--text-dim); flex-shrink: 0; width: 85px; }
+  .log-source {
+    flex-shrink: 0;
+    width: 80px;
+    font-weight: 600;
+    text-align: right;
+  }
+  .log-source.control { color: var(--accent); }
+  .log-source.discovery { color: var(--blue); }
+  .log-source.door { color: var(--yellow); }
+  .log-source.audio { color: var(--green); }
+  .log-source.video { color: var(--orange); }
+  .log-msg { flex: 1; word-break: break-word; }
+  .log-msg .arrow-out { color: var(--green); font-weight: bold; }
+  .log-msg .arrow-in { color: var(--blue); font-weight: bold; }
+  .log-msg .unlock { color: var(--green); font-weight: bold; }
+
+  /* direction arrows */
+  .dir-out::before { content: ">>> "; color: var(--green); font-weight: bold; }
+  .dir-in::before { content: "<<< "; color: var(--blue); font-weight: bold; }
+
+  /* scrollbar */
+  .traffic-log::-webkit-scrollbar { width: 6px; }
+  .traffic-log::-webkit-scrollbar-track { background: transparent; }
+  .traffic-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* command buttons */
+  .btn-cmd {
+    padding: 10px 14px;
+    font-size: 12px;
+  }
+  .btn-cmd-blue {
+    background: var(--surface2);
+    color: var(--blue);
+    border: 1px solid var(--border);
+  }
+  .btn-cmd-blue:hover:not(:disabled) { background: #2a2a50; }
+  .btn-cmd-orange {
+    background: var(--surface2);
+    color: var(--orange);
+    border: 1px solid var(--border);
+  }
+  .btn-cmd-orange:hover:not(:disabled) { background: #2a2a40; }
+
+  .card-hint {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-top: 8px;
+    font-style: italic;
+  }
+
+  /* event indicators */
+  .event-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+  }
+  .event-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--border);
+    transition: background 0.3s, box-shadow 0.3s;
+    flex-shrink: 0;
+  }
+  .event-dot.flash {
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+  }
+  .event-dot.flash-unlock {
+    background: var(--green);
+    box-shadow: 0 0 12px var(--green);
+    animation: pulse 0.5s ease 3;
+  }
+  .event-dot.flash-hangup {
+    background: var(--red);
+    box-shadow: 0 0 8px var(--red);
+  }
+  .event-dot.flash-busy {
+    background: var(--orange);
+    box-shadow: 0 0 8px var(--orange);
+  }
+  .event-label {
+    flex: 1;
+    font-size: 12px;
+    color: var(--text);
+  }
+  .event-count {
+    font-family: 'Consolas', monospace;
+    font-size: 12px;
+    color: var(--text-dim);
+    min-width: 20px;
+    text-align: right;
+  }
+
+  /* unit cards */
+  .unit-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    transition: border-color 0.2s;
+  }
+  .unit-card:hover { border-color: var(--accent); }
+  .unit-info { display: flex; flex-direction: column; gap: 2px; }
+  .unit-alias { font-weight: 600; font-size: 13px; color: var(--text); }
+  .unit-ip { font-size: 12px; font-family: 'Consolas', monospace; color: var(--accent); }
+  .unit-serial { font-size: 10px; color: var(--text-dim); }
+  .btn-unit-call {
+    background: var(--green);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .btn-unit-call:hover { box-shadow: 0 2px 10px rgba(0,200,83,0.3); }
+  .scanning-pulse {
+    display: inline-block;
+    width: 8px; height: 8px;
+    background: var(--blue);
+    border-radius: 50%;
+    animation: blink 2s ease infinite;
+    margin-right: 6px;
+  }
+
+  /* responsive */
+  @media (max-width: 768px) {
+    .main { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    .sidebar { border-right: none; border-bottom: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <h1><span class="icon">🚪</span> Mock Door Intercom</h1>
+  <span id="statusBadge" class="status-badge status-idle">IDLE</span>
+</div>
+
+<!-- Main -->
+<div class="main">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <!-- Discovered Units -->
+    <div class="card">
+      <div class="card-title">Discovered Indoor Units</div>
+      <div id="unitsList" style="font-size:13px; color:var(--text-dim);">
+        Scanning... discovery probes are broadcasting automatically.
+      </div>
+    </div>
+
+    <!-- Connection -->
+    <div class="card">
+      <div class="card-title">Manual IP (optional)</div>
+      <div class="ip-group">
+        <input type="text" id="ipInput" class="ip-input" placeholder="Auto-detected or enter manually">
+      </div>
+    </div>
+
+    <!-- Call Actions -->
+    <div class="card">
+      <div class="card-title">Call</div>
+      <div style="display:flex; flex-direction:column; gap:8px;">
+        <div class="btn-row">
+          <button id="btnCall" class="btn btn-call" onclick="doCall()">
+            <span class="icon">📞</span> Call
+          </button>
+          <button id="btnHangup" class="btn btn-hangup" onclick="doHangup()" disabled>
+            <span class="icon">📵</span> Hang Up
+          </button>
+        </div>
+        <button id="btnDiscovery" class="btn btn-discovery" onclick="doDiscovery()">
+          <span class="icon">📡</span> Send Discovery
+        </button>
+      </div>
+    </div>
+
+    <!-- Door Commands (sent TO the app) -->
+    <div class="card">
+      <div class="card-title">Door → App Commands</div>
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        <div class="btn-row">
+          <button class="btn btn-cmd btn-cmd-blue" onclick="sendCmd('GetCallInfo')">
+            <span class="icon">❓</span> GetCallInfo
+          </button>
+          <button class="btn btn-cmd btn-cmd-orange" onclick="sendCmd('deviceBusy')">
+            <span class="icon">🚫</span> DeviceBusy
+          </button>
+        </div>
+      </div>
+      <div class="card-hint">These simulate commands a real door station would send</div>
+    </div>
+
+    <!-- App Commands (received FROM app, shown as indicators) -->
+    <div class="card">
+      <div class="card-title">App → Door Events</div>
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        <div class="event-row">
+          <span class="event-dot" id="evtAnswer"></span>
+          <span class="event-label">Answer</span>
+          <span class="event-count" id="evtAnswerCount">0</span>
+        </div>
+        <div class="event-row">
+          <span class="event-dot" id="evtOpenDoor"></span>
+          <span class="event-label">OpenDoor (Unlock)</span>
+          <span class="event-count" id="evtOpenDoorCount">0</span>
+        </div>
+        <div class="event-row">
+          <span class="event-dot" id="evtHangUp"></span>
+          <span class="event-label">HangUp</span>
+          <span class="event-count" id="evtHangUpCount">0</span>
+        </div>
+        <div class="event-row">
+          <span class="event-dot" id="evtStartTalk"></span>
+          <span class="event-label">StartTalk</span>
+          <span class="event-count" id="evtStartTalkCount">0</span>
+        </div>
+        <div class="event-row">
+          <span class="event-dot" id="evtDeviceBusy"></span>
+          <span class="event-label">DeviceBusy</span>
+          <span class="event-count" id="evtDeviceBusyCount">0</span>
+        </div>
+      </div>
+      <div class="card-hint">Events received from the Android app during a call</div>
+    </div>
+
+    <!-- Stats -->
+    <div class="card">
+      <div class="card-title">Traffic Stats</div>
+      <div class="stats-grid">
+        <div class="stat-box">
+          <div class="stat-value" id="statControl">0</div>
+          <div class="stat-label">Control</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-value" id="statDiscovery">0</div>
+          <div class="stat-label">Discovery</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-value" id="statVideo">0</div>
+          <div class="stat-label">Video</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-value" id="statAudio">0</div>
+          <div class="stat-label">Audio</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Info -->
+    <div class="card">
+      <div class="card-title">Protocol</div>
+      <div style="font-size:12px; color:var(--text-dim); line-height:1.6;">
+        <div>UDP Discovery: <b style="color:var(--text)">port 8089</b></div>
+        <div>TCP Call: <b style="color:var(--text)">port 8189</b></div>
+        <div>Video: <b style="color:var(--text)">H.264 1080p (0xBB)</b></div>
+        <div>Audio: <b style="color:var(--text)">G.711 A-law (0xCC)</b></div>
+        <div>Control: <b style="color:var(--text)">JSON (0xAA)</b></div>
+        <div style="margin-top:6px;">
+          FFmpeg: <b style="color:{{ 'var(--green)' if has_ffmpeg else 'var(--red)' }}">
+            {{ 'Available' if has_ffmpeg else 'Not found' }}
+          </b>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Traffic -->
+  <div class="traffic-panel">
+    <div class="traffic-header">
+      <h2><span class="live-dot"></span> Live Traffic</h2>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <div class="filter-bar">
+          <button class="filter-btn active" data-filter="all" onclick="setFilter('all', this)">All</button>
+          <button class="filter-btn" data-filter="CONTROL" onclick="setFilter('CONTROL', this)">Control</button>
+          <button class="filter-btn" data-filter="DISCOVERY" onclick="setFilter('DISCOVERY', this)">Discovery</button>
+          <button class="filter-btn" data-filter="DOOR" onclick="setFilter('DOOR', this)">Door</button>
+        </div>
+        <button class="btn btn-clear" onclick="clearLog()">Clear</button>
+        <label style="font-size:11px; color:var(--text-dim); display:flex; align-items:center; gap:4px;">
+          <input type="checkbox" id="autoScroll" checked> Auto-scroll
+        </label>
+      </div>
+    </div>
+    <div class="traffic-log" id="trafficLog"></div>
+  </div>
+</div>
+
+<script>
+const socket = io();
+let activeFilter = 'all';
+let stats = { CONTROL: 0, DISCOVERY: 0, VIDEO: 0, AUDIO: 0 };
+
+let discoveredUnits = {};
+
+socket.on('connect', () => console.log('WebSocket connected'));
+
+socket.on('unit_discovered', unit => {
+  discoveredUnits[unit.ip] = unit;
+  renderUnits();
+});
+
+socket.on('log', entry => {
+  addLogEntry(entry);
+  updateStats(entry.source);
+
+  // Flash event indicators for inbound commands
+  const msg = entry.message;
+  if (msg.startsWith('<<<')) {
+    if (msg.includes('Answer')) flashEvent('Answer');
+    if (msg.includes('OpenDoor')) flashEvent('OpenDoor');
+    if (msg.includes('HangUp')) flashEvent('HangUp');
+    if (msg.includes('StartTalk')) flashEvent('StartTalk');
+    if (msg.includes('deviceBusy')) flashEvent('deviceBusy');
+  }
+  if (msg.includes('DOOR UNLOCKED')) flashEvent('OpenDoor');
+});
+
+socket.on('status', data => {
+  setStatus(data.status, data.color);
+});
+
+function addLogEntry(entry) {
+  const log = document.getElementById('trafficLog');
+  const div = document.createElement('div');
+  div.className = 'log-entry highlight';
+  div.dataset.source = entry.source;
+
+  const sourceClass = entry.source.toLowerCase();
+  let msgHtml = escapeHtml(entry.message);
+
+  if (msgHtml.startsWith('&gt;&gt;&gt;')) {
+    msgHtml = '<span class="arrow-out">&gt;&gt;&gt;</span>' + msgHtml.slice(12);
+  } else if (msgHtml.startsWith('&lt;&lt;&lt;')) {
+    msgHtml = '<span class="arrow-in">&lt;&lt;&lt;</span>' + msgHtml.slice(12);
+  }
+  if (msgHtml.includes('DOOR UNLOCKED')) {
+    msgHtml = '<span class="unlock">' + msgHtml + '</span>';
+  }
+
+  div.innerHTML = `
+    <span class="log-time">${entry.time}</span>
+    <span class="log-source ${sourceClass}">${entry.source}</span>
+    <span class="log-msg">${msgHtml}</span>
+  `;
+
+  if (activeFilter !== 'all' && entry.source !== activeFilter) {
+    div.style.display = 'none';
+  }
+
+  log.appendChild(div);
+
+  // keep max 500 entries in DOM
+  while (log.children.length > 500) log.removeChild(log.firstChild);
+
+  if (document.getElementById('autoScroll').checked) {
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+function updateStats(source) {
+  const key = source.toUpperCase();
+  if (key in stats) {
+    stats[key]++;
+  } else if (key === 'DOOR') {
+    stats.CONTROL++;
+  }
+  document.getElementById('statControl').textContent = stats.CONTROL;
+  document.getElementById('statDiscovery').textContent = stats.DISCOVERY;
+  document.getElementById('statVideo').textContent = stats.VIDEO;
+  document.getElementById('statAudio').textContent = stats.AUDIO;
+}
+
+function setFilter(filter, btn) {
+  activeFilter = filter;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+
+  document.querySelectorAll('.log-entry').forEach(el => {
+    if (filter === 'all' || el.dataset.source === filter) {
+      el.style.display = '';
+    } else {
+      el.style.display = 'none';
+    }
+  });
+}
+
+function clearLog() {
+  document.getElementById('trafficLog').innerHTML = '';
+  stats = { CONTROL: 0, DISCOVERY: 0, VIDEO: 0, AUDIO: 0 };
+  document.getElementById('statControl').textContent = '0';
+  document.getElementById('statDiscovery').textContent = '0';
+  document.getElementById('statVideo').textContent = '0';
+  document.getElementById('statAudio').textContent = '0';
+}
+
+function renderUnits() {
+  const container = document.getElementById('unitsList');
+  const ips = Object.keys(discoveredUnits);
+  if (ips.length === 0) {
+    container.innerHTML = '<span class="scanning-pulse"></span> Scanning... discovery probes are broadcasting automatically.';
+    return;
+  }
+  container.innerHTML = ips.map(ip => {
+    const u = discoveredUnits[ip];
+    return `<div class="unit-card">
+      <div class="unit-info">
+        <span class="unit-alias">${escapeHtml(u.alias)}</span>
+        <span class="unit-ip">${escapeHtml(u.ip)}</span>
+        <span class="unit-serial">${escapeHtml(u.serial)}</span>
+      </div>
+      <button class="btn-unit-call" onclick="doCallUnit('${escapeHtml(u.ip)}')">Call</button>
+    </div>`;
+  }).join('');
+}
+
+function doCallUnit(ip) {
+  document.getElementById('ipInput').value = ip;
+  doCall();
+}
+
+function doCall() {
+  let ip = document.getElementById('ipInput').value.trim();
+  // Auto-pick first discovered unit if no IP entered
+  if (!ip) {
+    const ips = Object.keys(discoveredUnits);
+    if (ips.length > 0) {
+      ip = ips[0];
+      document.getElementById('ipInput').value = ip;
+    }
+  }
+  document.getElementById('btnCall').disabled = true;
+  document.getElementById('btnHangup').disabled = false;
+  fetch('/api/call', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ip })
+  });
+}
+
+function doHangup() {
+  fetch('/api/hangup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then(() => {
+      setStatus('IDLE', 'gray');
+    });
+}
+
+function setStatus(status, color) {
+  const badge = document.getElementById('statusBadge');
+  badge.textContent = status;
+  badge.className = 'status-badge';
+  switch (color) {
+    case 'green':  badge.classList.add(status.includes('UNLOCK') ? 'status-unlocked' : 'status-connected'); break;
+    case 'yellow': badge.classList.add('status-calling'); break;
+    case 'orange': badge.classList.add('status-busy'); break;
+    default:       badge.classList.add('status-idle');
+  }
+  const inCall = ['CALLING...', 'CONNECTED'].includes(status);
+  document.getElementById('btnCall').disabled = inCall;
+  document.getElementById('btnHangup').disabled = !inCall;
+  if (status === 'IDLE') {
+    document.getElementById('btnCall').disabled = false;
+    document.getElementById('btnHangup').disabled = true;
+  }
+}
+
+function doDiscovery() {
+  fetch('/api/discovery', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}'
+  });
+}
+
+function sendCmd(command, extra) {
+  const payload = { command, ...(extra || {}) };
+  fetch('/api/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+}
+
+// Track inbound events from the app
+const eventCounts = { Answer: 0, OpenDoor: 0, HangUp: 0, StartTalk: 0, deviceBusy: 0 };
+
+function flashEvent(name) {
+  const dotId = 'evt' + name.replace(/\s/g, '');
+  const countId = dotId + 'Count';
+  const dot = document.getElementById(dotId);
+  const counter = document.getElementById(countId);
+  if (!dot || !counter) return;
+
+  if (eventCounts[name] !== undefined) {
+    eventCounts[name]++;
+    counter.textContent = eventCounts[name];
+  }
+
+  let flashClass = 'flash';
+  if (name === 'OpenDoor') flashClass = 'flash-unlock';
+  else if (name === 'HangUp') flashClass = 'flash-hangup';
+  else if (name === 'deviceBusy') flashClass = 'flash-busy';
+
+  dot.classList.add(flashClass);
+  setTimeout(() => dot.classList.remove(flashClass), 2000);
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// Enter key triggers call
+document.getElementById('ipInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doCall();
+});
+
+// Load existing logs on connect
+fetch('/api/logs').then(r => r.json()).then(logs => {
+  logs.forEach(entry => addLogEntry(entry));
+});
+
+// Start discovery automatically and poll for units
+fetch('/api/discovery', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+
+// Poll for discovered units + call status every 3s
+setInterval(() => {
+  fetch('/api/units').then(r => r.json()).then(units => {
+    units.forEach(u => { discoveredUnits[u.ip] = u; });
+    renderUnits();
+  });
+  fetch('/api/status').then(r => r.json()).then(s => {
+    // Sync button state with actual call state
+    if (!s.in_call) {
+      document.getElementById('btnCall').disabled = false;
+      document.getElementById('btnHangup').disabled = true;
+    } else {
+      document.getElementById('btnCall').disabled = true;
+      document.getElementById('btnHangup').disabled = false;
+    }
+  });
+}, 3000);
+</script>
+</body>
+</html>

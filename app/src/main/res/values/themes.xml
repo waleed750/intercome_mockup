@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Base XML theme. Colors and typography are driven by the Compose theme
+      (see ui/theme). This only sets window-level attributes so the call UI
+      paints correctly before Compose takes over.
+    -->
+    <style name="Theme.SmartIntercom" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/black</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
+</resources>

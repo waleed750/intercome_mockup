@@ -1,0 +1,7 @@
+opencv-python>=4.8
+numpy>=1.24
+Pillow>=10.0
+flask>=3.0
+flask-socketio>=5.3
+imageio-ffmpeg>=0.5.1
+sounddevice>=0.5

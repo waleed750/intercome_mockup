@@ -1,0 +1,17 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- House outline -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,30 L78,50 L78,78 L62,78 L62,62 L46,62 L46,78 L30,78 L30,50 Z" />
+    <!-- Camera lens (door station) -->
+    <path
+        android:fillColor="#9CCCE0"
+        android:pathData="M54,44 m-7,0 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0" />
+    <path
+        android:fillColor="#0B3D5B"
+        android:pathData="M54,44 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0" />
+</vector>

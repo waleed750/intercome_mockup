@@ -1,0 +1,64 @@
+<resources>
+    <string name="app_name">Smart Intercom</string>
+
+    <!-- Idle / Home -->
+    <string name="idle_ready">Ready — listening for the door</string>
+    <string name="idle_not_connected">Not connected to door network</string>
+    <string name="idle_wrong_wifi">Connect to your home Wi-Fi to receive door calls.</string>
+    <string name="idle_paired_with">Paired with %1$s</string>
+    <string name="idle_this_unit">This unit: %1$s</string>
+    <string name="open_settings">Settings</string>
+
+    <!-- Incoming -->
+    <string name="incoming_calling">%1$s is calling…</string>
+    <string name="incoming_default_caller">Front Door</string>
+    <string name="incoming_status">Incoming call…</string>
+    <string name="action_answer">Answer</string>
+    <string name="action_decline">Decline</string>
+    <string name="connecting_to_door">Connecting to door…</string>
+
+    <!-- In-call -->
+    <string name="status_connected">Connected</string>
+    <string name="action_unlock">Unlock</string>
+    <string name="action_mute">Mute</string>
+    <string name="action_unmute">Unmute</string>
+    <string name="action_end">End</string>
+    <string name="unlock_confirm">Door unlocked</string>
+    <string name="muted_banner">You\'re muted</string>
+    <string name="call_ended">Call ended</string>
+    <string name="video_unavailable">Video unavailable</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_identity">Device identity</string>
+    <string name="settings_unit_name">Unit name</string>
+    <string name="settings_address">Address (dstAddr)</string>
+    <string name="settings_serial">Serial</string>
+    <string name="settings_door">Paired door</string>
+    <string name="settings_permissions">Permissions</string>
+    <string name="settings_about">About</string>
+    <string name="settings_version">Version %1$s</string>
+    <string name="perm_mic">Microphone</string>
+    <string name="perm_notifications">Notifications</string>
+    <string name="perm_battery">Battery optimization exemption</string>
+    <string name="perm_granted">Granted</string>
+    <string name="perm_missing">Action needed</string>
+    <string name="perm_fix">Fix</string>
+    <string name="save">Save</string>
+
+    <!-- Permission rationale -->
+    <string name="rationale_mic">Allow microphone to talk to visitors at the door.</string>
+    <string name="rationale_notifications">Notifications are required for incoming calls to ring full-screen.</string>
+    <string name="warn_notifications_off">Notifications are off — calls may not ring full-screen.</string>
+    <string name="warn_battery">Battery optimization may stop calls from arriving. Tap to exempt this app.</string>
+
+    <!-- Notifications -->
+    <string name="notif_channel_calls">Incoming calls</string>
+    <string name="notif_channel_calls_desc">Full-screen ringing for door calls</string>
+    <string name="notif_channel_service">Listening for the door</string>
+    <string name="notif_channel_service_desc">Keeps the intercom ready to receive calls</string>
+    <string name="notif_listening_title">Smart Intercom</string>
+    <string name="notif_listening_text">Listening for the door</string>
+    <string name="notif_incoming_title">%1$s</string>
+    <string name="notif_incoming_text">Incoming call</string>
+</resources>
