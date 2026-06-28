@@ -1,0 +1,1 @@
+enum IntercomMode { panel, mobile }

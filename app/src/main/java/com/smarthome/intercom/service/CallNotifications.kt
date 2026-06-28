@@ -84,7 +84,7 @@ object CallNotifications {
             .addAction(
                 R.drawable.ic_call_notification,
                 context.getString(R.string.action_answer),
-                servicePendingIntent(context, IntercomService.ACTION_ANSWER, REQ_ANSWER),
+                answerIntent(context),
             )
             .build()
 
@@ -101,6 +101,30 @@ object CallNotifications {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
     }
+
+    /**
+     * Answer button: opens the Activity with EXTRA_ANSWER_ON_OPEN=true.
+     * The Activity reads the extra and calls controller.answer().
+     * This works even when the app is killed because PendingIntent.getActivity
+     * is allowed to start an activity from a high-priority notification.
+     */
+    private fun answerIntent(context: Context): PendingIntent {
+        val intent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(MainActivity.EXTRA_FROM_CALL, true)
+            putExtra(EXTRA_ANSWER_ON_OPEN, true)
+        }
+        return PendingIntent.getActivity(
+            context,
+            REQ_ANSWER,
+            intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+    }
+
+    const val EXTRA_ANSWER_ON_OPEN = "com.smarthome.intercom.ANSWER_ON_OPEN"
 
     private fun servicePendingIntent(context: Context, action: String, requestCode: Int): PendingIntent {
         val intent = Intent(context, IntercomService::class.java).setAction(action)

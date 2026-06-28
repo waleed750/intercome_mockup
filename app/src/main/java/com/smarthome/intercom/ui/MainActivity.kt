@@ -1,9 +1,13 @@
 package com.smarthome.intercom.ui
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -32,6 +36,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.smarthome.intercom.call.CallPhase
+import com.smarthome.intercom.service.CallNotifications
 import com.smarthome.intercom.service.IntercomService
 import com.smarthome.intercom.ui.screens.IdleScreen
 import com.smarthome.intercom.ui.screens.InCallScreen
@@ -68,11 +73,35 @@ class MainActivity : ComponentActivity() {
 
         IntercomService.start(this)
         requestStartupPermissions()
+        requestBatteryOptimizationExemption()
+        handleAnswerIntent(intent)
 
         setContent {
             IntercomTheme {
                 IntercomApp(viewModel)
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleAnswerIntent(intent)
+    }
+
+    private fun handleAnswerIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(CallNotifications.EXTRA_ANSWER_ON_OPEN, false) == true) {
+            intent.removeExtra(CallNotifications.EXTRA_ANSWER_ON_OPEN)
+            viewModel.answer()
+        }
+    }
+
+    private fun requestBatteryOptimizationExemption() {
+        val pm = getSystemService(PowerManager::class.java)
+        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:$packageName")
+            }
+            startActivity(intent)
         }
     }
 

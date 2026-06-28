@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Intercom Example",
+      "request": "launch",
+      "type": "dart",
+      "cwd": "packages/intercom/example",
+      "program": "lib/main.dart"
+    },
+    {
+      "name": "Intercom Package Tests",
+      "request": "launch",
+      "type": "dart",
+      "cwd": "packages/intercom",
+      "program": "test"
+    }
+  ]
+}

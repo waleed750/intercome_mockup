@@ -25,6 +25,7 @@
 
     <!-- Survive Doze to receive calls -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:name=".IntercomApplication"
@@ -54,6 +55,15 @@
             android:name=".service.IntercomService"
             android:exported="false"
             android:foregroundServiceType="microphone|connectedDevice" />
+
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
     </application>
 

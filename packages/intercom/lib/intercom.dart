@@ -1,0 +1,21 @@
+library intercom;
+
+export 'src/call/call_controller.dart';
+export 'src/call/call_phase.dart';
+export 'src/call/call_ui_state.dart';
+export 'src/background/android_foreground_service.dart';
+export 'src/config/device_config.dart';
+export 'src/config/device_identity.dart';
+export 'src/intercom_mode.dart';
+export 'src/intercom_module.dart';
+export 'src/notifications/intercom_notification_handler.dart';
+export 'src/protocol/alaw_codec.dart';
+export 'src/protocol/commands.dart';
+export 'src/protocol/discovery.dart';
+export 'src/protocol/frame.dart';
+export 'src/protocol/frame_parser.dart';
+export 'src/ui/screens/add_intercom_screen.dart';
+export 'src/ui/screens/idle_screen.dart';
+export 'src/ui/screens/in_call_screen.dart';
+export 'src/ui/screens/incoming_call_screen.dart';
+export 'src/ui/theme/intercom_theme.dart';
