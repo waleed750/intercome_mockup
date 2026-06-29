@@ -428,7 +428,7 @@
       "languageVersion": "3.8"
     },
     {
-      "name": "intercom",
+      "name": "intercom_core",
       "rootUri": "../",
       "packageUri": "lib/",
       "languageVersion": "3.4"
