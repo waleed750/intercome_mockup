@@ -87,7 +87,7 @@
     },
     {
       "name": "flutter",
-      "rootUri": "file:///C:/Users/dedoa/.puro/envs/master/flutter/packages/flutter",
+      "rootUri": "file:///C:/Users/dedoa/.puro/envs/stable/flutter/packages/flutter",
       "packageUri": "lib/",
       "languageVersion": "3.8"
     },
@@ -117,13 +117,13 @@
     },
     {
       "name": "flutter_test",
-      "rootUri": "file:///C:/Users/dedoa/.puro/envs/master/flutter/packages/flutter_test",
+      "rootUri": "file:///C:/Users/dedoa/.puro/envs/stable/flutter/packages/flutter_test",
       "packageUri": "lib/",
       "languageVersion": "3.8"
     },
     {
       "name": "flutter_web_plugins",
-      "rootUri": "file:///C:/Users/dedoa/.puro/envs/master/flutter/packages/flutter_web_plugins",
+      "rootUri": "file:///C:/Users/dedoa/.puro/envs/stable/flutter/packages/flutter_web_plugins",
       "packageUri": "lib/",
       "languageVersion": "3.8"
     },
@@ -177,9 +177,9 @@
     },
     {
       "name": "meta",
-      "rootUri": "file:///C:/Users/dedoa/.puro/shared/pub_cache/hosted/pub.dev/meta-1.16.0",
+      "rootUri": "file:///C:/Users/dedoa/.puro/shared/pub_cache/hosted/pub.dev/meta-1.17.0",
       "packageUri": "lib/",
-      "languageVersion": "2.12"
+      "languageVersion": "3.5"
     },
     {
       "name": "nested",
@@ -321,7 +321,7 @@
     },
     {
       "name": "sky_engine",
-      "rootUri": "file:///C:/Users/dedoa/.puro/envs/master/flutter/bin/cache/pkg/sky_engine",
+      "rootUri": "file:///C:/Users/dedoa/.puro/envs/stable/flutter/bin/cache/pkg/sky_engine",
       "packageUri": "lib/",
       "languageVersion": "3.8"
     },
@@ -357,7 +357,7 @@
     },
     {
       "name": "test_api",
-      "rootUri": "file:///C:/Users/dedoa/.puro/shared/pub_cache/hosted/pub.dev/test_api-0.7.6",
+      "rootUri": "file:///C:/Users/dedoa/.puro/shared/pub_cache/hosted/pub.dev/test_api-0.7.7",
       "packageUri": "lib/",
       "languageVersion": "3.5"
     },
@@ -435,8 +435,8 @@
     }
   ],
   "generator": "pub",
-  "generatorVersion": "3.9.2",
-  "flutterRoot": "file:///C:/Users/dedoa/.puro/envs/master/flutter",
-  "flutterVersion": "3.35.6",
+  "generatorVersion": "3.10.7",
+  "flutterRoot": "file:///C:/Users/dedoa/.puro/envs/stable/flutter",
+  "flutterVersion": "3.38.6",
   "pubCache": "file:///C:/Users/dedoa/.puro/shared/pub_cache"
 }

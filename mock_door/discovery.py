@@ -40,6 +40,8 @@ def _get_all_broadcast_addresses() -> list[str]:
 @dataclass
 class IndoorUnit:
     ip: str
+    udp_ip: str
+    reported_ip: str
     alias: str
     serial: str
     dst_addr: str
@@ -147,8 +149,12 @@ class DiscoveryBroadcaster:
 
                 # Accept discovery replies from indoor units
                 if command == "cmd_reply_get_device_info":
+                    reported_ip = str(msg.get("localIp") or msg.get("ip") or "").strip()
+                    unit_ip = reported_ip if _is_usable_ipv4(reported_ip) else addr[0]
                     unit = IndoorUnit(
-                        ip=addr[0],
+                        ip=unit_ip,
+                        udp_ip=addr[0],
+                        reported_ip=reported_ip,
                         alias=msg.get("alias", "Unknown"),
                         serial=msg.get("serial", ""),
                         dst_addr=msg.get("dstAddr", ""),
@@ -159,7 +165,16 @@ class DiscoveryBroadcaster:
                         self.discovered_units[unit.ip] = unit
 
                     if is_new:
-                        LOG.info("NEW indoor unit found: %s (%s) at %s", unit.alias, unit.serial, unit.ip)
+                        if unit.reported_ip and unit.reported_ip != unit.udp_ip:
+                            LOG.info(
+                                "NEW indoor unit found: %s (%s) at %s (UDP source %s)",
+                                unit.alias,
+                                unit.serial,
+                                unit.ip,
+                                unit.udp_ip,
+                            )
+                        else:
+                            LOG.info("NEW indoor unit found: %s (%s) at %s", unit.alias, unit.serial, unit.ip)
                     else:
                         LOG.debug("Indoor unit refreshed: %s at %s", unit.alias, unit.ip)
 
@@ -176,3 +191,11 @@ class DiscoveryBroadcaster:
         finally:
             if sock:
                 sock.close()
+
+
+def _is_usable_ipv4(value: str) -> bool:
+    try:
+        ip = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        return False
+    return not (ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified)

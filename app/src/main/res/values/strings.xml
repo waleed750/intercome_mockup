@@ -33,6 +33,8 @@
     <string name="settings_identity">Device identity</string>
     <string name="settings_unit_name">Unit name</string>
     <string name="settings_address">Address (dstAddr)</string>
+    <string name="settings_address_hint">Enter a number from 1 to 999</string>
+    <string name="settings_address_error">Address must be between 1 and 999</string>
     <string name="settings_serial">Serial</string>
     <string name="settings_door">Paired door</string>
     <string name="settings_permissions">Permissions</string>

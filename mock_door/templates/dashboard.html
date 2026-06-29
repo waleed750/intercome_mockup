@@ -149,6 +149,9 @@
   }
   .btn-hangup:hover:not(:disabled) { box-shadow: 0 4px 20px rgba(255, 23, 68, 0.3); }
 
+  .ffmpeg-ok { color: var(--green); }
+  .ffmpeg-missing { color: var(--red); }
+
   .btn-discovery {
     background: var(--surface2);
     color: var(--blue);
@@ -646,7 +649,7 @@
         <div>Audio: <b style="color:var(--text)">G.711 A-law (0xCC)</b></div>
         <div>Control: <b style="color:var(--text)">JSON (0xAA)</b></div>
         <div style="margin-top:6px;">
-          FFmpeg: <b style="color:{{ 'var(--green)' if has_ffmpeg else 'var(--red)' }}">
+          FFmpeg: <b class="{{ 'ffmpeg-ok' if has_ffmpeg else 'ffmpeg-missing' }}">
             {{ 'Available' if has_ffmpeg else 'Not found' }}
           </b>
         </div>
@@ -796,6 +799,10 @@ function renderUnits() {
       <div class="unit-info">
         <span class="unit-alias">${escapeHtml(u.alias)}</span>
         <span class="unit-ip">${escapeHtml(u.ip)}</span>
+        ${u.reported_ip && u.udp_ip && u.reported_ip !== u.udp_ip
+          ? `<span class="unit-serial">UDP source: ${escapeHtml(u.udp_ip)}</span>`
+          : ''}
+        ${u.dst_addr ? `<span class="unit-serial">Address: ${escapeHtml(u.dst_addr)}</span>` : ''}
         <span class="unit-serial">${escapeHtml(u.serial)}</span>
       </div>
       <button class="btn-unit-call" onclick="doCallUnit('${escapeHtml(u.ip)}')">Call</button>

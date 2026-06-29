@@ -20,8 +20,7 @@ final class _IntercomExampleAppState extends State<IntercomExampleApp>
   CallController? _activeController;
 
   Future<CallController> _loadController() async {
-    final controller = await IntercomModule.init(mode: IntercomMode.panel)
-        .timeout(const Duration(seconds: 8));
+    final controller = await IntercomModule.init(mode: IntercomMode.panel);
     _activeController = controller;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       controller.checkPendingBackgroundCall();
@@ -65,7 +64,10 @@ final class _IntercomExampleAppState extends State<IntercomExampleApp>
             );
           }
           if (snapshot.hasError) {
-            return _StartupError(error: snapshot.error);
+            return _StartupError(
+              error: snapshot.error,
+              stackTrace: snapshot.stackTrace,
+            );
           }
           return const _StartupLoading();
         },
@@ -86,19 +88,22 @@ final class _StartupLoading extends StatelessWidget {
 }
 
 final class _StartupError extends StatelessWidget {
-  const _StartupError({required this.error});
+  const _StartupError({required this.error, this.stackTrace});
 
   final Object? error;
+  final StackTrace? stackTrace;
 
   @override
   Widget build(BuildContext context) {
+    final trace = stackTrace?.toString().split('\n').take(6).join('\n');
     return Scaffold(
       body: SafeArea(
         child: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
             child: Text(
-              'Intercom startup failed\n$error',
+              'Intercom startup failed\n$error'
+              '${trace == null || trace.isEmpty ? '' : '\n\n$trace'}',
               textAlign: TextAlign.center,
             ),
           ),

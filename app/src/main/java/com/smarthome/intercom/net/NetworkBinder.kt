@@ -10,14 +10,13 @@ import java.net.Inet4Address
 import java.net.Socket
 
 /**
- * Keeps intercom traffic on the home Wi-Fi and reachable while idle.
+ * Keeps intercom traffic on the local network and reachable while idle.
  *
- *  - Resolves the current Wi-Fi network and its IPv4 address so sockets bind to
- *    the LAN interface only (never mobile data — satisfies SEC-1 and the
- *    "don't escape to mobile data" requirement).
- *  - Holds a [WifiManager.MulticastLock] so broadcast discovery probes are
- *    delivered, and a high-perf [WifiManager.WifiLock] so Wi-Fi stays awake
- *    during a call.
+ *  - Resolves the current LAN network (Wi-Fi or Ethernet) and its IPv4 address
+ *    so sockets bind to the LAN interface only (never mobile data — SEC-1).
+ *  - On Wi-Fi: holds a [WifiManager.MulticastLock] so broadcast discovery probes
+ *    are delivered, and a high-perf [WifiManager.WifiLock] so Wi-Fi stays awake.
+ *  - On Ethernet (e.g. PX30 panels): locks are skipped since they're unnecessary.
  */
 class NetworkBinder(context: Context) {
 
@@ -25,20 +24,23 @@ class NetworkBinder(context: Context) {
     private val connectivity =
         appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private val wifi =
-        appContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
-    /** The active Wi-Fi [Network], or null if not connected to Wi-Fi. */
-    fun wifiNetwork(): Network? = connectivity.allNetworks.firstOrNull { net ->
+    /** The active LAN [Network] — prefers Wi-Fi, falls back to Ethernet. */
+    fun lanNetwork(): Network? = connectivity.allNetworks.firstOrNull { net ->
         connectivity.getNetworkCapabilities(net)
             ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+    } ?: connectivity.allNetworks.firstOrNull { net ->
+        connectivity.getNetworkCapabilities(net)
+            ?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true
     }
 
-    /** This device's IPv4 address on Wi-Fi, used to bind listening sockets. */
-    fun wifiIpv4Address(): Inet4Address? {
-        val net = wifiNetwork() ?: return null
+    /** This device's IPv4 address on the LAN, used to bind listening sockets. */
+    fun lanIpv4Address(): Inet4Address? {
+        val net = lanNetwork() ?: return null
         val props = connectivity.getLinkProperties(net) ?: return null
         return props.linkAddresses
             .map { it.address }
@@ -46,7 +48,13 @@ class NetworkBinder(context: Context) {
             .firstOrNull { !it.isLoopbackAddress && !it.isLinkLocalAddress }
     }
 
-    fun isOnWifi(): Boolean = wifiNetwork() != null
+    fun isOnLan(): Boolean = lanNetwork() != null
+
+    /** Whether the active LAN network is Wi-Fi (vs Ethernet). */
+    private fun isWifi(): Boolean = connectivity.allNetworks.any { net ->
+        connectivity.getNetworkCapabilities(net)
+            ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+    }
 
     /**
      * Human-readable dump of every network the OS currently exposes to us, with
@@ -73,26 +81,32 @@ class NetworkBinder(context: Context) {
         }
     }
 
-    /** Pins a UDP socket to the Wi-Fi network so its traffic can't leak to cellular. */
-    fun bindToWifi(socket: DatagramSocket) {
-        wifiNetwork()?.bindSocket(socket)
+    /** Pins a UDP socket to the LAN network so its traffic can't leak to cellular. */
+    fun bindToLan(socket: DatagramSocket) {
+        lanNetwork()?.bindSocket(socket)
     }
 
-    /** Pins a TCP socket to the Wi-Fi network. */
-    fun bindToWifi(socket: Socket) {
-        wifiNetwork()?.bindSocket(socket)
+    /** Pins a TCP socket to the LAN network. */
+    fun bindToLan(socket: Socket) {
+        lanNetwork()?.bindSocket(socket)
     }
 
     @Suppress("DEPRECATION")
     fun acquireLocks() {
+        // Wi-Fi locks are only needed (and only safe to create) on Wi-Fi.
+        // Ethernet panels (e.g. PX30) don't need them and may not have
+        // WifiManager at all.
+        val wm = wifi ?: return
+        if (!isWifi()) return
+
         if (multicastLock == null) {
-            multicastLock = wifi.createMulticastLock(MULTICAST_LOCK_TAG).apply {
+            multicastLock = wm.createMulticastLock(MULTICAST_LOCK_TAG).apply {
                 setReferenceCounted(false)
                 acquire()
             }
         }
         if (wifiLock == null) {
-            wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, WIFI_LOCK_TAG).apply {
+            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, WIFI_LOCK_TAG).apply {
                 setReferenceCounted(false)
                 acquire()
             }

@@ -12,6 +12,7 @@ final class CallUiState {
     this.transientMessage,
     this.unitName = '',
     this.pairedDoor = 'Front Door',
+    this.localIpAddress,
     this.tcpServerListening = false,
     this.discoveryListening = false,
   });
@@ -26,6 +27,7 @@ final class CallUiState {
   final String? transientMessage;
   final String unitName;
   final String pairedDoor;
+  final String? localIpAddress;
   final bool tcpServerListening;
   final bool discoveryListening;
 
@@ -44,6 +46,7 @@ final class CallUiState {
     Object? transientMessage = _sentinel,
     String? unitName,
     String? pairedDoor,
+    Object? localIpAddress = _sentinel,
     bool? tcpServerListening,
     bool? discoveryListening,
   }) {
@@ -60,6 +63,9 @@ final class CallUiState {
           : transientMessage as String?,
       unitName: unitName ?? this.unitName,
       pairedDoor: pairedDoor ?? this.pairedDoor,
+      localIpAddress: identical(localIpAddress, _sentinel)
+          ? this.localIpAddress
+          : localIpAddress as String?,
       tcpServerListening: tcpServerListening ?? this.tcpServerListening,
       discoveryListening: discoveryListening ?? this.discoveryListening,
     );

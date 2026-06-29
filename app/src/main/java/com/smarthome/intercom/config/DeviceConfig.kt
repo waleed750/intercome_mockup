@@ -43,7 +43,7 @@ class DeviceConfig(private val context: Context, scope: CoroutineScope) {
             DeviceIdentity(
                 alias = prefs[Keys.ALIAS] ?: defaults.alias,
                 serial = prefs[Keys.SERIAL] ?: defaults.serial,
-                dstAddr = prefs[Keys.DST_ADDR] ?: defaults.dstAddr,
+                dstAddr = prefs[Keys.DST_ADDR]?.takeIf { it.isValidAddress() } ?: defaults.dstAddr,
                 doorName = prefs[Keys.DOOR] ?: defaults.doorName,
             )
         }
@@ -55,7 +55,9 @@ class DeviceConfig(private val context: Context, scope: CoroutineScope) {
             context.dataStore.edit { prefs ->
                 if (prefs[Keys.ALIAS] == null) prefs[Keys.ALIAS] = defaults.alias
                 if (prefs[Keys.SERIAL] == null) prefs[Keys.SERIAL] = defaults.serial
-                if (prefs[Keys.DST_ADDR] == null) prefs[Keys.DST_ADDR] = defaults.dstAddr
+                if (!prefs[Keys.DST_ADDR].orEmpty().isValidAddress()) {
+                    prefs[Keys.DST_ADDR] = defaults.dstAddr
+                }
                 if (prefs[Keys.DOOR] == null) prefs[Keys.DOOR] = defaults.doorName
             }
         }
@@ -65,7 +67,7 @@ class DeviceConfig(private val context: Context, scope: CoroutineScope) {
         context.dataStore.edit { prefs ->
             prefs[Keys.ALIAS] = identity.alias.ifBlank { defaults.alias }
             prefs[Keys.SERIAL] = identity.serial.ifBlank { defaults.serial }
-            prefs[Keys.DST_ADDR] = identity.dstAddr.ifBlank { defaults.dstAddr }
+            prefs[Keys.DST_ADDR] = identity.dstAddr.takeIf { it.isValidAddress() } ?: defaults.dstAddr
             prefs[Keys.DOOR] = identity.doorName.ifBlank { defaults.doorName }
         }
     }
@@ -75,8 +77,13 @@ class DeviceConfig(private val context: Context, scope: CoroutineScope) {
         return DeviceIdentity(
             alias = "Indoor $suffix",
             serial = UUID.randomUUID().toString().replace("-", "").take(12),
-            dstAddr = "android-$suffix",
+            dstAddr = (1..999).random().toString(),
             doorName = "Front Door",
         )
+    }
+
+    private fun String.isValidAddress(): Boolean {
+        val address = trim().toIntOrNull()
+        return address != null && address in 1..999
     }
 }

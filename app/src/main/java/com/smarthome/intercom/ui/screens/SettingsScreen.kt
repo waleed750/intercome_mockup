@@ -9,6 +9,7 @@ import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -42,6 +43,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -68,6 +70,7 @@ fun SettingsScreen(
 
     var alias by remember(identity.alias) { mutableStateOf(identity.alias) }
     var dstAddr by remember(identity.dstAddr) { mutableStateOf(identity.dstAddr) }
+    var dstAddrError by remember { mutableStateOf(false) }
     var doorName by remember(identity.doorName) { mutableStateOf(identity.doorName) }
 
     // Bumped on resume so permission statuses refresh after the user returns
@@ -129,8 +132,24 @@ fun SettingsScreen(
                     Spacer(Modifier.height(12.dp))
                     OutlinedTextField(
                         value = dstAddr,
-                        onValueChange = { dstAddr = it },
+                        onValueChange = {
+                            dstAddr = it.filter(Char::isDigit).take(3)
+                            dstAddrError = false
+                        },
                         label = { Text(stringResource(R.string.settings_address)) },
+                        supportingText = {
+                            Text(
+                                stringResource(
+                                    if (dstAddrError) {
+                                        R.string.settings_address_error
+                                    } else {
+                                        R.string.settings_address_hint
+                                    },
+                                ),
+                            )
+                        },
+                        isError = dstAddrError,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
@@ -151,9 +170,14 @@ fun SettingsScreen(
                     Spacer(Modifier.height(16.dp))
                     Button(
                         onClick = {
+                            val address = dstAddr.toIntOrNull()
+                            if (address == null || address !in 1..999) {
+                                dstAddrError = true
+                                return@Button
+                            }
                             scope.launch {
                                 viewModel.deviceConfig.save(
-                                    DeviceIdentity(alias, identity.serial, dstAddr, doorName),
+                                    DeviceIdentity(alias, identity.serial, address.toString(), doorName),
                                 )
                             }
                         },

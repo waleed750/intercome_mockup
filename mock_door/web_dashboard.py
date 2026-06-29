@@ -78,8 +78,11 @@ def _on_unit_discovered(unit):
     try:
         socketio.emit("unit_discovered", {
             "ip": unit.ip,
+            "udp_ip": unit.udp_ip,
+            "reported_ip": unit.reported_ip,
             "alias": unit.alias,
             "serial": unit.serial,
+            "dst_addr": unit.dst_addr,
         })
     except Exception:
         pass
@@ -154,7 +157,17 @@ def api_units():
         if service is None:
             return jsonify([])
         units = service.get_discovered_units()
-        return jsonify([{"ip": u.ip, "alias": u.alias, "serial": u.serial} for u in units])
+        return jsonify([
+            {
+                "ip": u.ip,
+                "udp_ip": u.udp_ip,
+                "reported_ip": u.reported_ip,
+                "alias": u.alias,
+                "serial": u.serial,
+                "dst_addr": u.dst_addr,
+            }
+            for u in units
+        ])
     except Exception:
         return jsonify([])
 

@@ -49,7 +49,7 @@ class DiscoveryResponder(
                 bind(InetSocketAddress(Discovery.PORT))
             }
             // Best-effort: keep replies on Wi-Fi. Reception still works without it.
-            runCatching { binder.bindToWifi(sock) }
+            runCatching { binder.bindToLan(sock) }
             socket = sock
 
             Log.d(TAG, "Discovery listening on UDP ${Discovery.PORT}")

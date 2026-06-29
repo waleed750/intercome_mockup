@@ -13,6 +13,7 @@ import '../media/video_decoder.dart';
 import '../net/call_connection.dart';
 import '../net/call_server.dart';
 import '../net/discovery_responder.dart';
+import '../net/local_ip_address.dart';
 import '../notifications/intercom_notification_handler.dart';
 import '../notifications/notification_actions.dart';
 import '../protocol/commands.dart';
@@ -69,18 +70,48 @@ final class CallController extends ChangeNotifier {
   }
 
   Future<void> start() async {
-    await _notifications.initialize();
-    await Permission.notification.request();
-    await refreshConnectivity();
+    await _startupStep('notifications.initialize', _notifications.initialize);
+    await _startupStep('permission.notification.request',
+        () => Permission.notification.request());
+    await _startupStep('connectivity.refresh', refreshConnectivity);
     if (mode == IntercomMode.panel) {
-      final discoveryStarted = await _discovery.start();
-      final serverStarted = await _server.start();
-      await AndroidForegroundService.startPanelService();
+      final discoveryStarted =
+          await _startupStep('discovery.start', _discovery.start);
+      final serverStarted =
+          await _startupStep('call_server.start', _server.start);
+      await _startupStep('foreground.startPanelService',
+          AndroidForegroundService.startPanelService);
       _setState(_state.copyWith(
         discoveryListening: discoveryStarted,
         tcpServerListening: serverStarted,
       ));
-      await checkPendingBackgroundCall();
+      await _startupStep(
+          'foreground.takePendingIncomingCall', checkPendingBackgroundCall);
+    }
+  }
+
+  Future<T> _startupStep<T>(
+    String name,
+    Future<T> Function() action,
+  ) async {
+    const timeout = Duration(seconds: 4);
+    debugPrint('Intercom startup step started: $name');
+    final stopwatch = Stopwatch()..start();
+    try {
+      final result = await action().timeout(timeout);
+      debugPrint(
+          'Intercom startup step finished: $name (${stopwatch.elapsedMilliseconds}ms)');
+      return result;
+    } on TimeoutException catch (error, stackTrace) {
+      final message =
+          'Intercom startup step timed out: $name after ${timeout.inSeconds}s';
+      debugPrint(message);
+      debugPrintStack(stackTrace: stackTrace);
+      throw TimeoutException(message, error.duration);
+    } catch (error, stackTrace) {
+      debugPrint('Intercom startup step failed: $name -> $error');
+      debugPrintStack(stackTrace: stackTrace);
+      Error.throwWithStackTrace(Exception('$name failed: $error'), stackTrace);
     }
   }
 
@@ -116,8 +147,11 @@ final class CallController extends ChangeNotifier {
 
   Future<void> refreshConnectivity() async {
     final result = await Connectivity().checkConnectivity();
-    _setState(
-        _state.copyWith(onWifi: result.contains(ConnectivityResult.wifi)));
+    final localIpAddress = await resolveLocalIpv4Address();
+    _setState(_state.copyWith(
+      onWifi: result.contains(ConnectivityResult.wifi),
+      localIpAddress: localIpAddress,
+    ));
   }
 
   Future<void> connectToDoor(String host,
@@ -288,7 +322,12 @@ final class CallController extends ChangeNotifier {
 
   ScreenInfo _buildScreenInfo() {
     final id = deviceConfig.identity;
-    return ScreenInfo(alias: id.alias, serial: id.serial, dstAddr: id.dstAddr);
+    return ScreenInfo(
+      alias: id.alias,
+      serial: id.serial,
+      dstAddr: id.dstAddr,
+      localIp: _state.localIpAddress,
+    );
   }
 
   void _showTransient(String message) {

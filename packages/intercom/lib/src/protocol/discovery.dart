@@ -10,6 +10,7 @@ final class ScreenInfo {
     required this.serial,
     this.dstType = 3,
     required this.dstAddr,
+    this.localIp,
     this.verify = 0,
     this.deviceBusy = 0,
     this.cameraEn = 0,
@@ -23,12 +24,14 @@ final class ScreenInfo {
   final String serial;
   final int dstType;
   final String dstAddr;
+  final String? localIp;
   final int verify;
   final int deviceBusy;
   final int cameraEn;
   final int relay0Delay;
 
-  ScreenInfo copyWith({int? dstType, String? dstAddr}) => ScreenInfo(
+  ScreenInfo copyWith({int? dstType, String? dstAddr, String? localIp}) =>
+      ScreenInfo(
         command: command,
         appid: appid,
         alias: alias,
@@ -36,6 +39,7 @@ final class ScreenInfo {
         serial: serial,
         dstType: dstType ?? this.dstType,
         dstAddr: dstAddr ?? this.dstAddr,
+        localIp: localIp ?? this.localIp,
         verify: verify,
         deviceBusy: deviceBusy,
         cameraEn: cameraEn,
@@ -50,6 +54,10 @@ final class ScreenInfo {
         'serial': serial,
         'dstType': dstType,
         'dstAddr': dstAddr,
+        if (localIp != null && localIp!.isNotEmpty) ...{
+          'ip': localIp,
+          'localIp': localIp,
+        },
         'verify': verify,
         'deviceBusy': deviceBusy,
         'camera_en': cameraEn,

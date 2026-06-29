@@ -53,7 +53,7 @@ class CallController(
     private val discovery = DiscoveryResponder(scope, binder, ::buildScreenInfo)
     private val server = CallServer(
         scope = scope,
-        bindAddressProvider = { binder.wifiIpv4Address() },
+        bindAddressProvider = { binder.lanIpv4Address() },
         onAccepted = ::onSocketAccepted,
     )
 
@@ -91,8 +91,8 @@ class CallController(
     }
 
     fun refreshConnectivity() {
-        val onWifi = binder.isOnWifi()
-        Log.d(TAG, "Connectivity: onWifi=$onWifi wifiIp=${binder.wifiIpv4Address()?.hostAddress} networks=${binder.describeNetworks()}")
+        val onWifi = binder.isOnLan()
+        Log.d(TAG, "Connectivity: onLan=$onWifi lanIp=${binder.lanIpv4Address()?.hostAddress} networks=${binder.describeNetworks()}")
         _uiState.update { it.copy(onWifi = onWifi) }
     }
 
