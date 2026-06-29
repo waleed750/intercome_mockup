@@ -6,17 +6,19 @@ import 'dart:typed_data';
 import '../protocol/frame.dart';
 import '../protocol/frame_parser.dart';
 
-typedef CallFrameHandler = void Function(Channel channel, Uint8List payload);
+typedef CallFrameHandler = FutureOr<void> Function(
+    Channel channel, Uint8List payload);
 
 final class CallConnection {
   CallConnection({
     required this.socket,
-    required this.onFrame,
+    required CallFrameHandler onFrame,
     required this.onClosed,
-  }) : _parser = FrameParser(onFrame: onFrame);
+  }) : _parser = FrameParser(onFrame: (channel, payload) {
+          unawaited(Future.value(onFrame(channel, payload)));
+        });
 
   final Socket socket;
-  final CallFrameHandler onFrame;
   final void Function() onClosed;
   final FrameParser _parser;
   final Queue<Uint8List> _outbox = Queue<Uint8List>();

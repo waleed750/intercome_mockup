@@ -174,6 +174,7 @@ final class CallController extends ChangeNotifier {
     ));
     await _notifications.showIncomingCall(doorName: id.doorName);
     await _video.start();
+    notifyListeners();
     await _ringer.start();
   }
 
