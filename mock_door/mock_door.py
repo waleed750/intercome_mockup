@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import msvcrt
 import socket
 import threading
 import time
@@ -74,8 +73,12 @@ class MockDoorService:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             import struct as _struct
-            # SO_LINGER: graceful close, wait up to 5s for pending data
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _struct.pack('hh', 1, 5))
+            # SO_LINGER: graceful close, wait up to 5s for pending data.
+            # struct linger on Linux is two C ints (8 bytes), not two
+            # shorts - 'hh' silently produced a 4-byte buffer that the
+            # kernel rejected with EINVAL, which got misreported as the
+            # TCP connection itself failing even though it had succeeded.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _struct.pack('ii', 1, 5))
         except OSError as exc:
             LOG.error("TCP connection to %s:%s failed: %s", self.target_ip, TCP_PORT, exc)
             return
@@ -302,6 +305,11 @@ def configure_logging():
 
 
 def read_key() -> str | None:
+    # Windows-only terminal UI helper; imported lazily so the rest of this
+    # module (MockDoorService, used headlessly by web_dashboard.py) stays
+    # importable on Linux/macOS, which have no msvcrt.
+    import msvcrt
+
     if not msvcrt.kbhit():
         return None
     raw = msvcrt.getch()

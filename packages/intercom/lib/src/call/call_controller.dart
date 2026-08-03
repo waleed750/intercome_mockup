@@ -69,18 +69,27 @@ final class CallController extends ChangeNotifier {
     ));
   }
 
+  /// Runtime permission prompts and the Android foreground service are
+  /// mobile-only concepts; desktop platforms (Linux) have no equivalent OS
+  /// gate and should treat the capability as already available.
+  static bool get _isMobile => Platform.isAndroid || Platform.isIOS;
+
   Future<void> start() async {
     await _startupStep('notifications.initialize', _notifications.initialize);
-    await _startupStep('permission.notification.request',
-        () => Permission.notification.request());
+    if (_isMobile) {
+      await _startupStep('permission.notification.request',
+          () => Permission.notification.request());
+    }
     await _startupStep('connectivity.refresh', refreshConnectivity);
     if (mode == IntercomMode.panel) {
       final discoveryStarted =
           await _startupStep('discovery.start', _discovery.start);
       final serverStarted =
           await _startupStep('call_server.start', _server.start);
-      await _startupStep('foreground.startPanelService',
-          AndroidForegroundService.startPanelService);
+      if (Platform.isAndroid) {
+        await _startupStep('foreground.startPanelService',
+            AndroidForegroundService.startPanelService);
+      }
       _setState(_state.copyWith(
         discoveryListening: discoveryStarted,
         tcpServerListening: serverStarted,
@@ -117,6 +126,7 @@ final class CallController extends ChangeNotifier {
 
   Future<void> checkPendingBackgroundCall() async {
     if (mode != IntercomMode.panel || _state.phase != CallPhase.idle) return;
+    if (!Platform.isAndroid) return;
     final hasPendingCall =
         await AndroidForegroundService.takePendingIncomingCall();
     if (hasPendingCall) {
@@ -136,7 +146,7 @@ final class CallController extends ChangeNotifier {
     await _teardownCall(showEnded: false);
     await _discovery.stop();
     await _server.stop();
-    if (mode == IntercomMode.panel) {
+    if (mode == IntercomMode.panel && Platform.isAndroid) {
       await AndroidForegroundService.stopPanelService();
     }
     _setState(_state.copyWith(
@@ -172,10 +182,11 @@ final class CallController extends ChangeNotifier {
       muted: false,
       transientMessage: null,
     ));
+    final videoStarted = _video.start();
     await _notifications.showIncomingCall(doorName: id.doorName);
-    await _video.start();
     notifyListeners();
     await _ringer.start();
+    await videoStarted;
   }
 
   Future<void> answer() async {
@@ -271,9 +282,10 @@ final class CallController extends ChangeNotifier {
           muted: false,
           transientMessage: null,
         ));
+        final videoStarted = _video.start();
         await _notifications.showIncomingCall(doorName: id.doorName);
-        await _video.start();
         await _ringer.start();
+        await videoStarted;
       case InboundCommand.getCallInfo:
         if (_state.phase == CallPhase.connected) {
           for (final frame in Commands.answerFrames()) {
@@ -288,11 +300,14 @@ final class CallController extends ChangeNotifier {
   }
 
   Future<void> _startAudio() async {
-    var micStatus = await Permission.microphone.status;
-    if (!micStatus.isGranted) {
-      micStatus = await Permission.microphone.request();
+    var micGranted = true;
+    if (_isMobile) {
+      var micStatus = await Permission.microphone.status;
+      if (!micStatus.isGranted) {
+        micStatus = await Permission.microphone.request();
+      }
+      micGranted = micStatus.isGranted;
     }
-    final micGranted = micStatus.isGranted;
     await _audio.start(captureEnabled: micGranted);
     _audioSub?.cancel();
     _audioSub = _audio.uplink.listen((alaw) {

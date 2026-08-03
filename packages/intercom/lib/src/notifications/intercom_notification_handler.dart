@@ -20,8 +20,9 @@ final class IntercomNotificationHandler {
   Future<void> initialize() async {
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     const ios = DarwinInitializationSettings();
+    const linux = LinuxInitializationSettings(defaultActionName: 'Open');
     await plugin.initialize(
-      const InitializationSettings(android: android, iOS: ios),
+      const InitializationSettings(android: android, iOS: ios, linux: linux),
       onDidReceiveNotificationResponse: _handleResponse,
       onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
     );
@@ -63,6 +64,15 @@ final class IntercomNotificationHandler {
           presentAlert: true,
           presentSound: true,
           categoryIdentifier: 'intercom_call',
+        ),
+        linux: LinuxNotificationDetails(
+          urgency: LinuxNotificationUrgency.critical,
+          actions: [
+            LinuxNotificationAction(
+                key: IntercomNotificationAction.answer.id, label: 'Answer'),
+            LinuxNotificationAction(
+                key: IntercomNotificationAction.reject.id, label: 'Reject'),
+          ],
         ),
       ),
       payload: payload,

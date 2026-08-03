@@ -6,7 +6,27 @@
       "request": "launch",
       "type": "dart",
       "cwd": "packages/intercom/example",
-      "program": "lib/main.dart"
+      "program": "lib/main.dart",
+      "env": { "LIBGL_ALWAYS_SOFTWARE": "1" }
+    },
+    {
+      "name": "Intercom Example (Linux)",
+      "request": "launch",
+      "type": "dart",
+      "cwd": "packages/intercom/example",
+      "program": "lib/main.dart",
+      "deviceId": "linux",
+      "env": { "LIBGL_ALWAYS_SOFTWARE": "1" }
+    },
+    {
+      "name": "Intercom Example (Linux, software rendering)",
+      "request": "launch",
+      "type": "dart",
+      "cwd": "packages/intercom/example",
+      "program": "lib/main.dart",
+      "deviceId": "linux",
+      "toolArgs": ["--enable-software-rendering"],
+      "env": { "LIBGL_ALWAYS_SOFTWARE": "1" }
     },
     {
       "name": "Intercom Package Tests",
@@ -14,6 +34,29 @@
       "type": "dart",
       "cwd": "packages/intercom",
       "program": "test"
+    },
+    {
+      "name": "Mock Door (Web Dashboard)",
+      "request": "launch",
+      "type": "debugpy",
+      "python": "${workspaceFolder}/mock_door/.venv-linux/bin/python",
+      "cwd": "${workspaceFolder}/mock_door",
+      "program": "${workspaceFolder}/mock_door/web_dashboard.py",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Mock Door + Intercom (Linux)",
+      "configurations": ["Mock Door (Web Dashboard)", "Intercom Example (Linux)"]
+    },
+    {
+      "name": "Mock Door + Intercom (Linux, software rendering)",
+      "configurations": [
+        "Mock Door (Web Dashboard)",
+        "Intercom Example (Linux, software rendering)"
+      ]
     }
   ]
 }

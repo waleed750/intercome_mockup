@@ -94,31 +94,34 @@ class VideoStreamer:
         self._stop_ffmpeg()
 
     def _run(self):
+        cap = None
         try:
             import cv2
         except ImportError:
-            LOG.warning("opencv-python is not installed. Video streaming disabled.")
-            return
+            cv2 = None
+            LOG.warning("opencv-python is not installed. Falling back to test pattern.")
 
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            LOG.warning("Webcam unavailable. Continuing without video.")
-            cap.release()
-            return
+        if cv2 is not None:
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                LOG.warning("Webcam unavailable. Falling back to test pattern.")
+                cap.release()
+                cap = None
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
-        cap.set(cv2.CAP_PROP_FPS, FPS)
+        if cap is not None:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+            cap.set(cv2.CAP_PROP_FPS, FPS)
+            self._run_from_webcam(cv2, cap)
+        else:
+            self._run_from_test_pattern()
 
-        cmd = [
+    def _encode_cmd(self, input_args: list[str]) -> list[str]:
+        return [
             self.ffmpeg_path,
             "-hide_banner",
             "-loglevel", "error",
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-s", f"{WIDTH}x{HEIGHT}",
-            "-r", str(FPS),
-            "-i", "pipe:0",
+            *input_args,
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-tune", "zerolatency",
@@ -133,6 +136,15 @@ class VideoStreamer:
             "-f", "h264",
             "pipe:1",
         ]
+
+    def _run_from_webcam(self, cv2, cap):
+        cmd = self._encode_cmd([
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{WIDTH}x{HEIGHT}",
+            "-r", str(FPS),
+            "-i", "pipe:0",
+        ])
 
         try:
             self.process = subprocess.Popen(
@@ -164,6 +176,37 @@ class VideoStreamer:
             LOG.error("Unable to start ffmpeg: %s", exc)
         finally:
             cap.release()
+            self._stop_ffmpeg()
+
+    def _run_from_test_pattern(self):
+        """No webcam (or opencv) available - e.g. running in a VM with no camera
+        passthrough. Have ffmpeg synthesize a moving test pattern (via its
+        built-in lavfi source) so the encode/transport/decode/render pipeline
+        can still be exercised end to end without real camera hardware."""
+        cmd = self._encode_cmd([
+            "-f", "lavfi",
+            "-i", f"testsrc2=size={WIDTH}x{HEIGHT}:rate={FPS}",
+        ])
+
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            reader = threading.Thread(target=self._read_ffmpeg_stdout, name="video-ffmpeg-read", daemon=True)
+            reader.start()
+            LOG.info("No webcam found; streaming synthetic test pattern (%dx%d @ %d fps)", WIDTH, HEIGHT, FPS)
+            while not self.call_stop_event.is_set():
+                if self.process.poll() is not None:
+                    LOG.error("ffmpeg test pattern process exited unexpectedly")
+                    break
+                time.sleep(0.2)
+        except OSError as exc:
+            LOG.error("Unable to start ffmpeg: %s", exc)
+        finally:
             self._stop_ffmpeg()
 
     def _read_ffmpeg_stdout(self):

@@ -7,6 +7,7 @@ import json
 import logging
 import socket
 import threading
+import time
 from dataclasses import dataclass
 
 DISCOVERY_PORT = 8089
@@ -20,12 +21,16 @@ def _get_all_broadcast_addresses() -> list[str]:
     addrs = set()
     addrs.add("255.255.255.255")
     try:
-        # Use socket to get all local IPs, then compute /24 broadcast as fallback
-        hostname = socket.gethostname()
-        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
-            ip = info[4][0]
-            if ip.startswith("127."):
-                continue
+        # Determine the outbound-facing local IP via the UDP-connect trick: this
+        # doesn't send any packets, it just asks the kernel which local address
+        # would be used to route to an external host. Unlike gethostname() +
+        # getaddrinfo(), this isn't fooled by /etc/hosts mapping the hostname to
+        # 127.0.1.1 (the default on Debian/Ubuntu), which used to leave this
+        # function with nothing but the 255.255.255.255 fallback.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            ip = probe.getsockname()[0]
+        if not ip.startswith("127."):
             # Assume /24 as most common subnet — covers home/office networks
             try:
                 net = ipaddress.IPv4Network(f"{ip}/24", strict=False)
@@ -85,7 +90,18 @@ class DiscoveryBroadcaster:
             separators=(",", ":"),
         ).encode("utf-8")
 
-        targets = _get_all_broadcast_addresses()
+        # Always include the loopback broadcast address: this VM's virtual
+        # NIC doesn't hairpin broadcast frames back to the sending host, so
+        # a same-host indoor unit under test would never see the probe
+        # otherwise. 127.255.255.255 (not plain 127.0.0.1 unicast) matters
+        # here — unicast to loopback only reaches ONE of the processes
+        # sharing port 8089 (this listener would keep winning and starve
+        # the app under test), whereas a genuine broadcast address copies
+        # the datagram to every same-port listener. This is a no-op on a
+        # real deployment (door and indoor unit on separate physical
+        # devices) but makes local dev/testing work reliably regardless of
+        # the network's broadcast loopback behavior.
+        targets = _get_all_broadcast_addresses() + ["127.255.255.255"]
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             for addr in targets:
@@ -107,21 +123,45 @@ class DiscoveryBroadcaster:
                 LOG.warning("Discovery probe failed: %s", exc)
             self.stop_event.wait(DISCOVERY_INTERVAL_SECONDS)
 
+    def _open_listen_socket(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # SO_REUSEADDR alone is enough to share this port with other local
+        # listeners (e.g. an indoor unit app under test on the same host)
+        # and still receive broadcast copies. SO_REUSEPORT deliberately
+        # NOT set: on Linux it forms an exclusive delivery group that
+        # hashes each incoming packet to a single group member, which
+        # silently starves any other same-port listener (like Flutter's
+        # RawDatagramSocket, which only sets SO_REUSEADDR) of ever
+        # receiving discovery probes when both run on one machine.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(("0.0.0.0", self.port))
+        sock.settimeout(1.0)
+        return sock
+
     def _listen_loop(self):
+        # An indoor unit's reply is unicast back to this socket's address:port
+        # (never broadcast), and on Linux, multiple SO_REUSEADDR sockets
+        # sharing one port without SO_REUSEPORT don't get a copy each for
+        # unicast traffic - only the MOST RECENTLY BOUND socket receives it.
+        # If the indoor unit app under test binds its own port-8089 socket
+        # after this one, its replies loop back to itself instead of ever
+        # reaching us. Periodically closing and rebinding reclaims "most
+        # recently bound" status regardless of when the other side started,
+        # so replies keep landing here rather than getting silently stolen.
+        rebind_interval = DISCOVERY_INTERVAL_SECONDS * 0.6
         sock = None
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except (AttributeError, OSError):
-                pass  # SO_REUSEPORT not available on Windows
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.bind(("0.0.0.0", self.port))
-            sock.settimeout(1.0)
+            sock = self._open_listen_socket()
             LOG.info("Listening for discovery replies on UDP %s", self.port)
+            last_bind = time.monotonic()
 
             while not self.stop_event.is_set():
+                if time.monotonic() - last_bind >= rebind_interval:
+                    sock.close()
+                    sock = self._open_listen_socket()
+                    last_bind = time.monotonic()
+
                 try:
                     data, addr = sock.recvfrom(4096)
                 except socket.timeout:

@@ -23,10 +23,14 @@ dev_dependencies:
   flutter_lints: ^4.0.0
 
 flutter:
+  assets:
+    - assets/sounds/ringtone.wav
   plugin:
     platforms:
       android:
         package: com.syncn.intercom
         pluginClass: IntercomPlugin
       ios:
+        pluginClass: IntercomPlugin
+      linux:
         pluginClass: IntercomPlugin
