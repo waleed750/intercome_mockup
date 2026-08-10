@@ -65,11 +65,20 @@ final class FullScreenCallHandler implements IncomingCallHandler {
   Future<void> initialize() async {
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     const ios = DarwinInitializationSettings();
-    await _plugin.initialize(
-      const InitializationSettings(android: android, iOS: ios),
-      onDidReceiveNotificationResponse: _handleResponse,
-      onDidReceiveBackgroundNotificationResponse: _backgroundHandler,
-    );
+    const linux = LinuxInitializationSettings(defaultActionName: 'Open');
+    try {
+      await _plugin.initialize(
+        const InitializationSettings(android: android, iOS: ios, linux: linux),
+        onDidReceiveNotificationResponse: _handleResponse,
+        onDidReceiveBackgroundNotificationResponse: _backgroundHandler,
+      );
+    } catch (_) {
+      // Linux kiosk targets (e.g. flutter-pi, bare DRM) typically have no
+      // org.freedesktop.Notifications D-Bus daemon to talk to. The call flow
+      // itself doesn't depend on system notifications, so a failure here
+      // shouldn't block the intercom feature.
+      return;
+    }
 
     // Ensure the notification channel exists.
     final androidImpl = _plugin.resolvePlatformSpecificImplementation<
@@ -87,34 +96,39 @@ final class FullScreenCallHandler implements IncomingCallHandler {
       'doorName': doorName,
     });
 
-    await _plugin.show(
-      _notificationId,
-      doorName,
-      'Incoming intercom call',
-      NotificationDetails(
-        android: AndroidNotificationDetails(
-          _channel.id,
-          _channel.name,
-          channelDescription: _channel.description,
-          importance: Importance.max,
-          priority: Priority.max,
-          category: AndroidNotificationCategory.call,
-          fullScreenIntent: true,
-          actions: [
-            AndroidNotificationAction(_Action.answer.id, 'Answer',
-                showsUserInterface: true),
-            AndroidNotificationAction(_Action.reject.id, 'Reject',
-                cancelNotification: true),
-          ],
+    try {
+      await _plugin.show(
+        _notificationId,
+        doorName,
+        'Incoming intercom call',
+        NotificationDetails(
+          android: AndroidNotificationDetails(
+            _channel.id,
+            _channel.name,
+            channelDescription: _channel.description,
+            importance: Importance.max,
+            priority: Priority.max,
+            category: AndroidNotificationCategory.call,
+            fullScreenIntent: true,
+            actions: [
+              AndroidNotificationAction(_Action.answer.id, 'Answer',
+                  showsUserInterface: true),
+              AndroidNotificationAction(_Action.reject.id, 'Reject',
+                  cancelNotification: true),
+            ],
+          ),
+          iOS: const DarwinNotificationDetails(
+            presentAlert: true,
+            presentSound: true,
+            categoryIdentifier: 'intercom_call',
+          ),
         ),
-        iOS: const DarwinNotificationDetails(
-          presentAlert: true,
-          presentSound: true,
-          categoryIdentifier: 'intercom_call',
-        ),
-      ),
-      payload: payload,
-    );
+        payload: payload,
+      );
+    } catch (_) {
+      // No system notification daemon on this target (see initialize()) --
+      // the in-app call UI still drives the call, so this is non-fatal.
+    }
 
     // Start vibration pattern: 0ms delay, 800ms vibrate, 600ms pause.
     _startVibration();
@@ -122,13 +136,13 @@ final class FullScreenCallHandler implements IncomingCallHandler {
 
   @override
   Future<void> onCallDismissed() async {
-    await _plugin.cancel(_notificationId);
+    await _plugin.cancel(_notificationId).catchError((_) {});
     _stopVibration();
   }
 
   @override
   Future<void> dispose() async {
-    await _plugin.cancel(_notificationId);
+    await _plugin.cancel(_notificationId).catchError((_) {});
     _stopVibration();
   }
 

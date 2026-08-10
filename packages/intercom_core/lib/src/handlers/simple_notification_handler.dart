@@ -42,11 +42,18 @@ final class SimpleNotificationHandler implements IncomingCallHandler {
   Future<void> initialize() async {
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     const ios = DarwinInitializationSettings();
-    await _plugin.initialize(
-      const InitializationSettings(android: android, iOS: ios),
-      onDidReceiveNotificationResponse: _handleResponse,
-      onDidReceiveBackgroundNotificationResponse: _backgroundHandler,
-    );
+    const linux = LinuxInitializationSettings(defaultActionName: 'Open');
+    try {
+      await _plugin.initialize(
+        const InitializationSettings(android: android, iOS: ios, linux: linux),
+        onDidReceiveNotificationResponse: _handleResponse,
+        onDidReceiveBackgroundNotificationResponse: _backgroundHandler,
+      );
+    } catch (_) {
+      // No org.freedesktop.Notifications D-Bus daemon on bare-DRM Linux
+      // kiosk targets; the call flow doesn't depend on system notifications.
+      return;
+    }
 
     final androidImpl = _plugin.resolvePlatformSpecificImplementation<
         AndroidFlutterLocalNotificationsPlugin>();
@@ -63,43 +70,47 @@ final class SimpleNotificationHandler implements IncomingCallHandler {
       'doorName': doorName,
     });
 
-    await _plugin.show(
-      _notificationId,
-      doorName,
-      'Incoming intercom call',
-      NotificationDetails(
-        android: AndroidNotificationDetails(
-          _channel.id,
-          _channel.name,
-          channelDescription: _channel.description,
-          importance: Importance.defaultImportance,
-          priority: Priority.defaultPriority,
-          category: AndroidNotificationCategory.call,
-          actions: [
-            const AndroidNotificationAction('answer', 'Answer',
-                showsUserInterface: true),
-            const AndroidNotificationAction('cancel', 'Cancel',
-                cancelNotification: true),
-          ],
+    try {
+      await _plugin.show(
+        _notificationId,
+        doorName,
+        'Incoming intercom call',
+        NotificationDetails(
+          android: AndroidNotificationDetails(
+            _channel.id,
+            _channel.name,
+            channelDescription: _channel.description,
+            importance: Importance.defaultImportance,
+            priority: Priority.defaultPriority,
+            category: AndroidNotificationCategory.call,
+            actions: [
+              const AndroidNotificationAction('answer', 'Answer',
+                  showsUserInterface: true),
+              const AndroidNotificationAction('cancel', 'Cancel',
+                  cancelNotification: true),
+            ],
+          ),
+          iOS: const DarwinNotificationDetails(
+            presentAlert: true,
+            presentSound: false,
+            categoryIdentifier: 'intercom_call',
+          ),
         ),
-        iOS: const DarwinNotificationDetails(
-          presentAlert: true,
-          presentSound: false,
-          categoryIdentifier: 'intercom_call',
-        ),
-      ),
-      payload: payload,
-    );
+        payload: payload,
+      );
+    } catch (_) {
+      // No system notification daemon on this target; non-fatal.
+    }
   }
 
   @override
   Future<void> onCallDismissed() async {
-    await _plugin.cancel(_notificationId);
+    await _plugin.cancel(_notificationId).catchError((_) {});
   }
 
   @override
   Future<void> dispose() async {
-    await _plugin.cancel(_notificationId);
+    await _plugin.cancel(_notificationId).catchError((_) {});
   }
 
   Future<void> _handleResponse(NotificationResponse response) async {
