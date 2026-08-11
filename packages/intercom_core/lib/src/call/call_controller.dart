@@ -77,8 +77,16 @@ final class CallController extends ChangeNotifier {
   Future<void> start() async {
     await _startupStep(
         'incomingCallHandler.initialize', incomingCallHandler.initialize);
-    await _startupStep('permission.notification.request',
-        () => Permission.notification.request());
+    // permission_handler has no Linux platform implementation at all --
+    // every call on this channel throws MissingPluginException there, not
+    // just an unsupported/denied result. Bare-DRM kiosk targets have no
+    // notification daemon to grant permission to in the first place (see
+    // FullScreenCallHandler's Linux handling), so this step is meaningless
+    // there and skipped entirely rather than treated as a failure.
+    if (!Platform.isLinux) {
+      await _startupStep('permission.notification.request',
+          () => Permission.notification.request());
+    }
     await _startupStep('connectivity.refresh', refreshConnectivity);
 
     if (_startDiscovery) {
@@ -298,11 +306,19 @@ final class CallController extends ChangeNotifier {
   }
 
   Future<void> _startAudio() async {
-    var micStatus = await Permission.microphone.status;
-    if (!micStatus.isGranted) {
-      micStatus = await Permission.microphone.request();
+    // permission_handler has no Linux platform implementation -- there's no
+    // OS-level permission prompt to check/request there, so treat mic access
+    // as always granted (same as the app itself being allowed to open the
+    // audio device, which is a system/user configuration concern, not
+    // something this plugin can gate on Linux).
+    bool micGranted = true;
+    if (!Platform.isLinux) {
+      var micStatus = await Permission.microphone.status;
+      if (!micStatus.isGranted) {
+        micStatus = await Permission.microphone.request();
+      }
+      micGranted = micStatus.isGranted;
     }
-    final micGranted = micStatus.isGranted;
     await _audio.start(captureEnabled: micGranted);
     _audioSub?.cancel();
     _audioSub = _audio.uplink.listen((alaw) {
