@@ -30,6 +30,7 @@
 #include "flutter-pi.h"
 #include "platformchannel.h"
 #include "pluginregistry.h"
+#include "syncn_intercom_debug.h"
 #include "util/logging.h"
 
 struct syncn_intercom_audio {
@@ -46,6 +47,9 @@ struct syncn_intercom_audio {
     GstElement *capture_pipeline;
     GstElement *capture_appsink;
     GstElement *capture_volume;
+
+    int playback_count;
+    int capture_count;
 };
 
 // Split into a quick locked "detach" part and a separately-called unlocked
@@ -97,7 +101,13 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
 
     pthread_mutex_lock(&self->lock);
     bool listening = self->uplink_listening;
+    self->capture_count++;
+    bool should_log = self->capture_count <= 10;
     pthread_mutex_unlock(&self->lock);
+
+    if (should_log) {
+        syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: listening=%d, size=%zu", self->capture_count, listening, map.size);
+    }
 
     if (listening && map.size > 0) {
         struct std_value event = {
@@ -105,7 +115,10 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
             .size = map.size,
             .uint8array = map.data,
         };
-        platch_send_success_event_std(SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, &event);
+        int send_ret = platch_send_success_event_std(SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, &event);
+        if (should_log) {
+            syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: platch_send_success_event_std -> %d", self->capture_count, send_ret);
+        }
     }
 
     gst_buffer_unmap(buffer, &map);
@@ -145,12 +158,14 @@ static void log_pipeline_bus_errors(const char *tag, GstElement *pipeline) {
 // -- logging bus errors either way so real hardware failures are visible.
 static bool start_and_confirm_playing(const char *tag, GstElement *pipeline) {
     GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    syncn_intercom_debug_log("audio", "%s: gst_element_set_state(PLAYING) -> %d", tag, state_ret);
     if (state_ret == GST_STATE_CHANGE_FAILURE) {
         log_pipeline_bus_errors(tag, pipeline);
         return false;
     }
     GstState final_state;
     GstStateChangeReturn wait_ret = gst_element_get_state(pipeline, &final_state, NULL, 3 * GST_SECOND);
+    syncn_intercom_debug_log("audio", "%s: gst_element_get_state -> wait_ret=%d, final_state=%d", tag, wait_ret, final_state);
     log_pipeline_bus_errors(tag, pipeline);
     if (wait_ret == GST_STATE_CHANGE_FAILURE || (final_state != GST_STATE_PLAYING && wait_ret != GST_STATE_CHANGE_ASYNC)) {
         LOG_ERROR("%s: pipeline did not reach PLAYING (wait_ret=%d, final_state=%d)\n", tag, wait_ret, final_state);
@@ -160,10 +175,13 @@ static bool start_and_confirm_playing(const char *tag, GstElement *pipeline) {
 }
 
 static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled) {
+    syncn_intercom_debug_log("audio", "start_locked called, capture_enabled=%d, self->running=%d", capture_enabled, self->running);
     if (self->running) {
         self->capture_enabled = capture_enabled;
         return true;
     }
+    self->playback_count = 0;
+    self->capture_count = 0;
 
     if (!gst_is_initialized()) {
         GError *error = NULL;
@@ -178,7 +196,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     GstElement *playback = gst_parse_launch(
         "appsrc name=src is-live=true format=time do-timestamp=true block=false "
         "caps=audio/x-alaw,rate=8000,channels=1 ! "
-        "alawdec ! audioconvert ! audioresample ! autoaudiosink sync=false",
+        "alawdec ! audioconvert ! audioresample ! alsasink device=default sync=false",
         &error
     );
     if (playback == NULL) {
@@ -200,7 +218,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     GstElement *capture_volume = NULL;
     if (capture_enabled) {
         capture = gst_parse_launch(
-            "autoaudiosrc ! audioconvert ! audioresample ! "
+            "alsasrc device=default ! audioconvert ! audioresample ! "
             "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
             "volume name=capvol ! alawenc ! "
             "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true",
@@ -241,17 +259,32 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     self->capture_volume = capture_volume;
     self->capture_enabled = capture_enabled && capture != NULL;
     self->running = true;
+    syncn_intercom_debug_log("audio", "start_locked: SUCCESS, capture_enabled=%d (requested %d)", self->capture_enabled, capture_enabled);
     return true;
 }
 
 static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_t *data, size_t size) {
     pthread_mutex_lock(&self->lock);
+    self->playback_count++;
+    bool should_log = self->playback_count <= 10;
     if (self->running && self->playback_appsrc != NULL && size > 0) {
         GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
         gst_buffer_fill(buffer, 0, data, size);
         GstFlowReturn ret;
         g_signal_emit_by_name(self->playback_appsrc, "push-buffer", buffer, &ret);
         gst_buffer_unref(buffer);
+        if (should_log) {
+            syncn_intercom_debug_log("audio", "handle_play_downlink #%d: pushed %zu bytes, ret=%d", self->playback_count, size, ret);
+        }
+    } else if (should_log) {
+        syncn_intercom_debug_log(
+            "audio",
+            "handle_play_downlink #%d: DROPPED (running=%d, playback_appsrc=%p, size=%zu)",
+            self->playback_count,
+            self->running,
+            (void *) self->playback_appsrc,
+            size
+        );
     }
     pthread_mutex_unlock(&self->lock);
 }

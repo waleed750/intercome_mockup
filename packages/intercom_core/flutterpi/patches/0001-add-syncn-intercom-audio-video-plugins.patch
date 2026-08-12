@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..0a7c3e6
+index 0000000..eb3e0e1
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,426 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -90,6 +90,7 @@ index 0000000..0a7c3e6
 +#include "flutter-pi.h"
 +#include "platformchannel.h"
 +#include "pluginregistry.h"
++#include "syncn_intercom_debug.h"
 +#include "util/logging.h"
 +
 +struct syncn_intercom_audio {
@@ -106,6 +107,9 @@ index 0000000..0a7c3e6
 +    GstElement *capture_pipeline;
 +    GstElement *capture_appsink;
 +    GstElement *capture_volume;
++
++    int playback_count;
++    int capture_count;
 +};
 +
 +// Split into a quick locked "detach" part and a separately-called unlocked
@@ -157,7 +161,13 @@ index 0000000..0a7c3e6
 +
 +    pthread_mutex_lock(&self->lock);
 +    bool listening = self->uplink_listening;
++    self->capture_count++;
++    bool should_log = self->capture_count <= 10;
 +    pthread_mutex_unlock(&self->lock);
++
++    if (should_log) {
++        syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: listening=%d, size=%zu", self->capture_count, listening, map.size);
++    }
 +
 +    if (listening && map.size > 0) {
 +        struct std_value event = {
@@ -165,7 +175,10 @@ index 0000000..0a7c3e6
 +            .size = map.size,
 +            .uint8array = map.data,
 +        };
-+        platch_send_success_event_std(SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, &event);
++        int send_ret = platch_send_success_event_std(SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, &event);
++        if (should_log) {
++            syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: platch_send_success_event_std -> %d", self->capture_count, send_ret);
++        }
 +    }
 +
 +    gst_buffer_unmap(buffer, &map);
@@ -205,12 +218,14 @@ index 0000000..0a7c3e6
 +// -- logging bus errors either way so real hardware failures are visible.
 +static bool start_and_confirm_playing(const char *tag, GstElement *pipeline) {
 +    GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
++    syncn_intercom_debug_log("audio", "%s: gst_element_set_state(PLAYING) -> %d", tag, state_ret);
 +    if (state_ret == GST_STATE_CHANGE_FAILURE) {
 +        log_pipeline_bus_errors(tag, pipeline);
 +        return false;
 +    }
 +    GstState final_state;
 +    GstStateChangeReturn wait_ret = gst_element_get_state(pipeline, &final_state, NULL, 3 * GST_SECOND);
++    syncn_intercom_debug_log("audio", "%s: gst_element_get_state -> wait_ret=%d, final_state=%d", tag, wait_ret, final_state);
 +    log_pipeline_bus_errors(tag, pipeline);
 +    if (wait_ret == GST_STATE_CHANGE_FAILURE || (final_state != GST_STATE_PLAYING && wait_ret != GST_STATE_CHANGE_ASYNC)) {
 +        LOG_ERROR("%s: pipeline did not reach PLAYING (wait_ret=%d, final_state=%d)\n", tag, wait_ret, final_state);
@@ -220,10 +235,13 @@ index 0000000..0a7c3e6
 +}
 +
 +static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled) {
++    syncn_intercom_debug_log("audio", "start_locked called, capture_enabled=%d, self->running=%d", capture_enabled, self->running);
 +    if (self->running) {
 +        self->capture_enabled = capture_enabled;
 +        return true;
 +    }
++    self->playback_count = 0;
++    self->capture_count = 0;
 +
 +    if (!gst_is_initialized()) {
 +        GError *error = NULL;
@@ -238,7 +256,7 @@ index 0000000..0a7c3e6
 +    GstElement *playback = gst_parse_launch(
 +        "appsrc name=src is-live=true format=time do-timestamp=true block=false "
 +        "caps=audio/x-alaw,rate=8000,channels=1 ! "
-+        "alawdec ! audioconvert ! audioresample ! autoaudiosink sync=false",
++        "alawdec ! audioconvert ! audioresample ! alsasink device=default sync=false",
 +        &error
 +    );
 +    if (playback == NULL) {
@@ -260,7 +278,7 @@ index 0000000..0a7c3e6
 +    GstElement *capture_volume = NULL;
 +    if (capture_enabled) {
 +        capture = gst_parse_launch(
-+            "autoaudiosrc ! audioconvert ! audioresample ! "
++            "alsasrc device=default ! audioconvert ! audioresample ! "
 +            "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
 +            "volume name=capvol ! alawenc ! "
 +            "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true",
@@ -301,17 +319,32 @@ index 0000000..0a7c3e6
 +    self->capture_volume = capture_volume;
 +    self->capture_enabled = capture_enabled && capture != NULL;
 +    self->running = true;
++    syncn_intercom_debug_log("audio", "start_locked: SUCCESS, capture_enabled=%d (requested %d)", self->capture_enabled, capture_enabled);
 +    return true;
 +}
 +
 +static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_t *data, size_t size) {
 +    pthread_mutex_lock(&self->lock);
++    self->playback_count++;
++    bool should_log = self->playback_count <= 10;
 +    if (self->running && self->playback_appsrc != NULL && size > 0) {
 +        GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
 +        gst_buffer_fill(buffer, 0, data, size);
 +        GstFlowReturn ret;
 +        g_signal_emit_by_name(self->playback_appsrc, "push-buffer", buffer, &ret);
 +        gst_buffer_unref(buffer);
++        if (should_log) {
++            syncn_intercom_debug_log("audio", "handle_play_downlink #%d: pushed %zu bytes, ret=%d", self->playback_count, size, ret);
++        }
++    } else if (should_log) {
++        syncn_intercom_debug_log(
++            "audio",
++            "handle_play_downlink #%d: DROPPED (running=%d, playback_appsrc=%p, size=%zu)",
++            self->playback_count,
++            self->running,
++            (void *) self->playback_appsrc,
++            size
++        );
 +    }
 +    pthread_mutex_unlock(&self->lock);
 +}
@@ -470,12 +503,62 @@ index 0000000..598c45e
 +void syncn_intercom_audio_deinit(struct flutterpi *flutterpi, void *userdata);
 +
 +#endif  // _SYNCN_INTERCOM_AUDIO_H
+diff --git a/src/plugins/syncn_intercom_debug.h b/src/plugins/syncn_intercom_debug.h
+new file mode 100644
+index 0000000..8b0c7e1
+--- /dev/null
++++ b/src/plugins/syncn_intercom_debug.h
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: MIT
++//
++// File-based diagnostic logging for the syncn_intercom plugins, independent
++// of journald/LOG_ERROR. Added because journald's capture of this process's
++// stdout/stderr was found to be unreliable on-device (a journald restart
++// after the process had already started orphans its log pipe -- the process
++// keeps running fine, but nothing it writes to stdout/stderr ever reaches
++// the journal again). Writing straight to a file sidesteps that entirely:
++// `cat /tmp/syncn_intercom_debug.log` on the panel always reflects what this
++// process actually did, regardless of journald's state.
++#ifndef _SYNCN_INTERCOM_DEBUG_H
++#define _SYNCN_INTERCOM_DEBUG_H
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <time.h>
++
++#define SYNCN_INTERCOM_DEBUG_LOG_PATH "/tmp/syncn_intercom_debug.log"
++
++static inline void syncn_intercom_debug_log(const char *tag, const char *fmt, ...) {
++    FILE *f = fopen(SYNCN_INTERCOM_DEBUG_LOG_PATH, "a");
++    if (f == NULL) {
++        return;
++    }
++
++    struct timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    struct tm tm_info;
++    localtime_r(&ts.tv_sec, &tm_info);
++    char timestr[16];
++    strftime(timestr, sizeof(timestr), "%H:%M:%S", &tm_info);
++
++    fprintf(f, "[%s.%03ld] %s: ", timestr, ts.tv_nsec / 1000000, tag);
++
++    va_list args;
++    va_start(args, fmt);
++    vfprintf(f, fmt, args);
++    va_end(args);
++
++    fprintf(f, "\n");
++    fclose(f);
++}
++
++#endif  // _SYNCN_INTERCOM_DEBUG_H
 diff --git a/src/plugins/syncn_intercom_video.c b/src/plugins/syncn_intercom_video.c
 new file mode 100644
-index 0000000..f2226b9
+index 0000000..b4a86f3
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_video.c
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,517 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of the "syncn_intercom/video" MethodChannel.
@@ -514,6 +597,7 @@ index 0000000..f2226b9
 +#include "gl_renderer.h"
 +#include "platformchannel.h"
 +#include "pluginregistry.h"
++#include "syncn_intercom_debug.h"
 +#include "texture_registry.h"
 +#include "util/logging.h"
 +
@@ -533,6 +617,9 @@ index 0000000..f2226b9
 +    GLuint gl_texture_name;
 +    int gl_texture_width;
 +    int gl_texture_height;
++
++    int submit_count;
++    int frame_count;
 +};
 +
 +// Only one intercom call (and therefore one video stream) is ever active at a
@@ -583,7 +670,32 @@ index 0000000..f2226b9
 +
 +    pthread_mutex_lock(&self->lock);
 +
-+    if (self->running && gl_renderer_make_flutter_resource_uploading_context_current(self->gl_renderer) == 0) {
++    self->frame_count++;
++    bool should_log = self->frame_count <= 10;
++    if (should_log) {
++        syncn_intercom_debug_log(
++            "video",
++            "on_new_sample #%d: running=%d, decoded %dx%d, buffer size=%zu",
++            self->frame_count,
++            self->running,
++            width,
++            height,
++            map.size
++        );
++    }
++
++    if (!self->running) {
++        if (should_log) syncn_intercom_debug_log("video", "on_new_sample #%d: dropped, self->running is false", self->frame_count);
++        pthread_mutex_unlock(&self->lock);
++        gst_buffer_unmap(buffer, &map);
++        gst_sample_unref(sample);
++        return GST_FLOW_OK;
++    }
++
++    int gl_context_ret = gl_renderer_make_flutter_resource_uploading_context_current(self->gl_renderer);
++    if (should_log) syncn_intercom_debug_log("video", "on_new_sample #%d: gl_renderer_make_flutter_resource_uploading_context_current -> %d", self->frame_count, gl_context_ret);
++
++    if (gl_context_ret == 0) {
 +        if (self->gl_texture_name == 0) {
 +            glGenTextures(1, &self->gl_texture_name);
 +            glBindTexture(GL_TEXTURE_2D, self->gl_texture_name);
@@ -635,9 +747,25 @@ index 0000000..f2226b9
 +            .destroy = on_texture_frame_destroy,
 +            .userdata = NULL,
 +        };
-+        texture_push_frame(self->texture, &frame);
++        int push_ret = texture_push_frame(self->texture, &frame);
++        if (should_log) {
++            syncn_intercom_debug_log(
++                "video",
++                "on_new_sample #%d: uploaded gl_texture_name=%u, texture_push_frame -> %d",
++                self->frame_count,
++                self->gl_texture_name,
++                push_ret
++            );
++        }
 +
 +        gl_renderer_clear_current(self->gl_renderer);
++    } else if (should_log) {
++        syncn_intercom_debug_log(
++            "video",
++            "on_new_sample #%d: SKIPPED upload -- gl_renderer_make_flutter_resource_uploading_context_current failed (%d)",
++            self->frame_count,
++            gl_context_ret
++        );
 +    }
 +
 +    pthread_mutex_unlock(&self->lock);
@@ -713,11 +841,17 @@ index 0000000..f2226b9
 +static int64_t handle_start(struct syncn_intercom_video *self) {
 +    pthread_mutex_lock(&self->lock);
 +
++    syncn_intercom_debug_log("video", "handle_start called, self->running=%d", self->running);
++
 +    if (self->running) {
 +        int64_t id = texture_get_id(self->texture);
++        syncn_intercom_debug_log("video", "handle_start: already running, returning existing texture id=%lld", (long long) id);
 +        pthread_mutex_unlock(&self->lock);
 +        return id;
 +    }
++
++    self->submit_count = 0;
++    self->frame_count = 0;
 +
 +    if (!gst_is_initialized()) {
 +        GError *error = NULL;
@@ -767,6 +901,7 @@ index 0000000..f2226b9
 +    g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), self);
 +
 +    GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
++    syncn_intercom_debug_log("video", "handle_start: gst_element_set_state(PLAYING) -> %d", state_ret);
 +    if (state_ret == GST_STATE_CHANGE_FAILURE) {
 +        LOG_ERROR("syncn_intercom_video: failed to start pipeline\n");
 +        log_pipeline_bus_errors("syncn_intercom_video", pipeline);
@@ -782,6 +917,7 @@ index 0000000..f2226b9
 +    // outcome instead of assuming it worked.
 +    GstState final_state;
 +    GstStateChangeReturn wait_ret = gst_element_get_state(pipeline, &final_state, NULL, 3 * GST_SECOND);
++    syncn_intercom_debug_log("video", "handle_start: gst_element_get_state -> wait_ret=%d, final_state=%d", wait_ret, final_state);
 +    if (wait_ret == GST_STATE_CHANGE_FAILURE || (final_state != GST_STATE_PLAYING && wait_ret != GST_STATE_CHANGE_ASYNC)) {
 +        LOG_ERROR(
 +            "syncn_intercom_video: pipeline did not reach PLAYING (wait_ret=%d, final_state=%d)\n",
@@ -804,13 +940,26 @@ index 0000000..f2226b9
 +    self->running = true;
 +
 +    int64_t id = texture_get_id(self->texture);
++    syncn_intercom_debug_log("video", "handle_start: SUCCESS, texture id=%lld", (long long) id);
 +    pthread_mutex_unlock(&self->lock);
 +    return id;
 +}
 +
 +static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data, size_t size) {
 +    pthread_mutex_lock(&self->lock);
++    self->submit_count++;
++    bool should_log = self->submit_count <= 10;
 +    if (!self->running || self->appsrc == NULL || size == 0) {
++        if (should_log) {
++            syncn_intercom_debug_log(
++                "video",
++                "handle_submit #%d: DROPPED (running=%d, appsrc=%p, size=%zu)",
++                self->submit_count,
++                self->running,
++                (void *) self->appsrc,
++                size
++            );
++        }
 +        pthread_mutex_unlock(&self->lock);
 +        return;
 +    }
@@ -822,11 +971,21 @@ index 0000000..f2226b9
 +    g_signal_emit_by_name(self->appsrc, "push-buffer", buffer, &ret);
 +    gst_buffer_unref(buffer);
 +
++    if (should_log) {
++        syncn_intercom_debug_log("video", "handle_submit #%d: pushed %zu bytes, push-buffer signal returned ret=%d", self->submit_count, size, ret);
++    }
++
 +    pthread_mutex_unlock(&self->lock);
 +}
 +
 +static void handle_stop(struct syncn_intercom_video *self) {
 +    pthread_mutex_lock(&self->lock);
++    syncn_intercom_debug_log(
++        "video",
++        "handle_stop called: total submit_count=%d, total frame_count=%d",
++        self->submit_count,
++        self->frame_count
++    );
 +    self->running = false;
 +    GstElement *pipeline;
 +    GLuint gl_texture_name;

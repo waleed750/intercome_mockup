@@ -36,6 +36,7 @@
 #include "gl_renderer.h"
 #include "platformchannel.h"
 #include "pluginregistry.h"
+#include "syncn_intercom_debug.h"
 #include "texture_registry.h"
 #include "util/logging.h"
 
@@ -55,6 +56,9 @@ struct syncn_intercom_video {
     GLuint gl_texture_name;
     int gl_texture_width;
     int gl_texture_height;
+
+    int submit_count;
+    int frame_count;
 };
 
 // Only one intercom call (and therefore one video stream) is ever active at a
@@ -105,7 +109,32 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
 
     pthread_mutex_lock(&self->lock);
 
-    if (self->running && gl_renderer_make_flutter_resource_uploading_context_current(self->gl_renderer) == 0) {
+    self->frame_count++;
+    bool should_log = self->frame_count <= 10;
+    if (should_log) {
+        syncn_intercom_debug_log(
+            "video",
+            "on_new_sample #%d: running=%d, decoded %dx%d, buffer size=%zu",
+            self->frame_count,
+            self->running,
+            width,
+            height,
+            map.size
+        );
+    }
+
+    if (!self->running) {
+        if (should_log) syncn_intercom_debug_log("video", "on_new_sample #%d: dropped, self->running is false", self->frame_count);
+        pthread_mutex_unlock(&self->lock);
+        gst_buffer_unmap(buffer, &map);
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    int gl_context_ret = gl_renderer_make_flutter_resource_uploading_context_current(self->gl_renderer);
+    if (should_log) syncn_intercom_debug_log("video", "on_new_sample #%d: gl_renderer_make_flutter_resource_uploading_context_current -> %d", self->frame_count, gl_context_ret);
+
+    if (gl_context_ret == 0) {
         if (self->gl_texture_name == 0) {
             glGenTextures(1, &self->gl_texture_name);
             glBindTexture(GL_TEXTURE_2D, self->gl_texture_name);
@@ -157,9 +186,25 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
             .destroy = on_texture_frame_destroy,
             .userdata = NULL,
         };
-        texture_push_frame(self->texture, &frame);
+        int push_ret = texture_push_frame(self->texture, &frame);
+        if (should_log) {
+            syncn_intercom_debug_log(
+                "video",
+                "on_new_sample #%d: uploaded gl_texture_name=%u, texture_push_frame -> %d",
+                self->frame_count,
+                self->gl_texture_name,
+                push_ret
+            );
+        }
 
         gl_renderer_clear_current(self->gl_renderer);
+    } else if (should_log) {
+        syncn_intercom_debug_log(
+            "video",
+            "on_new_sample #%d: SKIPPED upload -- gl_renderer_make_flutter_resource_uploading_context_current failed (%d)",
+            self->frame_count,
+            gl_context_ret
+        );
     }
 
     pthread_mutex_unlock(&self->lock);
@@ -235,11 +280,17 @@ static void teardown_pipeline_unlocked(struct syncn_intercom_video *self, GstEle
 static int64_t handle_start(struct syncn_intercom_video *self) {
     pthread_mutex_lock(&self->lock);
 
+    syncn_intercom_debug_log("video", "handle_start called, self->running=%d", self->running);
+
     if (self->running) {
         int64_t id = texture_get_id(self->texture);
+        syncn_intercom_debug_log("video", "handle_start: already running, returning existing texture id=%lld", (long long) id);
         pthread_mutex_unlock(&self->lock);
         return id;
     }
+
+    self->submit_count = 0;
+    self->frame_count = 0;
 
     if (!gst_is_initialized()) {
         GError *error = NULL;
@@ -289,6 +340,7 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), self);
 
     GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    syncn_intercom_debug_log("video", "handle_start: gst_element_set_state(PLAYING) -> %d", state_ret);
     if (state_ret == GST_STATE_CHANGE_FAILURE) {
         LOG_ERROR("syncn_intercom_video: failed to start pipeline\n");
         log_pipeline_bus_errors("syncn_intercom_video", pipeline);
@@ -304,6 +356,7 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     // outcome instead of assuming it worked.
     GstState final_state;
     GstStateChangeReturn wait_ret = gst_element_get_state(pipeline, &final_state, NULL, 3 * GST_SECOND);
+    syncn_intercom_debug_log("video", "handle_start: gst_element_get_state -> wait_ret=%d, final_state=%d", wait_ret, final_state);
     if (wait_ret == GST_STATE_CHANGE_FAILURE || (final_state != GST_STATE_PLAYING && wait_ret != GST_STATE_CHANGE_ASYNC)) {
         LOG_ERROR(
             "syncn_intercom_video: pipeline did not reach PLAYING (wait_ret=%d, final_state=%d)\n",
@@ -326,13 +379,26 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     self->running = true;
 
     int64_t id = texture_get_id(self->texture);
+    syncn_intercom_debug_log("video", "handle_start: SUCCESS, texture id=%lld", (long long) id);
     pthread_mutex_unlock(&self->lock);
     return id;
 }
 
 static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data, size_t size) {
     pthread_mutex_lock(&self->lock);
+    self->submit_count++;
+    bool should_log = self->submit_count <= 10;
     if (!self->running || self->appsrc == NULL || size == 0) {
+        if (should_log) {
+            syncn_intercom_debug_log(
+                "video",
+                "handle_submit #%d: DROPPED (running=%d, appsrc=%p, size=%zu)",
+                self->submit_count,
+                self->running,
+                (void *) self->appsrc,
+                size
+            );
+        }
         pthread_mutex_unlock(&self->lock);
         return;
     }
@@ -344,11 +410,21 @@ static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data
     g_signal_emit_by_name(self->appsrc, "push-buffer", buffer, &ret);
     gst_buffer_unref(buffer);
 
+    if (should_log) {
+        syncn_intercom_debug_log("video", "handle_submit #%d: pushed %zu bytes, push-buffer signal returned ret=%d", self->submit_count, size, ret);
+    }
+
     pthread_mutex_unlock(&self->lock);
 }
 
 static void handle_stop(struct syncn_intercom_video *self) {
     pthread_mutex_lock(&self->lock);
+    syncn_intercom_debug_log(
+        "video",
+        "handle_stop called: total submit_count=%d, total frame_count=%d",
+        self->submit_count,
+        self->frame_count
+    );
     self->running = false;
     GstElement *pipeline;
     GLuint gl_texture_name;
