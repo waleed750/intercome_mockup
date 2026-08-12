@@ -314,8 +314,7 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
 
     GError *error = NULL;
     GstElement *pipeline = gst_parse_launch(
-        "appsrc name=src is-live=true format=time do-timestamp=true block=false "
-        "caps=video/x-h264,stream-format=byte-stream,alignment=nal ! "
+        "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "h264parse config-interval=-1 ! avdec_h264 ! videoconvert ! "
         "video/x-raw,format=RGBA ! "
         "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false",
@@ -338,6 +337,23 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
         pthread_mutex_unlock(&self->lock);
         return -1;
     }
+
+    // Caps embedded in the gst_parse_launch() string only set the pad
+    // template's default caps -- on this device's GStreamer version that
+    // was NOT reliably propagating to the live GstAppSrc, leaving appsrc
+    // unable to negotiate with h264parse ("not-linked" bus error, appsrc
+    // stuck at ASYNC/PAUSED instead of reaching PLAYING, confirmed
+    // on-device via /tmp/syncn_intercom_debug.log). Setting caps explicitly
+    // via the C API is the fix.
+    GstCaps *appsrc_caps = gst_caps_new_simple(
+        "video/x-h264",
+        "stream-format", G_TYPE_STRING, "byte-stream",
+        "alignment", G_TYPE_STRING, "nal",
+        NULL
+    );
+    gst_app_src_set_caps(GST_APP_SRC(appsrc), appsrc_caps);
+    gst_caps_unref(appsrc_caps);
+    gst_app_src_set_stream_type(GST_APP_SRC(appsrc), GST_APP_STREAM_TYPE_STREAM);
 
     g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), self);
 

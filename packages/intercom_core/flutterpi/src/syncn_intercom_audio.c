@@ -196,8 +196,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
 
     GError *error = NULL;
     GstElement *playback = gst_parse_launch(
-        "appsrc name=src is-live=true format=time do-timestamp=true block=false "
-        "caps=audio/x-alaw,rate=8000,channels=1 ! "
+        "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "alawdec ! audioconvert ! audioresample ! alsasink device=default sync=false",
         &error
     );
@@ -207,6 +206,21 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         return false;
     }
     GstElement *playback_appsrc = gst_bin_get_by_name(GST_BIN(playback), "src");
+    if (playback_appsrc != NULL) {
+        // See syncn_intercom_video.c's identical fix for why: caps embedded in
+        // the gst_parse_launch() string weren't reliably reaching the live
+        // GstAppSrc on this device's GStreamer version, leaving it unable to
+        // negotiate with alawdec (same ASYNC/PAUSED-stuck symptom as video).
+        GstCaps *appsrc_caps = gst_caps_new_simple(
+            "audio/x-alaw",
+            "rate", G_TYPE_INT, 8000,
+            "channels", G_TYPE_INT, 1,
+            NULL
+        );
+        gst_app_src_set_caps(GST_APP_SRC(playback_appsrc), appsrc_caps);
+        gst_caps_unref(appsrc_caps);
+        gst_app_src_set_stream_type(GST_APP_SRC(playback_appsrc), GST_APP_STREAM_TYPE_STREAM);
+    }
     if (playback_appsrc == NULL || !start_and_confirm_playing("syncn_intercom_audio playback", playback)) {
         LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
         if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
