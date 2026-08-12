@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..1ab87ae
+index 0000000..4c1991a
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,428 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -200,9 +200,11 @@ index 0000000..1ab87ae
 +        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
 +            gst_message_parse_error(msg, &err, &debug);
 +            LOG_ERROR("%s: GStreamer ERROR from %s: %s (%s)\n", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
++            syncn_intercom_debug_log("audio", "%s: GStreamer ERROR from %s: %s (%s)", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
 +        } else {
 +            gst_message_parse_warning(msg, &err, &debug);
 +            LOG_ERROR("%s: GStreamer WARNING from %s: %s (%s)\n", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
++            syncn_intercom_debug_log("audio", "%s: GStreamer WARNING from %s: %s (%s)", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
 +        }
 +        g_clear_error(&err);
 +        g_free(debug);
@@ -555,10 +557,10 @@ index 0000000..8b0c7e1
 +#endif  // _SYNCN_INTERCOM_DEBUG_H
 diff --git a/src/plugins/syncn_intercom_video.c b/src/plugins/syncn_intercom_video.c
 new file mode 100644
-index 0000000..c678ee3
+index 0000000..62823ef
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_video.c
-@@ -0,0 +1,517 @@
+@@ -0,0 +1,524 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of the "syncn_intercom/video" MethodChannel.
@@ -816,9 +818,11 @@ index 0000000..c678ee3
 +        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
 +            gst_message_parse_error(msg, &err, &debug);
 +            LOG_ERROR("%s: GStreamer ERROR from %s: %s (%s)\n", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
++            syncn_intercom_debug_log("video", "%s: GStreamer ERROR from %s: %s (%s)", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
 +        } else {
 +            gst_message_parse_warning(msg, &err, &debug);
 +            LOG_ERROR("%s: GStreamer WARNING from %s: %s (%s)\n", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
++            syncn_intercom_debug_log("video", "%s: GStreamer WARNING from %s: %s (%s)", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
 +        }
 +        g_clear_error(&err);
 +        g_free(debug);
@@ -972,6 +976,11 @@ index 0000000..c678ee3
 +    gst_buffer_unref(buffer);
 +
 +    if (should_log) {
++        // Bus errors (e.g. a real decode failure in h264parse/avdec_h264) are
++        // only ever checked at handle_start time otherwise -- if the pipeline
++        // starts fine but then fails once real data flows through it, nothing
++        // would ever see that. Poll it here too, for the same logging window.
++        log_pipeline_bus_errors("syncn_intercom_video (during submit)", self->pipeline);
 +        syncn_intercom_debug_log("video", "handle_submit #%d: pushed %zu bytes, push-buffer signal returned ret=%d", self->submit_count, size, ret);
 +    }
 +

@@ -255,9 +255,11 @@ static void log_pipeline_bus_errors(const char *tag, GstElement *pipeline) {
         if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
             gst_message_parse_error(msg, &err, &debug);
             LOG_ERROR("%s: GStreamer ERROR from %s: %s (%s)\n", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
+            syncn_intercom_debug_log("video", "%s: GStreamer ERROR from %s: %s (%s)", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
         } else {
             gst_message_parse_warning(msg, &err, &debug);
             LOG_ERROR("%s: GStreamer WARNING from %s: %s (%s)\n", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
+            syncn_intercom_debug_log("video", "%s: GStreamer WARNING from %s: %s (%s)", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
         }
         g_clear_error(&err);
         g_free(debug);
@@ -411,6 +413,11 @@ static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data
     gst_buffer_unref(buffer);
 
     if (should_log) {
+        // Bus errors (e.g. a real decode failure in h264parse/avdec_h264) are
+        // only ever checked at handle_start time otherwise -- if the pipeline
+        // starts fine but then fails once real data flows through it, nothing
+        // would ever see that. Poll it here too, for the same logging window.
+        log_pipeline_bus_errors("syncn_intercom_video (during submit)", self->pipeline);
         syncn_intercom_debug_log("video", "handle_submit #%d: pushed %zu bytes, push-buffer signal returned ret=%d", self->submit_count, size, ret);
     }
 
