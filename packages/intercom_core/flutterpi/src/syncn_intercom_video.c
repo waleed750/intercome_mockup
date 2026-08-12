@@ -169,21 +169,39 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
     return GST_FLOW_OK;
 }
 
-static void teardown_pipeline_locked(struct syncn_intercom_video *self) {
-    if (self->pipeline != NULL) {
-        gst_element_set_state(self->pipeline, GST_STATE_NULL);
-        gst_object_unref(self->pipeline);
-        self->pipeline = NULL;
-        self->appsrc = NULL;
-        self->appsink = NULL;
-    }
-    if (self->gl_texture_name != 0 && gl_renderer_make_flutter_resource_uploading_context_current(self->gl_renderer) == 0) {
-        glDeleteTextures(1, &self->gl_texture_name);
-        gl_renderer_clear_current(self->gl_renderer);
-    }
+// Splitting teardown into a quick locked part (just detach the pipeline/texture
+// from `self` so on_new_sample's `self->running` check sees it's gone) and a
+// separately-called unlocked part (the actual blocking GStreamer/GL calls) is
+// required to avoid a deadlock: gst_element_set_state(..., GST_STATE_NULL) blocks
+// until the pipeline's streaming thread (which is what calls on_new_sample) has
+// settled, but on_new_sample itself tries to acquire `self->lock` at its very
+// start -- if we called gst_element_set_state while still holding that same
+// lock, the streaming thread could never acquire it to finish, and
+// gst_element_set_state would then block forever waiting on a thread that's
+// blocked waiting on us. Confirmed on-device: this exact pattern froze the
+// whole panel (not just the intercom) on call decline/close, since flutter-pi's
+// platform thread -- shared with all UI/input handling -- was the one stuck
+// making this blocking call while holding the lock.
+static void teardown_pipeline_locked(struct syncn_intercom_video *self, GstElement **pipeline_out, GLuint *gl_texture_name_out) {
+    *pipeline_out = self->pipeline;
+    self->pipeline = NULL;
+    self->appsrc = NULL;
+    self->appsink = NULL;
+    *gl_texture_name_out = self->gl_texture_name;
     self->gl_texture_name = 0;
     self->gl_texture_width = 0;
     self->gl_texture_height = 0;
+}
+
+static void teardown_pipeline_unlocked(struct syncn_intercom_video *self, GstElement *pipeline, GLuint gl_texture_name) {
+    if (pipeline != NULL) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+    }
+    if (gl_texture_name != 0 && gl_renderer_make_flutter_resource_uploading_context_current(self->gl_renderer) == 0) {
+        glDeleteTextures(1, &gl_texture_name);
+        gl_renderer_clear_current(self->gl_renderer);
+    }
 }
 
 static int64_t handle_start(struct syncn_intercom_video *self) {
@@ -281,8 +299,12 @@ static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data
 static void handle_stop(struct syncn_intercom_video *self) {
     pthread_mutex_lock(&self->lock);
     self->running = false;
-    teardown_pipeline_locked(self);
+    GstElement *pipeline;
+    GLuint gl_texture_name;
+    teardown_pipeline_locked(self, &pipeline, &gl_texture_name);
     pthread_mutex_unlock(&self->lock);
+
+    teardown_pipeline_unlocked(self, pipeline, gl_texture_name);
 }
 
 static void on_platform_message(void *userdata, const FlutterPlatformMessage *message) {

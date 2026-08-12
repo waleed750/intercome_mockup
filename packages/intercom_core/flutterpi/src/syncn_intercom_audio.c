@@ -48,21 +48,35 @@ struct syncn_intercom_audio {
     GstElement *capture_volume;
 };
 
-static void teardown_locked(struct syncn_intercom_audio *self) {
-    if (self->playback_pipeline != NULL) {
-        gst_element_set_state(self->playback_pipeline, GST_STATE_NULL);
-        gst_object_unref(self->playback_pipeline);
-        self->playback_pipeline = NULL;
-        self->playback_appsrc = NULL;
-    }
-    if (self->capture_pipeline != NULL) {
-        gst_element_set_state(self->capture_pipeline, GST_STATE_NULL);
-        gst_object_unref(self->capture_pipeline);
-        self->capture_pipeline = NULL;
-        self->capture_appsink = NULL;
-        self->capture_volume = NULL;
-    }
+// Split into a quick locked "detach" part and a separately-called unlocked
+// "close" part for the same reason as the video plugin's teardown split (see
+// its comment): gst_element_set_state(..., GST_STATE_NULL) blocks until the
+// pipeline's streaming thread has settled, but that thread (on_new_capture_sample)
+// tries to acquire `self->lock` itself -- calling it while still holding the
+// lock deadlocks the platform thread against the streaming thread, freezing
+// the whole panel (confirmed on-device, same failure mode as the video plugin).
+static void teardown_locked(struct syncn_intercom_audio *self, GstElement **playback_out, GstElement **capture_out) {
+    *playback_out = self->playback_pipeline;
+    self->playback_pipeline = NULL;
+    self->playback_appsrc = NULL;
+
+    *capture_out = self->capture_pipeline;
+    self->capture_pipeline = NULL;
+    self->capture_appsink = NULL;
+    self->capture_volume = NULL;
+
     self->running = false;
+}
+
+static void teardown_unlocked(GstElement *playback_pipeline, GstElement *capture_pipeline) {
+    if (playback_pipeline != NULL) {
+        gst_element_set_state(playback_pipeline, GST_STATE_NULL);
+        gst_object_unref(playback_pipeline);
+    }
+    if (capture_pipeline != NULL) {
+        gst_element_set_state(capture_pipeline, GST_STATE_NULL);
+        gst_object_unref(capture_pipeline);
+    }
 }
 
 // Called on a GStreamer streaming thread.
@@ -243,8 +257,10 @@ static void on_method_channel_message(void *userdata, const FlutterPlatformMessa
         platch_respond_success_std(message->response_handle, NULL);
     } else if (strcmp(object.method, "stop") == 0) {
         pthread_mutex_lock(&self->lock);
-        teardown_locked(self);
+        GstElement *playback_pipeline, *capture_pipeline;
+        teardown_locked(self, &playback_pipeline, &capture_pipeline);
         pthread_mutex_unlock(&self->lock);
+        teardown_unlocked(playback_pipeline, capture_pipeline);
         platch_respond_success_std(message->response_handle, NULL);
     } else {
         platch_respond_not_implemented(message->response_handle);
@@ -317,8 +333,10 @@ void syncn_intercom_audio_deinit(struct flutterpi *flutterpi, void *userdata) {
     plugin_registry_remove_receiver_v2_locked(registry, SYNCN_INTERCOM_AUDIO_METHOD_CHANNEL);
 
     pthread_mutex_lock(&self->lock);
-    teardown_locked(self);
+    GstElement *playback_pipeline, *capture_pipeline;
+    teardown_locked(self, &playback_pipeline, &capture_pipeline);
     pthread_mutex_unlock(&self->lock);
+    teardown_unlocked(playback_pipeline, capture_pipeline);
 
     pthread_mutex_destroy(&self->lock);
     free(self);
