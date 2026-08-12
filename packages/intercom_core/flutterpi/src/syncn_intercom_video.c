@@ -193,6 +193,34 @@ static void teardown_pipeline_locked(struct syncn_intercom_video *self, GstEleme
     self->gl_texture_height = 0;
 }
 
+// gst_element_set_state()'s own return value is not a reliable success/failure
+// signal for a live appsrc/appsink pipeline like this one -- it very commonly
+// returns ASYNC (or NO_PREROLL, since is-live sources skip normal preroll)
+// even when the pipeline is about to fail for a real reason (missing decoder,
+// no audio device, negotiation failure, etc). GStreamer reports that failure
+// asynchronously via a GST_MESSAGE_ERROR on the pipeline's bus instead, which
+// nothing was checking before this -- so real, actionable errors on real
+// hardware were being silently swallowed. This drains and logs them.
+static void log_pipeline_bus_errors(const char *tag, GstElement *pipeline) {
+    GstBus *bus = gst_element_get_bus(pipeline);
+    GstMessage *msg;
+    while ((msg = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING)) != NULL) {
+        GError *err = NULL;
+        gchar *debug = NULL;
+        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+            gst_message_parse_error(msg, &err, &debug);
+            LOG_ERROR("%s: GStreamer ERROR from %s: %s (%s)\n", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
+        } else {
+            gst_message_parse_warning(msg, &err, &debug);
+            LOG_ERROR("%s: GStreamer WARNING from %s: %s (%s)\n", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
+        }
+        g_clear_error(&err);
+        g_free(debug);
+        gst_message_unref(msg);
+    }
+    gst_object_unref(bus);
+}
+
 static void teardown_pipeline_unlocked(struct syncn_intercom_video *self, GstElement *pipeline, GLuint gl_texture_name) {
     if (pipeline != NULL) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
@@ -260,14 +288,37 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
 
     g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), self);
 
-    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+    GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    if (state_ret == GST_STATE_CHANGE_FAILURE) {
         LOG_ERROR("syncn_intercom_video: failed to start pipeline\n");
+        log_pipeline_bus_errors("syncn_intercom_video", pipeline);
         gst_object_unref(appsrc);
         gst_object_unref(appsink);
         gst_object_unref(pipeline);
         pthread_mutex_unlock(&self->lock);
         return -1;
     }
+
+    // set_state()'s immediate return is almost always ASYNC/NO_PREROLL here
+    // (see log_pipeline_bus_errors' comment) -- actually wait for the real
+    // outcome instead of assuming it worked.
+    GstState final_state;
+    GstStateChangeReturn wait_ret = gst_element_get_state(pipeline, &final_state, NULL, 3 * GST_SECOND);
+    if (wait_ret == GST_STATE_CHANGE_FAILURE || (final_state != GST_STATE_PLAYING && wait_ret != GST_STATE_CHANGE_ASYNC)) {
+        LOG_ERROR(
+            "syncn_intercom_video: pipeline did not reach PLAYING (wait_ret=%d, final_state=%d)\n",
+            wait_ret,
+            final_state
+        );
+        log_pipeline_bus_errors("syncn_intercom_video", pipeline);
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(appsrc);
+        gst_object_unref(appsink);
+        gst_object_unref(pipeline);
+        pthread_mutex_unlock(&self->lock);
+        return -1;
+    }
+    log_pipeline_bus_errors("syncn_intercom_video", pipeline);
 
     self->pipeline = pipeline;
     self->appsrc = appsrc;

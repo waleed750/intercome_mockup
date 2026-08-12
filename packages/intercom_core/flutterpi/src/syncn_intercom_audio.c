@@ -113,6 +113,52 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
     return GST_FLOW_OK;
 }
 
+// See syncn_intercom_video.c's identical helper for why this is needed:
+// gst_element_set_state()'s immediate return value is not a reliable
+// success/failure signal for a live pipeline -- real failures (no ALSA
+// device, negotiation failure, etc) are reported asynchronously via the
+// pipeline's bus instead, which nothing was checking before this.
+static void log_pipeline_bus_errors(const char *tag, GstElement *pipeline) {
+    GstBus *bus = gst_element_get_bus(pipeline);
+    GstMessage *msg;
+    while ((msg = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING)) != NULL) {
+        GError *err = NULL;
+        gchar *debug = NULL;
+        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+            gst_message_parse_error(msg, &err, &debug);
+            LOG_ERROR("%s: GStreamer ERROR from %s: %s (%s)\n", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
+        } else {
+            gst_message_parse_warning(msg, &err, &debug);
+            LOG_ERROR("%s: GStreamer WARNING from %s: %s (%s)\n", tag, GST_OBJECT_NAME(msg->src), err->message, debug != NULL ? debug : "no debug info");
+        }
+        g_clear_error(&err);
+        g_free(debug);
+        gst_message_unref(msg);
+    }
+    gst_object_unref(bus);
+}
+
+// Issues the PLAYING state change and actually waits for the real outcome
+// (see log_pipeline_bus_errors' comment for why the immediate return value
+// alone isn't trustworthy). Returns true if the pipeline is confirmed
+// playing (or still legitimately pending as ASYNC), false on a real failure
+// -- logging bus errors either way so real hardware failures are visible.
+static bool start_and_confirm_playing(const char *tag, GstElement *pipeline) {
+    GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    if (state_ret == GST_STATE_CHANGE_FAILURE) {
+        log_pipeline_bus_errors(tag, pipeline);
+        return false;
+    }
+    GstState final_state;
+    GstStateChangeReturn wait_ret = gst_element_get_state(pipeline, &final_state, NULL, 3 * GST_SECOND);
+    log_pipeline_bus_errors(tag, pipeline);
+    if (wait_ret == GST_STATE_CHANGE_FAILURE || (final_state != GST_STATE_PLAYING && wait_ret != GST_STATE_CHANGE_ASYNC)) {
+        LOG_ERROR("%s: pipeline did not reach PLAYING (wait_ret=%d, final_state=%d)\n", tag, wait_ret, final_state);
+        return false;
+    }
+    return true;
+}
+
 static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled) {
     if (self->running) {
         self->capture_enabled = capture_enabled;
@@ -141,9 +187,10 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         return false;
     }
     GstElement *playback_appsrc = gst_bin_get_by_name(GST_BIN(playback), "src");
-    if (playback_appsrc == NULL || gst_element_set_state(playback, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+    if (playback_appsrc == NULL || !start_and_confirm_playing("syncn_intercom_audio playback", playback)) {
         LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
         if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
+        gst_element_set_state(playback, GST_STATE_NULL);
         gst_object_unref(playback);
         return false;
     }
@@ -173,8 +220,9 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
                 capture = NULL;
             } else {
                 g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
-                if (gst_element_set_state(capture, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+                if (!start_and_confirm_playing("syncn_intercom_audio capture", capture)) {
                     LOG_ERROR("syncn_intercom_audio: failed to start capture pipeline (mic will be unavailable)\n");
+                    gst_element_set_state(capture, GST_STATE_NULL);
                     gst_object_unref(capture_appsink);
                     if (capture_volume != NULL) gst_object_unref(capture_volume);
                     gst_object_unref(capture);
