@@ -335,15 +335,36 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Mock smart home door intercom station")
     parser.add_argument("target_ip", nargs="?", help="Android device IP address")
     parser.add_argument("--cli", action="store_true", help="Use terminal UI instead of GUI")
+    parser.add_argument(
+        "--delay-call",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Automatically place the call after this many seconds, with no "
+            "keypress needed. Useful when you can't interact with this "
+            "terminal and watch the receiving device's screen at the same "
+            "time (e.g. testing over a VT switch)."
+        ),
+    )
     return parser.parse_args()
 
 
-def main_cli(target_ip: str):
+def main_cli(target_ip: str, delay_call: float | None = None):
     if not ffmpeg_available():
         print(ffmpeg_warning())
 
     service = MockDoorService(target_ip)
     service.start()
+
+    if delay_call is not None:
+        def _delayed_call():
+            time.sleep(delay_call)
+            print(f"\n[auto] Calling {target_ip} now...")
+            service.call()
+        threading.Thread(target=_delayed_call, daemon=True, name="delayed-call").start()
+        print(f"Will automatically call {target_ip} in {delay_call:.0f}s. Press q then Enter to quit early.")
+
     print_menu(target_ip)
 
     # On POSIX, stdin needs to be in cbreak mode for read_key() (select + read(1))
@@ -393,7 +414,7 @@ def main():
         target_ip = args.target_ip or input("Android device IP address: ").strip()
         if not target_ip:
             raise SystemExit("Target IP is required")
-        main_cli(target_ip)
+        main_cli(target_ip, delay_call=args.delay_call)
     else:
         main_gui()
 
