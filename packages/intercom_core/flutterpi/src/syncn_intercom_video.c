@@ -22,6 +22,7 @@
 
 #include "syncn_intercom_video.h"
 
+#include <errno.h>
 #include <string.h>
 
 #include <gst/app/gstappsrc.h>
@@ -29,6 +30,7 @@
 #include <gst/gst.h>
 #include <gst/video/video.h>
 
+#include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
@@ -52,6 +54,18 @@ struct syncn_intercom_video {
     GstElement *pipeline;
     GstElement *appsrc;
     GstElement *appsink;
+
+    // flutter-pi's own "resource uploading" EGL context is shared with the
+    // Flutter engine's own internal use (e.g. decoding image assets) -- a
+    // GStreamer streaming thread calling gl_renderer_make_flutter_resource_
+    // uploading_context_current() concurrently with the engine's own use of
+    // that same context fails with EGL_BAD_ACCESS ("context already current
+    // on another thread"), confirmed on-device via journald. Using our own
+    // dedicated context (created once via gl_renderer_create_context(), which
+    // shares GL objects with the main context so our uploaded texture is
+    // still visible to it) avoids this contention entirely.
+    EGLDisplay egl_display;
+    EGLContext egl_context;
 
     GLuint gl_texture_name;
     int gl_texture_width;
@@ -131,8 +145,8 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
         return GST_FLOW_OK;
     }
 
-    int gl_context_ret = gl_renderer_make_flutter_resource_uploading_context_current(self->gl_renderer);
-    if (should_log) syncn_intercom_debug_log("video", "on_new_sample #%d: gl_renderer_make_flutter_resource_uploading_context_current -> %d", self->frame_count, gl_context_ret);
+    int gl_context_ret = eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context) ? 0 : EIO;
+    if (should_log) syncn_intercom_debug_log("video", "on_new_sample #%d: eglMakeCurrent(own context) -> %d (eglGetError=0x%x)", self->frame_count, gl_context_ret, eglGetError());
 
     if (gl_context_ret == 0) {
         if (self->gl_texture_name == 0) {
@@ -197,11 +211,11 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
             );
         }
 
-        gl_renderer_clear_current(self->gl_renderer);
+        eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     } else if (should_log) {
         syncn_intercom_debug_log(
             "video",
-            "on_new_sample #%d: SKIPPED upload -- gl_renderer_make_flutter_resource_uploading_context_current failed (%d)",
+            "on_new_sample #%d: SKIPPED upload -- eglMakeCurrent(own context) failed (%d)",
             self->frame_count,
             gl_context_ret
         );
@@ -273,9 +287,9 @@ static void teardown_pipeline_unlocked(struct syncn_intercom_video *self, GstEle
         gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(pipeline);
     }
-    if (gl_texture_name != 0 && gl_renderer_make_flutter_resource_uploading_context_current(self->gl_renderer) == 0) {
+    if (gl_texture_name != 0 && eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context)) {
         glDeleteTextures(1, &gl_texture_name);
-        gl_renderer_clear_current(self->gl_renderer);
+        eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     }
 }
 
@@ -521,6 +535,19 @@ enum plugin_init_result syncn_intercom_video_init(struct flutterpi *flutterpi, v
         return PLUGIN_INIT_RESULT_NOT_APPLICABLE;
     }
 
+    // Own dedicated EGL context (shared with flutter-pi's main context, so
+    // textures we upload are visible to it) instead of flutter-pi's shared
+    // "resource uploading" context -- see the struct field comment above for
+    // why: that shared context is contended with the Flutter engine's own
+    // internal use of it, confirmed on-device as EGL_BAD_ACCESS.
+    self->egl_display = gl_renderer_get_egl_display(self->gl_renderer);
+    self->egl_context = gl_renderer_create_context(self->gl_renderer);
+    if (self->egl_display == EGL_NO_DISPLAY || self->egl_context == EGL_NO_CONTEXT) {
+        LOG_ERROR("syncn_intercom_video: could not create a dedicated EGL context.\n");
+        free(self);
+        return PLUGIN_INIT_RESULT_ERROR;
+    }
+
     int ok = plugin_registry_set_receiver_v2_locked(
         flutterpi_get_plugin_registry(flutterpi),
         SYNCN_INTERCOM_VIDEO_CHANNEL,
@@ -545,6 +572,9 @@ void syncn_intercom_video_deinit(struct flutterpi *flutterpi, void *userdata) {
     handle_stop(self);
     if (self->texture != NULL) {
         texture_destroy(self->texture);
+    }
+    if (self->egl_context != EGL_NO_CONTEXT) {
+        eglDestroyContext(self->egl_display, self->egl_context);
     }
     pthread_mutex_destroy(&self->lock);
     instance = NULL;
