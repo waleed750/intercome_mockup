@@ -421,6 +421,20 @@ static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data
         return;
     }
 
+    // One-shot raw capture of the real door unit's NAL stream, to replay
+    // through a standalone gst-launch-1.0 pipeline on-device (bypassing this
+    // plugin's own appsrc/C code entirely) and determine whether GStreamer
+    // itself can decode this exact data, independent of anything this file
+    // does. Concatenated as-is (each submit() payload is expected to already
+    // carry its own Annex-B start code), capped so it doesn't grow unbounded.
+    if (self->submit_count <= 200) {
+        FILE *raw = fopen("/tmp/syncn_video_raw.h264", "ab");
+        if (raw != NULL) {
+            fwrite(data, 1, size, raw);
+            fclose(raw);
+        }
+    }
+
     GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
     gst_buffer_fill(buffer, 0, data, size);
 
