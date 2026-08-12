@@ -1,0 +1,327 @@
+// SPDX-License-Identifier: MIT
+//
+// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
+// and "syncn_intercom/audio_uplink" (EventChannel).
+//
+// Mirrors AudioPipelineHandler.kt: 8kHz mono 16-bit PCM <-> A-law, 160-byte
+// (20ms) frames. `start({captureEnabled})` brings up a GStreamer playback
+// pipeline for the downlink (A-law -> speaker) and, if captureEnabled, a
+// capture pipeline for the uplink (mic -> A-law -> events on the
+// audio_uplink EventChannel). `setMuted(bool)` mirrors the Android behavior:
+// it mutes the *outgoing mic* only (via a `volume` element ahead of the
+// encoder, matching Android's "still send frames, but silence" approach),
+// not the speaker. `playDownlink(Uint8List)` pushes one A-law frame into the
+// playback appsrc. `stop()` tears both pipelines down.
+//
+// NOT implemented in this first pass (tracked as a follow-up, not blocking
+// the "no sound at all" bug this exists to fix): AEC/NS/AGC parity with the
+// Android path's AcousticEchoCanceler/NoiseSuppressor/AutomaticGainControl.
+// GStreamer's `webrtcdsp` element (gst-plugins-bad) is the natural fit if/when
+// echo quality turns out to need it on real hardware.
+
+#include "syncn_intercom_audio.h"
+
+#include <string.h>
+
+#include <gst/app/gstappsink.h>
+#include <gst/app/gstappsrc.h>
+#include <gst/gst.h>
+
+#include "flutter-pi.h"
+#include "platformchannel.h"
+#include "pluginregistry.h"
+#include "util/logging.h"
+
+struct syncn_intercom_audio {
+    struct flutterpi *flutterpi;
+
+    pthread_mutex_t lock;
+    bool running;
+    bool capture_enabled;
+    bool uplink_listening;
+
+    GstElement *playback_pipeline;
+    GstElement *playback_appsrc;
+
+    GstElement *capture_pipeline;
+    GstElement *capture_appsink;
+    GstElement *capture_volume;
+};
+
+static void teardown_locked(struct syncn_intercom_audio *self) {
+    if (self->playback_pipeline != NULL) {
+        gst_element_set_state(self->playback_pipeline, GST_STATE_NULL);
+        gst_object_unref(self->playback_pipeline);
+        self->playback_pipeline = NULL;
+        self->playback_appsrc = NULL;
+    }
+    if (self->capture_pipeline != NULL) {
+        gst_element_set_state(self->capture_pipeline, GST_STATE_NULL);
+        gst_object_unref(self->capture_pipeline);
+        self->capture_pipeline = NULL;
+        self->capture_appsink = NULL;
+        self->capture_volume = NULL;
+    }
+    self->running = false;
+}
+
+// Called on a GStreamer streaming thread.
+static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) {
+    struct syncn_intercom_audio *self = userdata;
+
+    GstSample *sample = gst_app_sink_pull_sample(sink);
+    if (sample == NULL) {
+        return GST_FLOW_OK;
+    }
+
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    GstMapInfo map;
+    if (buffer == NULL || !gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    pthread_mutex_lock(&self->lock);
+    bool listening = self->uplink_listening;
+    pthread_mutex_unlock(&self->lock);
+
+    if (listening && map.size > 0) {
+        struct std_value event = {
+            .type = kStdUInt8Array,
+            .size = map.size,
+            .uint8array = map.data,
+        };
+        platch_send_success_event_std(SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, &event);
+    }
+
+    gst_buffer_unmap(buffer, &map);
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+
+static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled) {
+    if (self->running) {
+        self->capture_enabled = capture_enabled;
+        return true;
+    }
+
+    if (!gst_is_initialized()) {
+        GError *error = NULL;
+        if (!gst_init_check(NULL, NULL, &error)) {
+            LOG_ERROR("syncn_intercom_audio: gst_init_check failed: %s\n", error != NULL ? error->message : "unknown error");
+            if (error != NULL) g_error_free(error);
+            return false;
+        }
+    }
+
+    GError *error = NULL;
+    GstElement *playback = gst_parse_launch(
+        "appsrc name=src is-live=true format=time do-timestamp=true block=false "
+        "caps=audio/x-alaw,rate=8000,channels=1 ! "
+        "alawdec ! audioconvert ! audioresample ! autoaudiosink sync=false",
+        &error
+    );
+    if (playback == NULL) {
+        LOG_ERROR("syncn_intercom_audio: failed to build playback pipeline: %s\n", error != NULL ? error->message : "unknown error");
+        if (error != NULL) g_error_free(error);
+        return false;
+    }
+    GstElement *playback_appsrc = gst_bin_get_by_name(GST_BIN(playback), "src");
+    if (playback_appsrc == NULL || gst_element_set_state(playback, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
+        if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
+        gst_object_unref(playback);
+        return false;
+    }
+
+    GstElement *capture = NULL;
+    GstElement *capture_appsink = NULL;
+    GstElement *capture_volume = NULL;
+    if (capture_enabled) {
+        capture = gst_parse_launch(
+            "autoaudiosrc ! audioconvert ! audioresample ! "
+            "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
+            "volume name=capvol ! alawenc ! "
+            "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true",
+            &error
+        );
+        if (capture == NULL) {
+            LOG_ERROR(
+                "syncn_intercom_audio: failed to build capture pipeline (mic will be unavailable): %s\n",
+                error != NULL ? error->message : "unknown error"
+            );
+            if (error != NULL) g_error_free(error);
+        } else {
+            capture_appsink = gst_bin_get_by_name(GST_BIN(capture), "sink");
+            capture_volume = gst_bin_get_by_name(GST_BIN(capture), "capvol");
+            if (capture_appsink == NULL) {
+                gst_object_unref(capture);
+                capture = NULL;
+            } else {
+                g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
+                if (gst_element_set_state(capture, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+                    LOG_ERROR("syncn_intercom_audio: failed to start capture pipeline (mic will be unavailable)\n");
+                    gst_object_unref(capture_appsink);
+                    if (capture_volume != NULL) gst_object_unref(capture_volume);
+                    gst_object_unref(capture);
+                    capture = NULL;
+                    capture_appsink = NULL;
+                    capture_volume = NULL;
+                }
+            }
+        }
+    }
+
+    self->playback_pipeline = playback;
+    self->playback_appsrc = playback_appsrc;
+    self->capture_pipeline = capture;
+    self->capture_appsink = capture_appsink;
+    self->capture_volume = capture_volume;
+    self->capture_enabled = capture_enabled && capture != NULL;
+    self->running = true;
+    return true;
+}
+
+static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_t *data, size_t size) {
+    pthread_mutex_lock(&self->lock);
+    if (self->running && self->playback_appsrc != NULL && size > 0) {
+        GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
+        gst_buffer_fill(buffer, 0, data, size);
+        GstFlowReturn ret;
+        g_signal_emit_by_name(self->playback_appsrc, "push-buffer", buffer, &ret);
+        gst_buffer_unref(buffer);
+    }
+    pthread_mutex_unlock(&self->lock);
+}
+
+static void handle_set_muted(struct syncn_intercom_audio *self, bool muted) {
+    pthread_mutex_lock(&self->lock);
+    if (self->capture_volume != NULL) {
+        g_object_set(self->capture_volume, "mute", (gboolean) muted, NULL);
+    }
+    pthread_mutex_unlock(&self->lock);
+}
+
+static void on_method_channel_message(void *userdata, const FlutterPlatformMessage *message) {
+    struct syncn_intercom_audio *self = userdata;
+
+    struct platch_obj object;
+    if (platch_decode((uint8_t *) message->message, message->message_size, kStandardMethodCall, &object) != 0) {
+        platch_respond_illegal_arg_std(message->response_handle, "Malformed method call.");
+        return;
+    }
+
+    if (strcmp(object.method, "start") == 0) {
+        bool capture_enabled = true;
+        if (object.std_arg.type == kStdMap) {
+            for (size_t i = 0; i < object.std_arg.size; i++) {
+                struct std_value *key = &object.std_arg.keys[i];
+                if (key->type == kStdString && strcmp(key->string_value, "captureEnabled") == 0) {
+                    struct std_value *value = &object.std_arg.values[i];
+                    capture_enabled = STDVALUE_IS_BOOL(*value) ? STDVALUE_AS_BOOL(*value) : true;
+                }
+            }
+        }
+
+        pthread_mutex_lock(&self->lock);
+        bool ok = start_locked(self, capture_enabled);
+        pthread_mutex_unlock(&self->lock);
+
+        if (ok) {
+            platch_respond_success_std(message->response_handle, NULL);
+        } else {
+            platch_respond_error_std(message->response_handle, "audio_start_failed", "Could not start the GStreamer audio pipeline.", NULL);
+        }
+    } else if (strcmp(object.method, "playDownlink") == 0) {
+        if (object.std_arg.type == kStdUInt8Array) {
+            handle_play_downlink(self, object.std_arg.uint8array, object.std_arg.size);
+        }
+        platch_respond_success_std(message->response_handle, NULL);
+    } else if (strcmp(object.method, "setMuted") == 0) {
+        bool muted = STDVALUE_IS_BOOL(object.std_arg) ? STDVALUE_AS_BOOL(object.std_arg) : false;
+        handle_set_muted(self, muted);
+        platch_respond_success_std(message->response_handle, NULL);
+    } else if (strcmp(object.method, "stop") == 0) {
+        pthread_mutex_lock(&self->lock);
+        teardown_locked(self);
+        pthread_mutex_unlock(&self->lock);
+        platch_respond_success_std(message->response_handle, NULL);
+    } else {
+        platch_respond_not_implemented(message->response_handle);
+    }
+
+    platch_free_obj(&object);
+}
+
+static void on_event_channel_message(void *userdata, const FlutterPlatformMessage *message) {
+    struct syncn_intercom_audio *self = userdata;
+
+    struct platch_obj object;
+    if (platch_decode((uint8_t *) message->message, message->message_size, kStandardMethodCall, &object) != 0) {
+        platch_respond_illegal_arg_std(message->response_handle, "Malformed method call.");
+        return;
+    }
+
+    if (strcmp(object.method, "listen") == 0) {
+        pthread_mutex_lock(&self->lock);
+        self->uplink_listening = true;
+        pthread_mutex_unlock(&self->lock);
+        platch_respond_success_std(message->response_handle, NULL);
+    } else if (strcmp(object.method, "cancel") == 0) {
+        pthread_mutex_lock(&self->lock);
+        self->uplink_listening = false;
+        pthread_mutex_unlock(&self->lock);
+        platch_respond_success_std(message->response_handle, NULL);
+    } else {
+        platch_respond_not_implemented(message->response_handle);
+    }
+
+    platch_free_obj(&object);
+}
+
+enum plugin_init_result syncn_intercom_audio_init(struct flutterpi *flutterpi, void **userdata_out) {
+    struct syncn_intercom_audio *self = calloc(1, sizeof(*self));
+    if (self == NULL) {
+        return PLUGIN_INIT_RESULT_ERROR;
+    }
+
+    self->flutterpi = flutterpi;
+    pthread_mutex_init(&self->lock, NULL);
+
+    struct plugin_registry *registry = flutterpi_get_plugin_registry(flutterpi);
+
+    int ok = plugin_registry_set_receiver_v2_locked(registry, SYNCN_INTERCOM_AUDIO_METHOD_CHANNEL, on_method_channel_message, self);
+    if (ok != 0) {
+        pthread_mutex_destroy(&self->lock);
+        free(self);
+        return PLUGIN_INIT_RESULT_ERROR;
+    }
+
+    ok = plugin_registry_set_receiver_v2_locked(registry, SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, on_event_channel_message, self);
+    if (ok != 0) {
+        plugin_registry_remove_receiver_v2_locked(registry, SYNCN_INTERCOM_AUDIO_METHOD_CHANNEL);
+        pthread_mutex_destroy(&self->lock);
+        free(self);
+        return PLUGIN_INIT_RESULT_ERROR;
+    }
+
+    *userdata_out = self;
+    return PLUGIN_INIT_RESULT_INITIALIZED;
+}
+
+void syncn_intercom_audio_deinit(struct flutterpi *flutterpi, void *userdata) {
+    struct syncn_intercom_audio *self = userdata;
+    struct plugin_registry *registry = flutterpi_get_plugin_registry(flutterpi);
+
+    plugin_registry_remove_receiver_v2_locked(registry, SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL);
+    plugin_registry_remove_receiver_v2_locked(registry, SYNCN_INTERCOM_AUDIO_METHOD_CHANNEL);
+
+    pthread_mutex_lock(&self->lock);
+    teardown_locked(self);
+    pthread_mutex_unlock(&self->lock);
+
+    pthread_mutex_destroy(&self->lock);
+    free(self);
+}
+
+FLUTTERPI_PLUGIN("syncn_intercom_audio", syncn_intercom_audio, syncn_intercom_audio_init, syncn_intercom_audio_deinit)

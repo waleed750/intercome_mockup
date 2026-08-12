@@ -1,0 +1,795 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 734aba5..d021263 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -36,6 +36,9 @@ option(TRY_BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN "Don't throw an error if the gstr
+ option(BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN "Include the gstreamer based audio plugins in the finished binary." ON)
+ option(TRY_BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN "Don't throw an error if the gstreamer libs aren't found, instead just don't build gstreamer audio plugin." ON)
+ 
++option(BUILD_SYNCN_INTERCOM_PLUGIN "Include the SyncN intercom audio/video plugins (syncn_intercom/audio, syncn_intercom/video) in the finished binary." ON)
++option(TRY_BUILD_SYNCN_INTERCOM_PLUGIN "Don't throw an error if the required libs aren't found, instead just don't build the SyncN intercom plugins in that case." ON)
++
+ option(BUILD_SENTRY_PLUGIN "Include the sentry plugin in the finished binary. Allows for crash reporting to sentry.io." OFF)
+ 
+ option(BUILD_CHARSET_CONVERTER_PLUGIN "Include the charset converter plugin in the finished binary." OFF)
+@@ -375,6 +378,39 @@ if (BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN)
+   endif()
+ endif()
+ 
++if (BUILD_SYNCN_INTERCOM_PLUGIN)
++  if (NOT HAVE_EGL_GLES2)
++    message(NOTICE "EGL and OpenGL ES2 are required for the SyncN intercom video plugin. SyncN intercom plugins won't be built.")
++  else()
++    if (TRY_BUILD_SYNCN_INTERCOM_PLUGIN)
++      pkg_check_modules(LIBGSTREAMER IMPORTED_TARGET gstreamer-1.0)
++      pkg_check_modules(LIBGSTREAMER_APP IMPORTED_TARGET gstreamer-app-1.0)
++      pkg_check_modules(LIBGSTREAMER_VIDEO IMPORTED_TARGET gstreamer-video-1.0)
++      pkg_check_modules(LIBGSTREAMER_AUDIO IMPORTED_TARGET gstreamer-audio-1.0)
++    else()
++      pkg_check_modules(LIBGSTREAMER REQUIRED IMPORTED_TARGET gstreamer-1.0)
++      pkg_check_modules(LIBGSTREAMER_APP REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
++      pkg_check_modules(LIBGSTREAMER_VIDEO REQUIRED IMPORTED_TARGET gstreamer-video-1.0)
++      pkg_check_modules(LIBGSTREAMER_AUDIO REQUIRED IMPORTED_TARGET gstreamer-audio-1.0)
++    endif()
++
++    if (LIBGSTREAMER_FOUND AND LIBGSTREAMER_APP_FOUND AND LIBGSTREAMER_VIDEO_FOUND AND LIBGSTREAMER_AUDIO_FOUND)
++      target_sources(flutterpi_module PRIVATE
++        src/plugins/syncn_intercom_video.c
++        src/plugins/syncn_intercom_audio.c
++      )
++      target_link_libraries(flutterpi_module PUBLIC
++        PkgConfig::LIBGSTREAMER
++        PkgConfig::LIBGSTREAMER_APP
++        PkgConfig::LIBGSTREAMER_VIDEO
++        PkgConfig::LIBGSTREAMER_AUDIO
++      )
++    else()
++      message(NOTICE "Couldn't find gstreamer libraries. SyncN intercom plugins won't be built.")
++    endif()
++  endif()
++endif()
++
+ if (BUILD_CHARSET_CONVERTER_PLUGIN)
+   target_sources(flutterpi_module PRIVATE src/plugins/charset_converter.c)
+ endif()
+diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
+new file mode 100644
+index 0000000..338e937
+--- /dev/null
++++ b/src/plugins/syncn_intercom_audio.c
+@@ -0,0 +1,327 @@
++// SPDX-License-Identifier: MIT
++//
++// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
++// and "syncn_intercom/audio_uplink" (EventChannel).
++//
++// Mirrors AudioPipelineHandler.kt: 8kHz mono 16-bit PCM <-> A-law, 160-byte
++// (20ms) frames. `start({captureEnabled})` brings up a GStreamer playback
++// pipeline for the downlink (A-law -> speaker) and, if captureEnabled, a
++// capture pipeline for the uplink (mic -> A-law -> events on the
++// audio_uplink EventChannel). `setMuted(bool)` mirrors the Android behavior:
++// it mutes the *outgoing mic* only (via a `volume` element ahead of the
++// encoder, matching Android's "still send frames, but silence" approach),
++// not the speaker. `playDownlink(Uint8List)` pushes one A-law frame into the
++// playback appsrc. `stop()` tears both pipelines down.
++//
++// NOT implemented in this first pass (tracked as a follow-up, not blocking
++// the "no sound at all" bug this exists to fix): AEC/NS/AGC parity with the
++// Android path's AcousticEchoCanceler/NoiseSuppressor/AutomaticGainControl.
++// GStreamer's `webrtcdsp` element (gst-plugins-bad) is the natural fit if/when
++// echo quality turns out to need it on real hardware.
++
++#include "syncn_intercom_audio.h"
++
++#include <string.h>
++
++#include <gst/app/gstappsink.h>
++#include <gst/app/gstappsrc.h>
++#include <gst/gst.h>
++
++#include "flutter-pi.h"
++#include "platformchannel.h"
++#include "pluginregistry.h"
++#include "util/logging.h"
++
++struct syncn_intercom_audio {
++    struct flutterpi *flutterpi;
++
++    pthread_mutex_t lock;
++    bool running;
++    bool capture_enabled;
++    bool uplink_listening;
++
++    GstElement *playback_pipeline;
++    GstElement *playback_appsrc;
++
++    GstElement *capture_pipeline;
++    GstElement *capture_appsink;
++    GstElement *capture_volume;
++};
++
++static void teardown_locked(struct syncn_intercom_audio *self) {
++    if (self->playback_pipeline != NULL) {
++        gst_element_set_state(self->playback_pipeline, GST_STATE_NULL);
++        gst_object_unref(self->playback_pipeline);
++        self->playback_pipeline = NULL;
++        self->playback_appsrc = NULL;
++    }
++    if (self->capture_pipeline != NULL) {
++        gst_element_set_state(self->capture_pipeline, GST_STATE_NULL);
++        gst_object_unref(self->capture_pipeline);
++        self->capture_pipeline = NULL;
++        self->capture_appsink = NULL;
++        self->capture_volume = NULL;
++    }
++    self->running = false;
++}
++
++// Called on a GStreamer streaming thread.
++static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) {
++    struct syncn_intercom_audio *self = userdata;
++
++    GstSample *sample = gst_app_sink_pull_sample(sink);
++    if (sample == NULL) {
++        return GST_FLOW_OK;
++    }
++
++    GstBuffer *buffer = gst_sample_get_buffer(sample);
++    GstMapInfo map;
++    if (buffer == NULL || !gst_buffer_map(buffer, &map, GST_MAP_READ)) {
++        gst_sample_unref(sample);
++        return GST_FLOW_OK;
++    }
++
++    pthread_mutex_lock(&self->lock);
++    bool listening = self->uplink_listening;
++    pthread_mutex_unlock(&self->lock);
++
++    if (listening && map.size > 0) {
++        struct std_value event = {
++            .type = kStdUInt8Array,
++            .size = map.size,
++            .uint8array = map.data,
++        };
++        platch_send_success_event_std(SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, &event);
++    }
++
++    gst_buffer_unmap(buffer, &map);
++    gst_sample_unref(sample);
++    return GST_FLOW_OK;
++}
++
++static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled) {
++    if (self->running) {
++        self->capture_enabled = capture_enabled;
++        return true;
++    }
++
++    if (!gst_is_initialized()) {
++        GError *error = NULL;
++        if (!gst_init_check(NULL, NULL, &error)) {
++            LOG_ERROR("syncn_intercom_audio: gst_init_check failed: %s\n", error != NULL ? error->message : "unknown error");
++            if (error != NULL) g_error_free(error);
++            return false;
++        }
++    }
++
++    GError *error = NULL;
++    GstElement *playback = gst_parse_launch(
++        "appsrc name=src is-live=true format=time do-timestamp=true block=false "
++        "caps=audio/x-alaw,rate=8000,channels=1 ! "
++        "alawdec ! audioconvert ! audioresample ! autoaudiosink sync=false",
++        &error
++    );
++    if (playback == NULL) {
++        LOG_ERROR("syncn_intercom_audio: failed to build playback pipeline: %s\n", error != NULL ? error->message : "unknown error");
++        if (error != NULL) g_error_free(error);
++        return false;
++    }
++    GstElement *playback_appsrc = gst_bin_get_by_name(GST_BIN(playback), "src");
++    if (playback_appsrc == NULL || gst_element_set_state(playback, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
++        LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
++        if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
++        gst_object_unref(playback);
++        return false;
++    }
++
++    GstElement *capture = NULL;
++    GstElement *capture_appsink = NULL;
++    GstElement *capture_volume = NULL;
++    if (capture_enabled) {
++        capture = gst_parse_launch(
++            "autoaudiosrc ! audioconvert ! audioresample ! "
++            "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
++            "volume name=capvol ! alawenc ! "
++            "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true",
++            &error
++        );
++        if (capture == NULL) {
++            LOG_ERROR(
++                "syncn_intercom_audio: failed to build capture pipeline (mic will be unavailable): %s\n",
++                error != NULL ? error->message : "unknown error"
++            );
++            if (error != NULL) g_error_free(error);
++        } else {
++            capture_appsink = gst_bin_get_by_name(GST_BIN(capture), "sink");
++            capture_volume = gst_bin_get_by_name(GST_BIN(capture), "capvol");
++            if (capture_appsink == NULL) {
++                gst_object_unref(capture);
++                capture = NULL;
++            } else {
++                g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
++                if (gst_element_set_state(capture, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
++                    LOG_ERROR("syncn_intercom_audio: failed to start capture pipeline (mic will be unavailable)\n");
++                    gst_object_unref(capture_appsink);
++                    if (capture_volume != NULL) gst_object_unref(capture_volume);
++                    gst_object_unref(capture);
++                    capture = NULL;
++                    capture_appsink = NULL;
++                    capture_volume = NULL;
++                }
++            }
++        }
++    }
++
++    self->playback_pipeline = playback;
++    self->playback_appsrc = playback_appsrc;
++    self->capture_pipeline = capture;
++    self->capture_appsink = capture_appsink;
++    self->capture_volume = capture_volume;
++    self->capture_enabled = capture_enabled && capture != NULL;
++    self->running = true;
++    return true;
++}
++
++static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_t *data, size_t size) {
++    pthread_mutex_lock(&self->lock);
++    if (self->running && self->playback_appsrc != NULL && size > 0) {
++        GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
++        gst_buffer_fill(buffer, 0, data, size);
++        GstFlowReturn ret;
++        g_signal_emit_by_name(self->playback_appsrc, "push-buffer", buffer, &ret);
++        gst_buffer_unref(buffer);
++    }
++    pthread_mutex_unlock(&self->lock);
++}
++
++static void handle_set_muted(struct syncn_intercom_audio *self, bool muted) {
++    pthread_mutex_lock(&self->lock);
++    if (self->capture_volume != NULL) {
++        g_object_set(self->capture_volume, "mute", (gboolean) muted, NULL);
++    }
++    pthread_mutex_unlock(&self->lock);
++}
++
++static void on_method_channel_message(void *userdata, const FlutterPlatformMessage *message) {
++    struct syncn_intercom_audio *self = userdata;
++
++    struct platch_obj object;
++    if (platch_decode((uint8_t *) message->message, message->message_size, kStandardMethodCall, &object) != 0) {
++        platch_respond_illegal_arg_std(message->response_handle, "Malformed method call.");
++        return;
++    }
++
++    if (strcmp(object.method, "start") == 0) {
++        bool capture_enabled = true;
++        if (object.std_arg.type == kStdMap) {
++            for (size_t i = 0; i < object.std_arg.size; i++) {
++                struct std_value *key = &object.std_arg.keys[i];
++                if (key->type == kStdString && strcmp(key->string_value, "captureEnabled") == 0) {
++                    struct std_value *value = &object.std_arg.values[i];
++                    capture_enabled = STDVALUE_IS_BOOL(*value) ? STDVALUE_AS_BOOL(*value) : true;
++                }
++            }
++        }
++
++        pthread_mutex_lock(&self->lock);
++        bool ok = start_locked(self, capture_enabled);
++        pthread_mutex_unlock(&self->lock);
++
++        if (ok) {
++            platch_respond_success_std(message->response_handle, NULL);
++        } else {
++            platch_respond_error_std(message->response_handle, "audio_start_failed", "Could not start the GStreamer audio pipeline.", NULL);
++        }
++    } else if (strcmp(object.method, "playDownlink") == 0) {
++        if (object.std_arg.type == kStdUInt8Array) {
++            handle_play_downlink(self, object.std_arg.uint8array, object.std_arg.size);
++        }
++        platch_respond_success_std(message->response_handle, NULL);
++    } else if (strcmp(object.method, "setMuted") == 0) {
++        bool muted = STDVALUE_IS_BOOL(object.std_arg) ? STDVALUE_AS_BOOL(object.std_arg) : false;
++        handle_set_muted(self, muted);
++        platch_respond_success_std(message->response_handle, NULL);
++    } else if (strcmp(object.method, "stop") == 0) {
++        pthread_mutex_lock(&self->lock);
++        teardown_locked(self);
++        pthread_mutex_unlock(&self->lock);
++        platch_respond_success_std(message->response_handle, NULL);
++    } else {
++        platch_respond_not_implemented(message->response_handle);
++    }
++
++    platch_free_obj(&object);
++}
++
++static void on_event_channel_message(void *userdata, const FlutterPlatformMessage *message) {
++    struct syncn_intercom_audio *self = userdata;
++
++    struct platch_obj object;
++    if (platch_decode((uint8_t *) message->message, message->message_size, kStandardMethodCall, &object) != 0) {
++        platch_respond_illegal_arg_std(message->response_handle, "Malformed method call.");
++        return;
++    }
++
++    if (strcmp(object.method, "listen") == 0) {
++        pthread_mutex_lock(&self->lock);
++        self->uplink_listening = true;
++        pthread_mutex_unlock(&self->lock);
++        platch_respond_success_std(message->response_handle, NULL);
++    } else if (strcmp(object.method, "cancel") == 0) {
++        pthread_mutex_lock(&self->lock);
++        self->uplink_listening = false;
++        pthread_mutex_unlock(&self->lock);
++        platch_respond_success_std(message->response_handle, NULL);
++    } else {
++        platch_respond_not_implemented(message->response_handle);
++    }
++
++    platch_free_obj(&object);
++}
++
++enum plugin_init_result syncn_intercom_audio_init(struct flutterpi *flutterpi, void **userdata_out) {
++    struct syncn_intercom_audio *self = calloc(1, sizeof(*self));
++    if (self == NULL) {
++        return PLUGIN_INIT_RESULT_ERROR;
++    }
++
++    self->flutterpi = flutterpi;
++    pthread_mutex_init(&self->lock, NULL);
++
++    struct plugin_registry *registry = flutterpi_get_plugin_registry(flutterpi);
++
++    int ok = plugin_registry_set_receiver_v2_locked(registry, SYNCN_INTERCOM_AUDIO_METHOD_CHANNEL, on_method_channel_message, self);
++    if (ok != 0) {
++        pthread_mutex_destroy(&self->lock);
++        free(self);
++        return PLUGIN_INIT_RESULT_ERROR;
++    }
++
++    ok = plugin_registry_set_receiver_v2_locked(registry, SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, on_event_channel_message, self);
++    if (ok != 0) {
++        plugin_registry_remove_receiver_v2_locked(registry, SYNCN_INTERCOM_AUDIO_METHOD_CHANNEL);
++        pthread_mutex_destroy(&self->lock);
++        free(self);
++        return PLUGIN_INIT_RESULT_ERROR;
++    }
++
++    *userdata_out = self;
++    return PLUGIN_INIT_RESULT_INITIALIZED;
++}
++
++void syncn_intercom_audio_deinit(struct flutterpi *flutterpi, void *userdata) {
++    struct syncn_intercom_audio *self = userdata;
++    struct plugin_registry *registry = flutterpi_get_plugin_registry(flutterpi);
++
++    plugin_registry_remove_receiver_v2_locked(registry, SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL);
++    plugin_registry_remove_receiver_v2_locked(registry, SYNCN_INTERCOM_AUDIO_METHOD_CHANNEL);
++
++    pthread_mutex_lock(&self->lock);
++    teardown_locked(self);
++    pthread_mutex_unlock(&self->lock);
++
++    pthread_mutex_destroy(&self->lock);
++    free(self);
++}
++
++FLUTTERPI_PLUGIN("syncn_intercom_audio", syncn_intercom_audio, syncn_intercom_audio_init, syncn_intercom_audio_deinit)
+diff --git a/src/plugins/syncn_intercom_audio.h b/src/plugins/syncn_intercom_audio.h
+new file mode 100644
+index 0000000..598c45e
+--- /dev/null
++++ b/src/plugins/syncn_intercom_audio.h
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: MIT
++#ifndef _SYNCN_INTERCOM_AUDIO_H
++#define _SYNCN_INTERCOM_AUDIO_H
++
++#include "pluginregistry.h"
++
++#define SYNCN_INTERCOM_AUDIO_METHOD_CHANNEL "syncn_intercom/audio"
++#define SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL "syncn_intercom/audio_uplink"
++
++enum plugin_init_result syncn_intercom_audio_init(struct flutterpi *flutterpi, void **userdata_out);
++void syncn_intercom_audio_deinit(struct flutterpi *flutterpi, void *userdata);
++
++#endif  // _SYNCN_INTERCOM_AUDIO_H
+diff --git a/src/plugins/syncn_intercom_video.c b/src/plugins/syncn_intercom_video.c
+new file mode 100644
+index 0000000..2b8b8c7
+--- /dev/null
++++ b/src/plugins/syncn_intercom_video.c
+@@ -0,0 +1,365 @@
++// SPDX-License-Identifier: MIT
++//
++// flutter-pi native implementation of the "syncn_intercom/video" MethodChannel.
++//
++// Mirrors the Android implementation (VideoDecoderHandler.kt): `start()` creates
++// a Flutter external texture and returns its id, `submit(Uint8List)` pushes one
++// H.264 access unit (Annex-B byte-stream, as produced by the door unit's
++// encoder -- same assumption the Android MediaCodec path makes, since it
++// configures MediaCodec with no explicit CSD and relies on in-band SPS/PPS),
++// `stop()` tears everything down. Decoding is done by a GStreamer pipeline
++// (appsrc -> h264parse -> avdec_h264 -> videoconvert), and each decoded RGBA
++// frame is uploaded into a plain GL_TEXTURE_2D via glTexImage2D/glTexSubImage2D
++// on flutter-pi's shared "resource uploading" EGL context, then pushed into a
++// flutter-pi `struct texture`.
++//
++// NOTE: NAL framing (Annex-B vs AVCC) and alignment (one NAL vs one full
++// access unit per submit() call) are inferred from the Android side, not
++// independently confirmed against the door unit's actual encoder output --
++// verify this against real captured traffic during on-device bring-up and
++// adjust the appsrc caps / h264parse config below if frames don't decode.
++
++#include "syncn_intercom_video.h"
++
++#include <string.h>
++
++#include <gst/app/gstappsrc.h>
++#include <gst/app/gstappsink.h>
++#include <gst/gst.h>
++
++#include <GLES2/gl2.h>
++
++#include "flutter-pi.h"
++#include "gl_renderer.h"
++#include "platformchannel.h"
++#include "pluginregistry.h"
++#include "texture_registry.h"
++#include "util/logging.h"
++
++struct syncn_intercom_video {
++    struct flutterpi *flutterpi;
++    struct gl_renderer *gl_renderer;
++    struct texture_registry *texture_registry;
++
++    pthread_mutex_t lock;
++    bool running;
++
++    struct texture *texture;
++    GstElement *pipeline;
++    GstElement *appsrc;
++    GstElement *appsink;
++
++    GLuint gl_texture_name;
++    int gl_texture_width;
++    int gl_texture_height;
++};
++
++// Only one intercom call (and therefore one video stream) is ever active at a
++// time -- see CallController, which tears down/rebuilds per call -- so a
++// process-wide singleton is sufficient and avoids plumbing instance handles
++// through the platform channel.
++static struct syncn_intercom_video *instance;
++
++static void on_texture_frame_destroy(const struct texture_frame *frame, void *userdata) {
++    (void) frame;
++    (void) userdata;
++    // The GL texture object is owned by `instance` and reused across frames
++    // (we glTexSubImage2D into it rather than allocating a new one each
++    // time), so there's nothing to free here.
++}
++
++// Called on a GStreamer streaming thread (not the flutter-pi platform
++// thread), once per decoded frame.
++static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
++    struct syncn_intercom_video *self = userdata;
++
++    GstSample *sample = gst_app_sink_pull_sample(sink);
++    if (sample == NULL) {
++        return GST_FLOW_OK;
++    }
++
++    GstBuffer *buffer = gst_sample_get_buffer(sample);
++    GstCaps *caps = gst_sample_get_caps(sample);
++    if (buffer == NULL || caps == NULL) {
++        gst_sample_unref(sample);
++        return GST_FLOW_OK;
++    }
++
++    GstVideoInfo info;
++    if (!gst_video_info_from_caps(&info, caps)) {
++        gst_sample_unref(sample);
++        return GST_FLOW_OK;
++    }
++
++    GstMapInfo map;
++    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
++        gst_sample_unref(sample);
++        return GST_FLOW_OK;
++    }
++
++    int width = GST_VIDEO_INFO_WIDTH(&info);
++    int height = GST_VIDEO_INFO_HEIGHT(&info);
++
++    pthread_mutex_lock(&self->lock);
++
++    if (self->running && gl_renderer_make_flutter_resource_uploading_context_current(self->gl_renderer) == 0) {
++        if (self->gl_texture_name == 0) {
++            glGenTextures(1, &self->gl_texture_name);
++            glBindTexture(GL_TEXTURE_2D, self->gl_texture_name);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        } else {
++            glBindTexture(GL_TEXTURE_2D, self->gl_texture_name);
++        }
++
++        // videoconvert's output stride can be padded; GST_VIDEO_INFO gives us
++        // the real plane stride, but glTexImage2D assumes tightly packed rows,
++        // so upload row-by-row when stride != width * 4 rather than assuming
++        // GL_UNPACK_ROW_LENGTH is available (it isn't in GLES2 without an
++        // extension).
++        int stride = GST_VIDEO_INFO_PLANE_STRIDE(&info, 0);
++        const uint8_t *plane = map.data + GST_VIDEO_INFO_PLANE_OFFSET(&info, 0);
++
++        if (width != self->gl_texture_width || height != self->gl_texture_height) {
++            if (stride == width * 4) {
++                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, plane);
++            } else {
++                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++                for (int y = 0; y < height; y++) {
++                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, width, 1, GL_RGBA, GL_UNSIGNED_BYTE, plane + y * stride);
++                }
++            }
++            self->gl_texture_width = width;
++            self->gl_texture_height = height;
++        } else {
++            if (stride == width * 4) {
++                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, plane);
++            } else {
++                for (int y = 0; y < height; y++) {
++                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, width, 1, GL_RGBA, GL_UNSIGNED_BYTE, plane + y * stride);
++                }
++            }
++        }
++
++        struct texture_frame frame = {
++            .gl = {
++                .target = GL_TEXTURE_2D,
++                .name = self->gl_texture_name,
++                .format = GL_RGBA8,
++                .width = (size_t) width,
++                .height = (size_t) height,
++            },
++            .destroy = on_texture_frame_destroy,
++            .userdata = NULL,
++        };
++        texture_push_frame(self->texture, &frame);
++
++        gl_renderer_clear_current(self->gl_renderer);
++    }
++
++    pthread_mutex_unlock(&self->lock);
++
++    gst_buffer_unmap(buffer, &map);
++    gst_sample_unref(sample);
++    return GST_FLOW_OK;
++}
++
++static void teardown_pipeline_locked(struct syncn_intercom_video *self) {
++    if (self->pipeline != NULL) {
++        gst_element_set_state(self->pipeline, GST_STATE_NULL);
++        gst_object_unref(self->pipeline);
++        self->pipeline = NULL;
++        self->appsrc = NULL;
++        self->appsink = NULL;
++    }
++    if (self->gl_texture_name != 0 && gl_renderer_make_flutter_resource_uploading_context_current(self->gl_renderer) == 0) {
++        glDeleteTextures(1, &self->gl_texture_name);
++        gl_renderer_clear_current(self->gl_renderer);
++    }
++    self->gl_texture_name = 0;
++    self->gl_texture_width = 0;
++    self->gl_texture_height = 0;
++}
++
++static int64_t handle_start(struct syncn_intercom_video *self) {
++    pthread_mutex_lock(&self->lock);
++
++    if (self->running) {
++        int64_t id = texture_get_id(self->texture);
++        pthread_mutex_unlock(&self->lock);
++        return id;
++    }
++
++    if (!gst_is_initialized()) {
++        GError *error = NULL;
++        if (!gst_init_check(NULL, NULL, &error)) {
++            LOG_ERROR("syncn_intercom_video: gst_init_check failed: %s\n", error != NULL ? error->message : "unknown error");
++            if (error != NULL) g_error_free(error);
++            pthread_mutex_unlock(&self->lock);
++            return -1;
++        }
++    }
++
++    if (self->texture == NULL) {
++        self->texture = texture_new(self->texture_registry);
++        if (self->texture == NULL) {
++            pthread_mutex_unlock(&self->lock);
++            return -1;
++        }
++    }
++
++    GError *error = NULL;
++    GstElement *pipeline = gst_parse_launch(
++        "appsrc name=src is-live=true format=time do-timestamp=true block=false "
++        "caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
++        "h264parse config-interval=-1 ! avdec_h264 ! videoconvert ! "
++        "video/x-raw,format=RGBA ! "
++        "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false",
++        &error
++    );
++    if (pipeline == NULL) {
++        LOG_ERROR("syncn_intercom_video: failed to build pipeline: %s\n", error != NULL ? error->message : "unknown error");
++        if (error != NULL) g_error_free(error);
++        pthread_mutex_unlock(&self->lock);
++        return -1;
++    }
++
++    GstElement *appsrc = gst_bin_get_by_name(GST_BIN(pipeline), "src");
++    GstElement *appsink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
++    if (appsrc == NULL || appsink == NULL) {
++        LOG_ERROR("syncn_intercom_video: pipeline missing appsrc/appsink\n");
++        gst_object_unref(pipeline);
++        if (appsrc != NULL) gst_object_unref(appsrc);
++        if (appsink != NULL) gst_object_unref(appsink);
++        pthread_mutex_unlock(&self->lock);
++        return -1;
++    }
++
++    g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), self);
++
++    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
++        LOG_ERROR("syncn_intercom_video: failed to start pipeline\n");
++        gst_object_unref(appsrc);
++        gst_object_unref(appsink);
++        gst_object_unref(pipeline);
++        pthread_mutex_unlock(&self->lock);
++        return -1;
++    }
++
++    self->pipeline = pipeline;
++    self->appsrc = appsrc;
++    self->appsink = appsink;
++    self->running = true;
++
++    int64_t id = texture_get_id(self->texture);
++    pthread_mutex_unlock(&self->lock);
++    return id;
++}
++
++static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data, size_t size) {
++    pthread_mutex_lock(&self->lock);
++    if (!self->running || self->appsrc == NULL || size == 0) {
++        pthread_mutex_unlock(&self->lock);
++        return;
++    }
++
++    GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
++    gst_buffer_fill(buffer, 0, data, size);
++
++    GstFlowReturn ret;
++    g_signal_emit_by_name(self->appsrc, "push-buffer", buffer, &ret);
++    gst_buffer_unref(buffer);
++
++    pthread_mutex_unlock(&self->lock);
++}
++
++static void handle_stop(struct syncn_intercom_video *self) {
++    pthread_mutex_lock(&self->lock);
++    self->running = false;
++    teardown_pipeline_locked(self);
++    pthread_mutex_unlock(&self->lock);
++}
++
++static void on_platform_message(void *userdata, const FlutterPlatformMessage *message) {
++    struct syncn_intercom_video *self = userdata;
++
++    struct platch_obj object;
++    int ok = platch_decode((uint8_t *) message->message, message->message_size, kStandardMethodCall, &object);
++    if (ok != 0) {
++        platch_respond_illegal_arg_std(message->response_handle, "Malformed method call.");
++        return;
++    }
++
++    if (strcmp(object.method, "start") == 0) {
++        int64_t id = handle_start(self);
++        if (id < 0) {
++            platch_respond_error_std(message->response_handle, "video_start_failed", "Could not start the GStreamer video pipeline.", NULL);
++        } else {
++            struct std_value result = STDINT64(id);
++            platch_respond_success_std(message->response_handle, &result);
++        }
++    } else if (strcmp(object.method, "submit") == 0) {
++        if (object.std_arg.type == kStdUInt8Array) {
++            handle_submit(self, object.std_arg.uint8array, object.std_arg.size);
++        }
++        platch_respond_success_std(message->response_handle, NULL);
++    } else if (strcmp(object.method, "stop") == 0) {
++        handle_stop(self);
++        platch_respond_success_std(message->response_handle, NULL);
++    } else {
++        platch_respond_not_implemented(message->response_handle);
++    }
++
++    platch_free_obj(&object);
++}
++
++enum plugin_init_result syncn_intercom_video_init(struct flutterpi *flutterpi, void **userdata_out) {
++    struct syncn_intercom_video *self = calloc(1, sizeof(*self));
++    if (self == NULL) {
++        return PLUGIN_INIT_RESULT_ERROR;
++    }
++
++    self->flutterpi = flutterpi;
++    self->gl_renderer = flutterpi_get_gl_renderer(flutterpi);
++    self->texture_registry = flutterpi_get_texture_registry(flutterpi);
++    pthread_mutex_init(&self->lock, NULL);
++
++    if (self->gl_renderer == NULL || self->texture_registry == NULL) {
++        LOG_ERROR("syncn_intercom_video: GL renderer / texture registry not available. Is EGL/GLES2 enabled?\n");
++        free(self);
++        return PLUGIN_INIT_RESULT_NOT_APPLICABLE;
++    }
++
++    int ok = plugin_registry_set_receiver_v2_locked(
++        flutterpi_get_plugin_registry(flutterpi),
++        SYNCN_INTERCOM_VIDEO_CHANNEL,
++        on_platform_message,
++        self
++    );
++    if (ok != 0) {
++        free(self);
++        return PLUGIN_INIT_RESULT_ERROR;
++    }
++
++    instance = self;
++    *userdata_out = self;
++    return PLUGIN_INIT_RESULT_INITIALIZED;
++}
++
++void syncn_intercom_video_deinit(struct flutterpi *flutterpi, void *userdata) {
++    struct syncn_intercom_video *self = userdata;
++
++    plugin_registry_remove_receiver_v2_locked(flutterpi_get_plugin_registry(flutterpi), SYNCN_INTERCOM_VIDEO_CHANNEL);
++
++    handle_stop(self);
++    if (self->texture != NULL) {
++        texture_destroy(self->texture);
++    }
++    pthread_mutex_destroy(&self->lock);
++    instance = NULL;
++    free(self);
++}
++
++FLUTTERPI_PLUGIN("syncn_intercom_video", syncn_intercom_video, syncn_intercom_video_init, syncn_intercom_video_deinit)
+diff --git a/src/plugins/syncn_intercom_video.h b/src/plugins/syncn_intercom_video.h
+new file mode 100644
+index 0000000..87128e0
+--- /dev/null
++++ b/src/plugins/syncn_intercom_video.h
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier: MIT
++#ifndef _SYNCN_INTERCOM_VIDEO_H
++#define _SYNCN_INTERCOM_VIDEO_H
++
++#include "pluginregistry.h"
++
++#define SYNCN_INTERCOM_VIDEO_CHANNEL "syncn_intercom/video"
++
++enum plugin_init_result syncn_intercom_video_init(struct flutterpi *flutterpi, void **userdata_out);
++void syncn_intercom_video_deinit(struct flutterpi *flutterpi, void *userdata);
++
++#endif  // _SYNCN_INTERCOM_VIDEO_H
