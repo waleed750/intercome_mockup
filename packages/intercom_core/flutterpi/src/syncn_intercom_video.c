@@ -4,20 +4,21 @@
 //
 // Mirrors the Android implementation (VideoDecoderHandler.kt): `start()` creates
 // a Flutter external texture and returns its id, `submit(Uint8List)` pushes one
-// H.264 access unit (Annex-B byte-stream, as produced by the door unit's
-// encoder -- same assumption the Android MediaCodec path makes, since it
-// configures MediaCodec with no explicit CSD and relies on in-band SPS/PPS),
+// H.264 NAL unit (Annex-B byte-stream, one NAL per submit() call -- confirmed
+// against mock_door/video_stream.py's `_read_ffmpeg_stdout`, which splits
+// ffmpeg's Annex-B output on start codes and sends each NAL individually via
+// `encode_frame(VIDEO, nalu)`; h264parse reassembles NALs into access units),
 // `stop()` tears everything down. Decoding is done by a GStreamer pipeline
 // (appsrc -> h264parse -> avdec_h264 -> videoconvert), and each decoded RGBA
 // frame is uploaded into a plain GL_TEXTURE_2D via glTexImage2D/glTexSubImage2D
 // on flutter-pi's shared "resource uploading" EGL context, then pushed into a
 // flutter-pi `struct texture`.
 //
-// NOTE: NAL framing (Annex-B vs AVCC) and alignment (one NAL vs one full
-// access unit per submit() call) are inferred from the Android side, not
-// independently confirmed against the door unit's actual encoder output --
-// verify this against real captured traffic during on-device bring-up and
-// adjust the appsrc caps / h264parse config below if frames don't decode.
+// NOTE: mock_door is a development stand-in for the real door unit -- its
+// encoder settings (ffmpeg libx264, baseline profile, byte-stream Annex-B)
+// are a reasonable proxy but not a guarantee the real hardware encoder
+// matches exactly. Re-verify against real door unit traffic if frames don't
+// decode.
 
 #include "syncn_intercom_video.h"
 
@@ -213,7 +214,7 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     GError *error = NULL;
     GstElement *pipeline = gst_parse_launch(
         "appsrc name=src is-live=true format=time do-timestamp=true block=false "
-        "caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
+        "caps=video/x-h264,stream-format=byte-stream,alignment=nal ! "
         "h264parse config-interval=-1 ! avdec_h264 ! videoconvert ! "
         "video/x-raw,format=RGBA ! "
         "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false",

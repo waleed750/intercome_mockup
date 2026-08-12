@@ -85,15 +85,16 @@ configure step, which those missing deps blocked). Before shipping, verify:
 
 1. **The patch actually compiles and links** as part of a full flutter-pi
    build (the CI job described above is the natural place to find out).
-2. **H.264 NAL framing/alignment.** The appsrc caps here assume
-   `stream-format=byte-stream,alignment=au` (Annex-B, one full access unit
-   per `submit()` call) — inferred from the Android path (MediaCodec
-   configured with no explicit CSD, fed each `submit()` payload directly as
-   one `queueInputBuffer` call), not independently confirmed against the
-   door unit's actual encoder output. If frames don't decode, capture real
-   traffic and check whether it's actually per-NAL rather than per-AU, or
-   AVCC-length-prefixed rather than Annex-B, and adjust the caps /
-   `h264parse` config accordingly.
+2. **H.264 NAL framing/alignment — confirmed against `mock_door`, not yet
+   against a real door unit.** The appsrc caps use
+   `stream-format=byte-stream,alignment=nal` (Annex-B, one NAL unit per
+   `submit()` call). This matches `mock_door/video_stream.py`'s
+   `_read_ffmpeg_stdout`, which splits ffmpeg's Annex-B output on start
+   codes and sends each NAL individually — h264parse reassembles NALs into
+   access units on the receiving end. `mock_door` is a development stand-in
+   (ffmpeg libx264, baseline profile) though, not the real door unit's
+   hardware encoder — re-confirm against real traffic if frames don't
+   decode on real hardware.
 3. **Audio device selection.** `autoaudiosrc`/`autoaudiosink` pick whatever
    GStreamer autodetects as the default ALSA/Pulse device on the panel —
    confirm that's actually the panel's mic/speaker and not some other ALSA

@@ -2,11 +2,23 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Mock Door: Web Dashboard",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/mock_door/web_dashboard.py",
+      "cwd": "${workspaceFolder}/mock_door",
+      "python": "${command:python.interpreterPath}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
       "name": "Intercom Example",
       "request": "launch",
       "type": "dart",
       "cwd": "packages/intercom/example",
-      "program": "lib/main.dart"
+      "program": "lib/main.dart",
+      "env": {
+        "LIBGL_ALWAYS_SOFTWARE": "1",}
     },
     {
       "name": "Intercom Package Tests",
@@ -14,6 +26,27 @@
       "type": "dart",
       "cwd": "packages/intercom",
       "program": "test"
+    },
+    {
+      "name": "flutter-pi: GStreamer pipeline smoke test (headless)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "bash ${workspaceFolder}/packages/intercom_core/flutterpi/test/gst_pipeline_smoketest.sh --headless",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "flutter-pi: GStreamer pipeline smoke test (on-screen)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "bash ${workspaceFolder}/packages/intercom_core/flutterpi/test/gst_pipeline_smoketest.sh",
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Mock Door + Intercom Example",
+      "configurations": ["Mock Door: Web Dashboard", "Intercom Example"],
+      "stopAll": true
     }
   ]
 }
