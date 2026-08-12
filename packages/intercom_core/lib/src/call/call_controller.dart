@@ -290,8 +290,20 @@ final class CallController extends ChangeNotifier {
           muted: false,
           transientMessage: null,
         ));
-        await incomingCallHandler.onIncomingCall(doorName: id.doorName);
+        // _video.start() runs first, before the (potentially slower) UI/
+        // notification handler: CallFrameHandler is a plain `void Function`
+        // (see CallConnection/FrameParser), so this async function's `await`s
+        // don't block the frame parser from dispatching the next buffered
+        // frame -- a door unit that starts streaming video immediately on
+        // connect can have several video frames already parsed and
+        // dispatched to _onFrame before this function's first await even
+        // suspends. Starting the video pipeline first (confirmed on-device:
+        // real video frames arriving with the native pipeline not yet
+        // started, all silently dropped) minimizes that window; it doesn't
+        // eliminate the race (the frame parser still isn't backpressured),
+        // but every frame from here on has the best chance of being decoded.
         await _video.start();
+        await incomingCallHandler.onIncomingCall(doorName: id.doorName);
       case InboundCommand.getCallInfo:
         if (_state.phase == CallPhase.connected) {
           for (final frame in Commands.answerFrames()) {

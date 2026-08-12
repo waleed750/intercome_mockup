@@ -110,7 +110,7 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
     pthread_mutex_lock(&self->lock);
 
     self->frame_count++;
-    bool should_log = self->frame_count <= 10;
+    bool should_log = self->frame_count <= 30;
     if (should_log) {
         syncn_intercom_debug_log(
             "video",
@@ -387,7 +387,7 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
 static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data, size_t size) {
     pthread_mutex_lock(&self->lock);
     self->submit_count++;
-    bool should_log = self->submit_count <= 10;
+    bool should_log = self->submit_count <= 30;
     if (!self->running || self->appsrc == NULL || size == 0) {
         if (should_log) {
             syncn_intercom_debug_log(

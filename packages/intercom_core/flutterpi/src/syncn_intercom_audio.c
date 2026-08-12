@@ -102,7 +102,7 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
     pthread_mutex_lock(&self->lock);
     bool listening = self->uplink_listening;
     self->capture_count++;
-    bool should_log = self->capture_count <= 10;
+    bool should_log = self->capture_count <= 30;
     pthread_mutex_unlock(&self->lock);
 
     if (should_log) {
@@ -266,7 +266,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
 static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_t *data, size_t size) {
     pthread_mutex_lock(&self->lock);
     self->playback_count++;
-    bool should_log = self->playback_count <= 10;
+    bool should_log = self->playback_count <= 30;
     if (self->running && self->playback_appsrc != NULL && size > 0) {
         GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
         gst_buffer_fill(buffer, 0, data, size);

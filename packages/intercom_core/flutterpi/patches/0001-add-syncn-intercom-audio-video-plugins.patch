@@ -54,7 +54,7 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..eb3e0e1
+index 0000000..1ab87ae
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
 @@ -0,0 +1,426 @@
@@ -162,7 +162,7 @@ index 0000000..eb3e0e1
 +    pthread_mutex_lock(&self->lock);
 +    bool listening = self->uplink_listening;
 +    self->capture_count++;
-+    bool should_log = self->capture_count <= 10;
++    bool should_log = self->capture_count <= 30;
 +    pthread_mutex_unlock(&self->lock);
 +
 +    if (should_log) {
@@ -326,7 +326,7 @@ index 0000000..eb3e0e1
 +static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_t *data, size_t size) {
 +    pthread_mutex_lock(&self->lock);
 +    self->playback_count++;
-+    bool should_log = self->playback_count <= 10;
++    bool should_log = self->playback_count <= 30;
 +    if (self->running && self->playback_appsrc != NULL && size > 0) {
 +        GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
 +        gst_buffer_fill(buffer, 0, data, size);
@@ -555,7 +555,7 @@ index 0000000..8b0c7e1
 +#endif  // _SYNCN_INTERCOM_DEBUG_H
 diff --git a/src/plugins/syncn_intercom_video.c b/src/plugins/syncn_intercom_video.c
 new file mode 100644
-index 0000000..b4a86f3
+index 0000000..c678ee3
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_video.c
 @@ -0,0 +1,517 @@
@@ -671,7 +671,7 @@ index 0000000..b4a86f3
 +    pthread_mutex_lock(&self->lock);
 +
 +    self->frame_count++;
-+    bool should_log = self->frame_count <= 10;
++    bool should_log = self->frame_count <= 30;
 +    if (should_log) {
 +        syncn_intercom_debug_log(
 +            "video",
@@ -948,7 +948,7 @@ index 0000000..b4a86f3
 +static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data, size_t size) {
 +    pthread_mutex_lock(&self->lock);
 +    self->submit_count++;
-+    bool should_log = self->submit_count <= 10;
++    bool should_log = self->submit_count <= 30;
 +    if (!self->running || self->appsrc == NULL || size == 0) {
 +        if (should_log) {
 +            syncn_intercom_debug_log(
