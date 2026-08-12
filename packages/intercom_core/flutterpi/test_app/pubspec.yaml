@@ -1,0 +1,21 @@
+name: syncn_intercom_flutterpi_test_app
+description: Minimal harness for exercising intercom_core's native audio/video channels on flutter-pi. Not published, not part of the real product app.
+publish_to: 'none'
+version: 0.0.1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  provider: ^6.1.0
+  intercom_core:
+    path: ../../
+
+dev_dependencies:
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import msvcrt
 import socket
+import sys
 import threading
 import time
 
@@ -301,14 +301,23 @@ def configure_logging():
     )
 
 
-def read_key() -> str | None:
-    if not msvcrt.kbhit():
-        return None
-    raw = msvcrt.getch()
-    try:
-        return raw.decode("utf-8").lower()
-    except UnicodeDecodeError:
-        return None
+if sys.platform == "win32":
+    def read_key() -> str | None:
+        import msvcrt
+        if not msvcrt.kbhit():
+            return None
+        raw = msvcrt.getch()
+        try:
+            return raw.decode("utf-8").lower()
+        except UnicodeDecodeError:
+            return None
+else:
+    def read_key() -> str | None:
+        import select
+        if not select.select([sys.stdin], [], [], 0)[0]:
+            return None
+        raw = sys.stdin.read(1)
+        return raw.lower() if raw else None
 
 
 def print_menu(target_ip: str):
@@ -336,6 +345,16 @@ def main_cli(target_ip: str):
     service = MockDoorService(target_ip)
     service.start()
     print_menu(target_ip)
+
+    # On POSIX, stdin needs to be in cbreak mode for read_key() (select + read(1))
+    # to see keypresses immediately instead of waiting for Enter/line buffering.
+    old_termios = None
+    if sys.platform != "win32" and sys.stdin.isatty():
+        import termios
+        import tty
+        old_termios = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+
     try:
         while not service.stop_event.is_set():
             key = read_key()
@@ -355,6 +374,8 @@ def main_cli(target_ip: str):
     except KeyboardInterrupt:
         print()
     finally:
+        if old_termios is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_termios)
         service.shutdown()
 
 

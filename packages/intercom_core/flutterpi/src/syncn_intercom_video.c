@@ -27,8 +27,10 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
+#include <gst/video/video.h>
 
 #include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 
 #include "flutter-pi.h"
 #include "gl_renderer.h"
@@ -148,7 +150,7 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
             .gl = {
                 .target = GL_TEXTURE_2D,
                 .name = self->gl_texture_name,
-                .format = GL_RGBA8,
+                .format = GL_RGBA8_OES,
                 .width = (size_t) width,
                 .height = (size_t) height,
             },

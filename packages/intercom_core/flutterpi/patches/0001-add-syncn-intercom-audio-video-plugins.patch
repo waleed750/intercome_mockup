@@ -406,10 +406,10 @@ index 0000000..598c45e
 +#endif  // _SYNCN_INTERCOM_AUDIO_H
 diff --git a/src/plugins/syncn_intercom_video.c b/src/plugins/syncn_intercom_video.c
 new file mode 100644
-index 0000000..2fc65b2
+index 0000000..a319ecf
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_video.c
-@@ -0,0 +1,366 @@
+@@ -0,0 +1,368 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of the "syncn_intercom/video" MethodChannel.
@@ -439,8 +439,10 @@ index 0000000..2fc65b2
 +#include <gst/app/gstappsrc.h>
 +#include <gst/app/gstappsink.h>
 +#include <gst/gst.h>
++#include <gst/video/video.h>
 +
 +#include <GLES2/gl2.h>
++#include <GLES2/gl2ext.h>
 +
 +#include "flutter-pi.h"
 +#include "gl_renderer.h"
@@ -560,7 +562,7 @@ index 0000000..2fc65b2
 +            .gl = {
 +                .target = GL_TEXTURE_2D,
 +                .name = self->gl_texture_name,
-+                .format = GL_RGBA8,
++                .format = GL_RGBA8_OES,
 +                .width = (size_t) width,
 +                .height = (size_t) height,
 +            },
