@@ -20,11 +20,18 @@ final class IntercomNotificationHandler {
   Future<void> initialize() async {
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     const ios = DarwinInitializationSettings();
-    await plugin.initialize(
-      const InitializationSettings(android: android, iOS: ios),
-      onDidReceiveNotificationResponse: _handleResponse,
-      onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
-    );
+    const linux = LinuxInitializationSettings(defaultActionName: 'Open');
+    try {
+      await plugin.initialize(
+        const InitializationSettings(android: android, iOS: ios, linux: linux),
+        onDidReceiveNotificationResponse: _handleResponse,
+        onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
+      );
+    } catch (_) {
+      // No org.freedesktop.Notifications D-Bus daemon on bare-DRM Linux
+      // kiosk targets; the call flow doesn't depend on system notifications.
+      return;
+    }
     await IntercomNotificationChannels.ensure(plugin);
   }
 

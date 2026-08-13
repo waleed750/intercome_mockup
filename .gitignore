@@ -38,3 +38,8 @@ Thumbs.db
 # Local agent/tool state
 .claude/
 .wolf/
+
+# Python
+mock_door/.venv-linux/
+mock_door/__pycache__/
+*.pyc
