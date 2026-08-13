@@ -22,16 +22,17 @@ So instead of Dart-plugin platform code, this directory ships:
 - `src/syncn_intercom_video.c` / `.h` — a flutter-pi plugin implementing
   `syncn_intercom/video`. Decodes H.264 via a GStreamer pipeline
   (`appsrc ! h264parse ! avdec_h264 ! videoconvert`) and uploads each decoded
-  frame into a plain `GL_TEXTURE_2D` on flutter-pi's shared "resource
-  uploading" EGL context (`gl_renderer_make_flutter_resource_uploading_context_current`),
-  then pushes it through flutter-pi's `texture_registry` — the same
-  mechanism flutter-pi's own texture-backed plugins use.
+  frame into a plain `GL_TEXTURE_2D` on a dedicated EGL context shared with
+  flutter-pi's main GL context, then pushes it through flutter-pi's
+  `texture_registry`.
 - `src/syncn_intercom_audio.c` / `.h` — a flutter-pi plugin implementing
   `syncn_intercom/audio` (downlink playback: `appsrc ! alawdec ! audioconvert
-  ! audioresample ! autoaudiosink`) and `syncn_intercom/audio_uplink`
-  (capture: `autoaudiosrc ! audioconvert ! audioresample ! volume ! alawenc !
+  ! audioresample ! alsasink`) and `syncn_intercom/audio_uplink`
+  (capture: `alsasrc ! audioconvert ! audioresample ! volume ! alawenc !
   appsink`, forwarded to Dart as `EventChannel` events via
-  `platch_send_success_event_std`).
+  `platch_send_success_event_std`). On the RK809 panel codec it also sets
+  `Playback Path=SPK_HP` and `Capture MIC Path=Main Mic` before pipeline start,
+  logging and ignoring failures on other hardware.
 - `patches/0001-add-syncn-intercom-audio-video-plugins.patch` — a patch
   against `ardera/flutter-pi` that drops the two `.c`/`.h` pairs above into
   `src/plugins/` and wires them into `CMakeLists.txt` behind a new
@@ -69,8 +70,8 @@ is available at a pinned ref here.
 ## What's verified vs. not
 
 Every flutter-pi API used here (`plugin_registry_set_receiver_v2_locked`,
-`texture_new`/`texture_push_frame`, `gl_renderer_make_flutter_resource_uploading_context_current`,
-`platch_respond_success_std`/`platch_send_success_event_std`, the
+`texture_new`/`texture_push_frame`, `gl_renderer_create_context`,
+`gl_renderer_get_egl_display`, `platch_respond_success_std`/`platch_send_success_event_std`, the
 `FLUTTERPI_PLUGIN` registration macro, `struct std_value`/`struct platch_obj`
 field layouts) was checked directly against `ardera/flutter-pi`'s actual
 source at the pinned commit above, not guessed from memory — see comments in

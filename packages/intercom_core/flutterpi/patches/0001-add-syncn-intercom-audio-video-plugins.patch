@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..5242494
+index 0000000..f174994
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,492 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -79,9 +79,14 @@ index 0000000..5242494
 +// GStreamer's `webrtcdsp` element (gst-plugins-bad) is the natural fit if/when
 +// echo quality turns out to need it on real hardware.
 +
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++
 +#include "syncn_intercom_audio.h"
 +
 +#include <string.h>
++#include <sys/wait.h>
 +
 +#include <gst/app/gstappsink.h>
 +#include <gst/app/gstappsrc.h>
@@ -91,6 +96,7 @@ index 0000000..5242494
 +#include "platformchannel.h"
 +#include "pluginregistry.h"
 +#include "syncn_intercom_debug.h"
++#include "syncn_intercom_gst_util.h"
 +#include "util/logging.h"
 +
 +struct syncn_intercom_audio {
@@ -133,14 +139,8 @@ index 0000000..5242494
 +}
 +
 +static void teardown_unlocked(GstElement *playback_pipeline, GstElement *capture_pipeline) {
-+    if (playback_pipeline != NULL) {
-+        gst_element_set_state(playback_pipeline, GST_STATE_NULL);
-+        gst_object_unref(playback_pipeline);
-+    }
-+    if (capture_pipeline != NULL) {
-+        gst_element_set_state(capture_pipeline, GST_STATE_NULL);
-+        gst_object_unref(capture_pipeline);
-+    }
++    syncn_gst_bounded_teardown("audio-playback", playback_pipeline, 3);
++    syncn_gst_bounded_teardown("audio-capture", capture_pipeline, 3);
 +}
 +
 +// Called on a GStreamer streaming thread.
@@ -236,12 +236,64 @@ index 0000000..5242494
 +    return true;
 +}
 +
++static void set_alsa_voice_routing(void) {
++    const char *playback_argv[] = { "amixer", "-c", "0", "sset", "Playback Path", "SPK_HP", NULL };
++    const char *capture_argv[] = { "amixer", "-c", "0", "sset", "Capture MIC Path", "Main Mic", NULL };
++    struct {
++        const char *tag;
++        const char **argv;
++    } controls[] = {
++        { "Playback Path -> SPK_HP", playback_argv },
++        { "Capture MIC Path -> Main Mic", capture_argv },
++    };
++
++    for (size_t i = 0; i < G_N_ELEMENTS(controls); i++) {
++        gchar *out = NULL;
++        gchar *err = NULL;
++        gint status = -1;
++        GError *gerror = NULL;
++        gboolean spawned = g_spawn_sync(
++            NULL,
++            (gchar **) controls[i].argv,
++            NULL,
++            G_SPAWN_SEARCH_PATH,
++            NULL,
++            NULL,
++            &out,
++            &err,
++            &status,
++            &gerror
++        );
++        if (!spawned) {
++            syncn_intercom_debug_log(
++                "audio",
++                "set_alsa_voice_routing: %s: failed to launch amixer: %s (non-fatal)",
++                controls[i].tag,
++                gerror != NULL ? gerror->message : "unknown"
++            );
++            g_clear_error(&gerror);
++        } else if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
++            syncn_intercom_debug_log(
++                "audio",
++                "set_alsa_voice_routing: %s: amixer exited non-zero (control may not exist on this hardware) -- stderr: %s (non-fatal)",
++                controls[i].tag,
++                err != NULL ? err : ""
++            );
++        } else {
++            syncn_intercom_debug_log("audio", "set_alsa_voice_routing: %s: OK", controls[i].tag);
++        }
++        g_free(out);
++        g_free(err);
++    }
++}
++
 +static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled) {
 +    syncn_intercom_debug_log("audio", "start_locked called, capture_enabled=%d, self->running=%d", capture_enabled, self->running);
 +    if (self->running) {
 +        self->capture_enabled = capture_enabled;
 +        return true;
 +    }
++    set_alsa_voice_routing();
 +    self->playback_count = 0;
 +    self->capture_count = 0;
 +
@@ -284,8 +336,7 @@ index 0000000..5242494
 +    if (playback_appsrc == NULL || !start_and_confirm_playing("syncn_intercom_audio playback", playback)) {
 +        LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
 +        if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
-+        gst_element_set_state(playback, GST_STATE_NULL);
-+        gst_object_unref(playback);
++        syncn_gst_bounded_teardown("audio-playback", playback, 3);
 +        return false;
 +    }
 +
@@ -316,10 +367,9 @@ index 0000000..5242494
 +                g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
 +                if (!start_and_confirm_playing("syncn_intercom_audio capture", capture)) {
 +                    LOG_ERROR("syncn_intercom_audio: failed to start capture pipeline (mic will be unavailable)\n");
-+                    gst_element_set_state(capture, GST_STATE_NULL);
 +                    gst_object_unref(capture_appsink);
 +                    if (capture_volume != NULL) gst_object_unref(capture_volume);
-+                    gst_object_unref(capture);
++                    syncn_gst_bounded_teardown("audio-capture", capture, 3);
 +                    capture = NULL;
 +                    capture_appsink = NULL;
 +                    capture_volume = NULL;
@@ -569,12 +619,90 @@ index 0000000..8b0c7e1
 +}
 +
 +#endif  // _SYNCN_INTERCOM_DEBUG_H
+diff --git a/src/plugins/syncn_intercom_gst_util.h b/src/plugins/syncn_intercom_gst_util.h
+new file mode 100644
+index 0000000..5a502d7
+--- /dev/null
++++ b/src/plugins/syncn_intercom_gst_util.h
+@@ -0,0 +1,72 @@
++// SPDX-License-Identifier: MIT
++#ifndef _SYNCN_INTERCOM_GST_UTIL_H
++#define _SYNCN_INTERCOM_GST_UTIL_H
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++
++#include <errno.h>
++#include <stdbool.h>
++#include <time.h>
++
++#include <gst/gst.h>
++#include <pthread.h>
++
++#include "syncn_intercom_debug.h"
++
++struct syncn_gst_teardown_job {
++    const char *tag;
++    GstElement *pipeline;
++};
++
++static inline void *syncn_gst_teardown_worker(void *userdata) {
++    struct syncn_gst_teardown_job *job = userdata;
++
++    syncn_intercom_debug_log(job->tag, "bounded_teardown: setting pipeline to NULL");
++    gst_element_set_state(job->pipeline, GST_STATE_NULL);
++    gst_object_unref(job->pipeline);
++    syncn_intercom_debug_log(job->tag, "bounded_teardown: settled and unref'd pipeline");
++
++    g_free(job);
++    return NULL;
++}
++
++static inline bool syncn_gst_bounded_teardown(const char *tag, GstElement *pipeline, int timeout_sec) {
++    if (pipeline == NULL) {
++        return true;
++    }
++
++    struct syncn_gst_teardown_job *job = g_new0(struct syncn_gst_teardown_job, 1);
++    job->tag = tag;
++    job->pipeline = pipeline;
++
++    pthread_t thread;
++    int create_ret = pthread_create(&thread, NULL, syncn_gst_teardown_worker, job);
++    if (create_ret != 0) {
++        syncn_intercom_debug_log(tag, "bounded_teardown: pthread_create failed (%d); falling back to synchronous teardown", create_ret);
++        g_free(job);
++        gst_element_set_state(pipeline, GST_STATE_NULL);
++        gst_object_unref(pipeline);
++        return true;
++    }
++
++    struct timespec deadline;
++    clock_gettime(CLOCK_REALTIME, &deadline);
++    deadline.tv_sec += timeout_sec;
++
++    int join_ret = pthread_timedjoin_np(thread, NULL, &deadline);
++    if (join_ret == 0) {
++        return true;
++    }
++
++    if (join_ret == ETIMEDOUT) {
++        syncn_intercom_debug_log(tag, "bounded_teardown: TIMED OUT after %ds; ABANDONING pipeline", timeout_sec);
++    } else {
++        syncn_intercom_debug_log(tag, "bounded_teardown: pthread_timedjoin_np failed (%d); ABANDONING pipeline", join_ret);
++    }
++    pthread_detach(thread);
++    return false;
++}
++
++#endif  // _SYNCN_INTERCOM_GST_UTIL_H
 diff --git a/src/plugins/syncn_intercom_video.c b/src/plugins/syncn_intercom_video.c
 new file mode 100644
-index 0000000..1b4ce23
+index 0000000..8f11672
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_video.c
-@@ -0,0 +1,584 @@
+@@ -0,0 +1,587 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of the "syncn_intercom/video" MethodChannel.
@@ -588,14 +716,18 @@ index 0000000..1b4ce23
 +// `stop()` tears everything down. Decoding is done by a GStreamer pipeline
 +// (appsrc -> h264parse -> avdec_h264 -> videoconvert), and each decoded RGBA
 +// frame is uploaded into a plain GL_TEXTURE_2D via glTexImage2D/glTexSubImage2D
-+// on flutter-pi's shared "resource uploading" EGL context, then pushed into a
-+// flutter-pi `struct texture`.
++// on a dedicated EGL context shared with flutter-pi's main GL context, then
++// pushed into a flutter-pi `struct texture`.
 +//
 +// NOTE: mock_door is a development stand-in for the real door unit -- its
 +// encoder settings (ffmpeg libx264, baseline profile, byte-stream Annex-B)
 +// are a reasonable proxy but not a guarantee the real hardware encoder
 +// matches exactly. Re-verify against real door unit traffic if frames don't
 +// decode.
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
 +
 +#include "syncn_intercom_video.h"
 +
@@ -616,6 +748,7 @@ index 0000000..1b4ce23
 +#include "platformchannel.h"
 +#include "pluginregistry.h"
 +#include "syncn_intercom_debug.h"
++#include "syncn_intercom_gst_util.h"
 +#include "texture_registry.h"
 +#include "util/logging.h"
 +
@@ -860,13 +993,12 @@ index 0000000..1b4ce23
 +}
 +
 +static void teardown_pipeline_unlocked(struct syncn_intercom_video *self, GstElement *pipeline, GLuint gl_texture_name) {
-+    if (pipeline != NULL) {
-+        gst_element_set_state(pipeline, GST_STATE_NULL);
-+        gst_object_unref(pipeline);
-+    }
-+    if (gl_texture_name != 0 && eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context)) {
++    bool settled = syncn_gst_bounded_teardown("video", pipeline, 3);
++    if (settled && gl_texture_name != 0 && eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context)) {
 +        glDeleteTextures(1, &gl_texture_name);
 +        eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    } else if (!settled && gl_texture_name != 0) {
++        syncn_intercom_debug_log("video", "teardown_pipeline_unlocked: skipped GL texture cleanup after abandoned pipeline");
 +    }
 +}
 +
@@ -955,7 +1087,7 @@ index 0000000..1b4ce23
 +        log_pipeline_bus_errors("syncn_intercom_video", pipeline);
 +        gst_object_unref(appsrc);
 +        gst_object_unref(appsink);
-+        gst_object_unref(pipeline);
++        syncn_gst_bounded_teardown("video", pipeline, 3);
 +        pthread_mutex_unlock(&self->lock);
 +        return -1;
 +    }
@@ -973,10 +1105,9 @@ index 0000000..1b4ce23
 +            final_state
 +        );
 +        log_pipeline_bus_errors("syncn_intercom_video", pipeline);
-+        gst_element_set_state(pipeline, GST_STATE_NULL);
 +        gst_object_unref(appsrc);
 +        gst_object_unref(appsink);
-+        gst_object_unref(pipeline);
++        syncn_gst_bounded_teardown("video", pipeline, 3);
 +        pthread_mutex_unlock(&self->lock);
 +        return -1;
 +    }

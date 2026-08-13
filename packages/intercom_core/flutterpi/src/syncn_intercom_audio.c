@@ -19,9 +19,14 @@
 // GStreamer's `webrtcdsp` element (gst-plugins-bad) is the natural fit if/when
 // echo quality turns out to need it on real hardware.
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "syncn_intercom_audio.h"
 
 #include <string.h>
+#include <sys/wait.h>
 
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
@@ -31,6 +36,7 @@
 #include "platformchannel.h"
 #include "pluginregistry.h"
 #include "syncn_intercom_debug.h"
+#include "syncn_intercom_gst_util.h"
 #include "util/logging.h"
 
 struct syncn_intercom_audio {
@@ -73,14 +79,8 @@ static void teardown_locked(struct syncn_intercom_audio *self, GstElement **play
 }
 
 static void teardown_unlocked(GstElement *playback_pipeline, GstElement *capture_pipeline) {
-    if (playback_pipeline != NULL) {
-        gst_element_set_state(playback_pipeline, GST_STATE_NULL);
-        gst_object_unref(playback_pipeline);
-    }
-    if (capture_pipeline != NULL) {
-        gst_element_set_state(capture_pipeline, GST_STATE_NULL);
-        gst_object_unref(capture_pipeline);
-    }
+    syncn_gst_bounded_teardown("audio-playback", playback_pipeline, 3);
+    syncn_gst_bounded_teardown("audio-capture", capture_pipeline, 3);
 }
 
 // Called on a GStreamer streaming thread.
@@ -176,12 +176,64 @@ static bool start_and_confirm_playing(const char *tag, GstElement *pipeline) {
     return true;
 }
 
+static void set_alsa_voice_routing(void) {
+    const char *playback_argv[] = { "amixer", "-c", "0", "sset", "Playback Path", "SPK_HP", NULL };
+    const char *capture_argv[] = { "amixer", "-c", "0", "sset", "Capture MIC Path", "Main Mic", NULL };
+    struct {
+        const char *tag;
+        const char **argv;
+    } controls[] = {
+        { "Playback Path -> SPK_HP", playback_argv },
+        { "Capture MIC Path -> Main Mic", capture_argv },
+    };
+
+    for (size_t i = 0; i < G_N_ELEMENTS(controls); i++) {
+        gchar *out = NULL;
+        gchar *err = NULL;
+        gint status = -1;
+        GError *gerror = NULL;
+        gboolean spawned = g_spawn_sync(
+            NULL,
+            (gchar **) controls[i].argv,
+            NULL,
+            G_SPAWN_SEARCH_PATH,
+            NULL,
+            NULL,
+            &out,
+            &err,
+            &status,
+            &gerror
+        );
+        if (!spawned) {
+            syncn_intercom_debug_log(
+                "audio",
+                "set_alsa_voice_routing: %s: failed to launch amixer: %s (non-fatal)",
+                controls[i].tag,
+                gerror != NULL ? gerror->message : "unknown"
+            );
+            g_clear_error(&gerror);
+        } else if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+            syncn_intercom_debug_log(
+                "audio",
+                "set_alsa_voice_routing: %s: amixer exited non-zero (control may not exist on this hardware) -- stderr: %s (non-fatal)",
+                controls[i].tag,
+                err != NULL ? err : ""
+            );
+        } else {
+            syncn_intercom_debug_log("audio", "set_alsa_voice_routing: %s: OK", controls[i].tag);
+        }
+        g_free(out);
+        g_free(err);
+    }
+}
+
 static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled) {
     syncn_intercom_debug_log("audio", "start_locked called, capture_enabled=%d, self->running=%d", capture_enabled, self->running);
     if (self->running) {
         self->capture_enabled = capture_enabled;
         return true;
     }
+    set_alsa_voice_routing();
     self->playback_count = 0;
     self->capture_count = 0;
 
@@ -224,8 +276,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     if (playback_appsrc == NULL || !start_and_confirm_playing("syncn_intercom_audio playback", playback)) {
         LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
         if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
-        gst_element_set_state(playback, GST_STATE_NULL);
-        gst_object_unref(playback);
+        syncn_gst_bounded_teardown("audio-playback", playback, 3);
         return false;
     }
 
@@ -256,10 +307,9 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
                 g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
                 if (!start_and_confirm_playing("syncn_intercom_audio capture", capture)) {
                     LOG_ERROR("syncn_intercom_audio: failed to start capture pipeline (mic will be unavailable)\n");
-                    gst_element_set_state(capture, GST_STATE_NULL);
                     gst_object_unref(capture_appsink);
                     if (capture_volume != NULL) gst_object_unref(capture_volume);
-                    gst_object_unref(capture);
+                    syncn_gst_bounded_teardown("audio-capture", capture, 3);
                     capture = NULL;
                     capture_appsink = NULL;
                     capture_volume = NULL;

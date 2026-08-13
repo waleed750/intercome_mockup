@@ -11,14 +11,18 @@
 // `stop()` tears everything down. Decoding is done by a GStreamer pipeline
 // (appsrc -> h264parse -> avdec_h264 -> videoconvert), and each decoded RGBA
 // frame is uploaded into a plain GL_TEXTURE_2D via glTexImage2D/glTexSubImage2D
-// on flutter-pi's shared "resource uploading" EGL context, then pushed into a
-// flutter-pi `struct texture`.
+// on a dedicated EGL context shared with flutter-pi's main GL context, then
+// pushed into a flutter-pi `struct texture`.
 //
 // NOTE: mock_door is a development stand-in for the real door unit -- its
 // encoder settings (ffmpeg libx264, baseline profile, byte-stream Annex-B)
 // are a reasonable proxy but not a guarantee the real hardware encoder
 // matches exactly. Re-verify against real door unit traffic if frames don't
 // decode.
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #include "syncn_intercom_video.h"
 
@@ -39,6 +43,7 @@
 #include "platformchannel.h"
 #include "pluginregistry.h"
 #include "syncn_intercom_debug.h"
+#include "syncn_intercom_gst_util.h"
 #include "texture_registry.h"
 #include "util/logging.h"
 
@@ -283,13 +288,12 @@ static void log_pipeline_bus_errors(const char *tag, GstElement *pipeline) {
 }
 
 static void teardown_pipeline_unlocked(struct syncn_intercom_video *self, GstElement *pipeline, GLuint gl_texture_name) {
-    if (pipeline != NULL) {
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-        gst_object_unref(pipeline);
-    }
-    if (gl_texture_name != 0 && eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context)) {
+    bool settled = syncn_gst_bounded_teardown("video", pipeline, 3);
+    if (settled && gl_texture_name != 0 && eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context)) {
         glDeleteTextures(1, &gl_texture_name);
         eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    } else if (!settled && gl_texture_name != 0) {
+        syncn_intercom_debug_log("video", "teardown_pipeline_unlocked: skipped GL texture cleanup after abandoned pipeline");
     }
 }
 
@@ -378,7 +382,7 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
         log_pipeline_bus_errors("syncn_intercom_video", pipeline);
         gst_object_unref(appsrc);
         gst_object_unref(appsink);
-        gst_object_unref(pipeline);
+        syncn_gst_bounded_teardown("video", pipeline, 3);
         pthread_mutex_unlock(&self->lock);
         return -1;
     }
@@ -396,10 +400,9 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
             final_state
         );
         log_pipeline_bus_errors("syncn_intercom_video", pipeline);
-        gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(appsrc);
         gst_object_unref(appsink);
-        gst_object_unref(pipeline);
+        syncn_gst_bounded_teardown("video", pipeline, 3);
         pthread_mutex_unlock(&self->lock);
         return -1;
     }
