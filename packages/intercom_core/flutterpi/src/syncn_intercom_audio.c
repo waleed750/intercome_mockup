@@ -13,11 +13,24 @@
 // not the speaker. `playDownlink(Uint8List)` pushes one A-law frame into the
 // playback appsrc. `stop()` tears both pipelines down.
 //
-// NOT implemented in this first pass (tracked as a follow-up, not blocking
-// the "no sound at all" bug this exists to fix): AEC/NS/AGC parity with the
-// Android path's AcousticEchoCanceler/NoiseSuppressor/AutomaticGainControl.
-// GStreamer's `webrtcdsp` element (gst-plugins-bad) is the natural fit if/when
-// echo quality turns out to need it on real hardware.
+// AEC/NS/AGC parity with the Android path's AcousticEchoCanceler/
+// NoiseSuppressor/AutomaticGainControl: implemented via GstElements
+// `webrtcechoprobe` (tapped off the playback pipeline, downstream of
+// alawdec, as the far-end reference) and `webrtcdsp` (in the capture
+// pipeline, ahead of the encoder). Both live in gst-plugins-bad and pair up
+// automatically process-wide -- they don't need to share a GstBin/GstBus,
+// which is why this works fine across our two separate playback/capture
+// GstPipelines. Guarded by gst_element_available() so a panel image without
+// gst-plugins-bad still gets working (just non-echo-cancelled) audio instead
+// of every call failing to start.
+//
+// Headset routing: this board (rk809 codec) exposes no kernel jack-detect
+// input device (confirmed via /proc/bus/input/devices), so the panel can't
+// tell in software whether a headset is plugged in. `Playback Path`
+// defaults to SPK_HP (speaker + headphone, both always on) and can be
+// switched to headset-only (HP + Hands Free Mic) via the `headsetMode`
+// start() arg / `setHeadsetMode` method, driven by a manual toggle in the
+// app -- see AudioPipeline.setHeadsetMode in the Dart layer.
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -46,6 +59,7 @@ struct syncn_intercom_audio {
     bool running;
     bool capture_enabled;
     bool uplink_listening;
+    bool headset_mode;
 
     GstElement *playback_pipeline;
     GstElement *playback_appsrc;
@@ -176,15 +190,22 @@ static bool start_and_confirm_playing(const char *tag, GstElement *pipeline) {
     return true;
 }
 
-static void set_alsa_voice_routing(void) {
-    const char *playback_argv[] = { "amixer", "-c", "0", "sset", "Playback Path", "SPK_HP", NULL };
-    const char *capture_argv[] = { "amixer", "-c", "0", "sset", "Capture MIC Path", "Main Mic", NULL };
+// `headset_mode` picks between the panel's built-in speaker+mic (default,
+// hands-free wall-panel use) and a manually-selected wired headset. There's
+// no hardware jack-detect on this board (see file header comment), so this
+// is purely driven by the caller (app-side toggle) -- it is not, and cannot
+// be, automatic.
+static void set_alsa_voice_routing(bool headset_mode) {
+    const char *playback_path = headset_mode ? "HP" : "SPK_HP";
+    const char *capture_mic_path = headset_mode ? "Hands Free Mic" : "Main Mic";
+    const char *playback_argv[] = { "amixer", "-c", "0", "sset", "Playback Path", playback_path, NULL };
+    const char *capture_argv[] = { "amixer", "-c", "0", "sset", "Capture MIC Path", capture_mic_path, NULL };
     struct {
         const char *tag;
         const char **argv;
     } controls[] = {
-        { "Playback Path -> SPK_HP", playback_argv },
-        { "Capture MIC Path -> Main Mic", capture_argv },
+        { headset_mode ? "Playback Path -> HP" : "Playback Path -> SPK_HP", playback_argv },
+        { headset_mode ? "Capture MIC Path -> Hands Free Mic" : "Capture MIC Path -> Main Mic", capture_argv },
     };
 
     for (size_t i = 0; i < G_N_ELEMENTS(controls); i++) {
@@ -227,13 +248,34 @@ static void set_alsa_voice_routing(void) {
     }
 }
 
-static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled) {
-    syncn_intercom_debug_log("audio", "start_locked called, capture_enabled=%d, self->running=%d", capture_enabled, self->running);
+// gst-plugins-bad may not be on every panel image; probing before we build
+// the pipeline string lets us fall back to plain (non-echo-cancelled) audio
+// instead of every call failing to start when it's missing.
+static bool gst_element_available(const char *factory_name) {
+    GstElementFactory *factory = gst_element_factory_find(factory_name);
+    if (factory == NULL) {
+        return false;
+    }
+    gst_object_unref(factory);
+    return true;
+}
+
+static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled, bool headset_mode) {
+    syncn_intercom_debug_log(
+        "audio",
+        "start_locked called, capture_enabled=%d, headset_mode=%d, self->running=%d",
+        capture_enabled,
+        headset_mode,
+        self->running
+    );
     if (self->running) {
         self->capture_enabled = capture_enabled;
+        self->headset_mode = headset_mode;
+        set_alsa_voice_routing(headset_mode);
         return true;
     }
-    set_alsa_voice_routing();
+    set_alsa_voice_routing(headset_mode);
+    self->headset_mode = headset_mode;
     self->playback_count = 0;
     self->capture_count = 0;
 
@@ -246,12 +288,32 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         }
     }
 
-    GError *error = NULL;
-    GstElement *playback = gst_parse_launch(
+    bool aec_available = gst_element_available("webrtcechoprobe") && gst_element_available("webrtcdsp");
+    syncn_intercom_debug_log("audio", "start_locked: AEC elements available=%d", aec_available);
+
+    static const char *playback_desc_aec =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-        "alawdec ! audioconvert ! audioresample ! alsasink device=hw:0,0 sync=false",
-        &error
-    );
+        "alawdec ! audioconvert ! audioresample ! tee name=t ! "
+        "queue ! alsasink device=hw:0,0 sync=false "
+        "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe ! fakesink sync=false async=false";
+    static const char *playback_desc_plain =
+        "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
+        "alawdec ! audioconvert ! audioresample ! alsasink device=hw:0,0 sync=false";
+
+    GError *error = NULL;
+    GstElement *playback = gst_parse_launch(aec_available ? playback_desc_aec : playback_desc_plain, &error);
+    if (playback == NULL && aec_available) {
+        // Parsing itself shouldn't fail if both elements probed OK, but fall
+        // back defensively rather than taking the whole call down with it.
+        LOG_ERROR(
+            "syncn_intercom_audio: failed to build AEC playback pipeline, falling back without AEC: %s\n",
+            error != NULL ? error->message : "unknown error"
+        );
+        if (error != NULL) g_error_free(error);
+        error = NULL;
+        aec_available = false;
+        playback = gst_parse_launch(playback_desc_plain, &error);
+    }
     if (playback == NULL) {
         LOG_ERROR("syncn_intercom_audio: failed to build playback pipeline: %s\n", error != NULL ? error->message : "unknown error");
         if (error != NULL) g_error_free(error);
@@ -274,47 +336,81 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         gst_app_src_set_stream_type(GST_APP_SRC(playback_appsrc), GST_APP_STREAM_TYPE_STREAM);
     }
     if (playback_appsrc == NULL || !start_and_confirm_playing("syncn_intercom_audio playback", playback)) {
-        LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
-        if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
-        syncn_gst_bounded_teardown("audio-playback", playback, 3);
-        return false;
+        if (aec_available) {
+            // The echo probe/tee branch is the one new failure mode here (e.g.
+            // fakesink negotiation); retry once without it before giving up
+            // entirely -- a call with no echo cancellation beats no call.
+            LOG_ERROR("syncn_intercom_audio: AEC playback pipeline failed to start, retrying without AEC\n");
+            if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
+            syncn_gst_bounded_teardown("audio-playback", playback, 3);
+            aec_available = false;
+            error = NULL;
+            playback = gst_parse_launch(playback_desc_plain, &error);
+            playback_appsrc = playback != NULL ? gst_bin_get_by_name(GST_BIN(playback), "src") : NULL;
+            if (playback_appsrc != NULL) {
+                GstCaps *appsrc_caps = gst_caps_new_simple("audio/x-alaw", "rate", G_TYPE_INT, 8000, "channels", G_TYPE_INT, 1, NULL);
+                gst_app_src_set_caps(GST_APP_SRC(playback_appsrc), appsrc_caps);
+                gst_caps_unref(appsrc_caps);
+                gst_app_src_set_stream_type(GST_APP_SRC(playback_appsrc), GST_APP_STREAM_TYPE_STREAM);
+            }
+        }
+        if (playback_appsrc == NULL || !start_and_confirm_playing("syncn_intercom_audio playback (retry)", playback)) {
+            LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
+            if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
+            if (playback != NULL) syncn_gst_bounded_teardown("audio-playback", playback, 3);
+            return false;
+        }
     }
+
+    static const char *capture_desc_aec =
+        "alsasrc device=hw:0,0 ! audioconvert ! audioresample ! "
+        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
+        "webrtcdsp echo-cancel=true noise-suppression=true gain-control=true ! "
+        "volume name=capvol ! alawenc ! "
+        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
+    static const char *capture_desc_plain =
+        "alsasrc device=hw:0,0 ! audioconvert ! audioresample ! "
+        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
+        "volume name=capvol ! alawenc ! "
+        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 
     GstElement *capture = NULL;
     GstElement *capture_appsink = NULL;
     GstElement *capture_volume = NULL;
     if (capture_enabled) {
-        capture = gst_parse_launch(
-            "alsasrc device=hw:0,0 ! audioconvert ! audioresample ! "
-            "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-            "volume name=capvol ! alawenc ! "
-            "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true",
-            &error
-        );
-        if (capture == NULL) {
-            LOG_ERROR(
-                "syncn_intercom_audio: failed to build capture pipeline (mic will be unavailable): %s\n",
-                error != NULL ? error->message : "unknown error"
-            );
-            if (error != NULL) g_error_free(error);
-        } else {
+        for (int attempt = 0; attempt < 2 && capture == NULL; attempt++) {
+            bool use_aec = aec_available && attempt == 0;
+            error = NULL;
+            capture = gst_parse_launch(use_aec ? capture_desc_aec : capture_desc_plain, &error);
+            if (capture == NULL) {
+                LOG_ERROR(
+                    "syncn_intercom_audio: failed to build capture pipeline (aec=%d): %s\n",
+                    use_aec,
+                    error != NULL ? error->message : "unknown error"
+                );
+                if (error != NULL) g_error_free(error);
+                continue;
+            }
             capture_appsink = gst_bin_get_by_name(GST_BIN(capture), "sink");
             capture_volume = gst_bin_get_by_name(GST_BIN(capture), "capvol");
             if (capture_appsink == NULL) {
                 gst_object_unref(capture);
                 capture = NULL;
-            } else {
-                g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
-                if (!start_and_confirm_playing("syncn_intercom_audio capture", capture)) {
-                    LOG_ERROR("syncn_intercom_audio: failed to start capture pipeline (mic will be unavailable)\n");
-                    gst_object_unref(capture_appsink);
-                    if (capture_volume != NULL) gst_object_unref(capture_volume);
-                    syncn_gst_bounded_teardown("audio-capture", capture, 3);
-                    capture = NULL;
-                    capture_appsink = NULL;
-                    capture_volume = NULL;
-                }
+                continue;
             }
+            g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
+            if (!start_and_confirm_playing("syncn_intercom_audio capture", capture)) {
+                LOG_ERROR("syncn_intercom_audio: failed to start capture pipeline (aec=%d)\n", use_aec);
+                gst_object_unref(capture_appsink);
+                if (capture_volume != NULL) gst_object_unref(capture_volume);
+                syncn_gst_bounded_teardown("audio-capture", capture, 3);
+                capture = NULL;
+                capture_appsink = NULL;
+                capture_volume = NULL;
+            }
+        }
+        if (capture == NULL) {
+            LOG_ERROR("syncn_intercom_audio: mic will be unavailable for this call\n");
         }
     }
 
@@ -374,18 +470,22 @@ static void on_method_channel_message(void *userdata, const FlutterPlatformMessa
 
     if (strcmp(object.method, "start") == 0) {
         bool capture_enabled = true;
+        bool headset_mode = false;
         if (object.std_arg.type == kStdMap) {
             for (size_t i = 0; i < object.std_arg.size; i++) {
                 struct std_value *key = &object.std_arg.keys[i];
-                if (key->type == kStdString && strcmp(key->string_value, "captureEnabled") == 0) {
-                    struct std_value *value = &object.std_arg.values[i];
+                if (key->type != kStdString) continue;
+                struct std_value *value = &object.std_arg.values[i];
+                if (strcmp(key->string_value, "captureEnabled") == 0) {
                     capture_enabled = STDVALUE_IS_BOOL(*value) ? STDVALUE_AS_BOOL(*value) : true;
+                } else if (strcmp(key->string_value, "headsetMode") == 0) {
+                    headset_mode = STDVALUE_IS_BOOL(*value) ? STDVALUE_AS_BOOL(*value) : false;
                 }
             }
         }
 
         pthread_mutex_lock(&self->lock);
-        bool ok = start_locked(self, capture_enabled);
+        bool ok = start_locked(self, capture_enabled, headset_mode);
         pthread_mutex_unlock(&self->lock);
 
         if (ok) {
@@ -401,6 +501,20 @@ static void on_method_channel_message(void *userdata, const FlutterPlatformMessa
     } else if (strcmp(object.method, "setMuted") == 0) {
         bool muted = STDVALUE_IS_BOOL(object.std_arg) ? STDVALUE_AS_BOOL(object.std_arg) : false;
         handle_set_muted(self, muted);
+        platch_respond_success_std(message->response_handle, NULL);
+    } else if (strcmp(object.method, "setHeadsetMode") == 0) {
+        bool headset_mode = STDVALUE_IS_BOOL(object.std_arg) ? STDVALUE_AS_BOOL(object.std_arg) : false;
+        pthread_mutex_lock(&self->lock);
+        self->headset_mode = headset_mode;
+        bool running = self->running;
+        pthread_mutex_unlock(&self->lock);
+        // Routing is a global ALSA mixer control (not per-pipeline), so this
+        // is safe to apply even when called without holding the lock across
+        // the amixer spawn -- matches set_alsa_voice_routing's existing
+        // non-fatal, fire-and-forget error handling.
+        if (running) {
+            set_alsa_voice_routing(headset_mode);
+        }
         platch_respond_success_std(message->response_handle, NULL);
     } else if (strcmp(object.method, "stop") == 0) {
         pthread_mutex_lock(&self->lock);

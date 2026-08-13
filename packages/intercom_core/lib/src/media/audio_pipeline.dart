@@ -19,9 +19,11 @@ final class AudioPipeline {
         .cast<Uint8List>();
   }
 
-  Future<void> start({required bool captureEnabled}) {
-    return methodChannel
-        .invokeMethod<void>('start', {'captureEnabled': captureEnabled});
+  Future<void> start({required bool captureEnabled, bool headsetMode = false}) {
+    return methodChannel.invokeMethod<void>('start', {
+      'captureEnabled': captureEnabled,
+      'headsetMode': headsetMode,
+    });
   }
 
   Future<void> playDownlink(Uint8List alaw) =>
@@ -29,6 +31,14 @@ final class AudioPipeline {
 
   Future<void> setMuted(bool muted) =>
       methodChannel.invokeMethod<void>('setMuted', muted);
+
+  /// Manually selects headset (wired headphone) vs speaker output routing
+  /// for platforms that can't detect a jack insertion themselves (the
+  /// flutter-pi/Linux panel target has no kernel jack-detect device for its
+  /// rk809 codec -- see syncn_intercom_audio.c). No-op / ignored on
+  /// platforms (e.g. Android) that already route automatically.
+  Future<void> setHeadsetMode(bool headsetMode) =>
+      methodChannel.invokeMethod<void>('setHeadsetMode', headsetMode);
 
   Future<void> stop() => methodChannel.invokeMethod<void>('stop');
 }

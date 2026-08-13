@@ -232,6 +232,11 @@ final class CallController extends ChangeNotifier {
     _setState(_state.copyWith(muted: muted));
   }
 
+  Future<void> setHeadsetMode(bool headsetMode) async {
+    await _audio.setHeadsetMode(headsetMode);
+    _setState(_state.copyWith(headsetMode: headsetMode));
+  }
+
   void _onSocketAccepted(Socket socket) {
     if (_connection != null &&
         _state.phase != CallPhase.idle &&
@@ -331,7 +336,10 @@ final class CallController extends ChangeNotifier {
       }
       micGranted = micStatus.isGranted;
     }
-    await _audio.start(captureEnabled: micGranted);
+    await _audio.start(
+      captureEnabled: micGranted,
+      headsetMode: _state.headsetMode,
+    );
     _audioSub?.cancel();
     _audioSub = _audio.uplink.listen((alaw) {
       _connection?.enqueue(Frame.encode(Channel.audio, alaw));
