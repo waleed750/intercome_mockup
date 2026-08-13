@@ -249,7 +249,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     GError *error = NULL;
     GstElement *playback = gst_parse_launch(
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-        "alawdec ! audioconvert ! audioresample ! alsasink device=default sync=false",
+        "alawdec ! audioconvert ! audioresample ! alsasink device=hw:0,0 sync=false",
         &error
     );
     if (playback == NULL) {
@@ -285,7 +285,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     GstElement *capture_volume = NULL;
     if (capture_enabled) {
         capture = gst_parse_launch(
-            "alsasrc device=default ! audioconvert ! audioresample ! "
+            "alsasrc device=hw:0,0 ! audioconvert ! audioresample ! "
             "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
             "volume name=capvol ! alawenc ! "
             "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true",
