@@ -353,12 +353,12 @@ index 0000000..08ff602
 +
 +    static const char *playback_desc_aec =
 +        "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-+        "alawdec ! audioconvert ! audioresample ! tee name=t ! "
++        "alawdec ! audioconvert ! audioresample ! volume name=playvol volume=0.75 ! tee name=t ! "
 +        "queue ! alsasink device=hw:0,0 sync=false "
 +        "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe ! fakesink sync=false async=false";
 +    static const char *playback_desc_plain =
 +        "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-+        "alawdec ! audioconvert ! audioresample ! alsasink device=hw:0,0 sync=false";
++        "alawdec ! audioconvert ! audioresample ! volume name=playvol volume=0.75 ! alsasink device=hw:0,0 sync=false";
 +
 +    GError *error = NULL;
 +    GstElement *playback = gst_parse_launch(aec_available ? playback_desc_aec : playback_desc_plain, &error);

@@ -54,7 +54,7 @@ gst-launch-1.0 \
   audio/x-raw,rate=8000,channels=1,format=S16LE ! \
   alawenc ! \
   audio/x-alaw,rate=8000,channels=1 ! \
-  alawdec ! audioconvert ! audioresample ! \
+  alawdec ! audioconvert ! audioresample ! volume name=playvol volume=0.75 ! \
   "$SINK_AUDIO"
 echo "audio pipeline: OK (no GStreamer pipeline errors)"
 
