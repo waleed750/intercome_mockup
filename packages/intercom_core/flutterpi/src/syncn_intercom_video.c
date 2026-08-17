@@ -60,15 +60,16 @@ struct syncn_intercom_video {
     GstElement *appsrc;
     GstElement *appsink;
 
-    // flutter-pi's own "resource uploading" EGL context is shared with the
-    // Flutter engine's own internal use (e.g. decoding image assets) -- a
-    // GStreamer streaming thread calling gl_renderer_make_flutter_resource_
-    // uploading_context_current() concurrently with the engine's own use of
-    // that same context fails with EGL_BAD_ACCESS ("context already current
-    // on another thread"), confirmed on-device via journald. Using our own
-    // dedicated context (created once via gl_renderer_create_context(), which
-    // shares GL objects with the main context so our uploaded texture is
-    // still visible to it) avoids this contention entirely.
+    // Lazily-created dedicated EGL context. flutter-pi's own "resource
+    // uploading" EGL context is shared with the Flutter engine's internal use
+    // (e.g. decoding image assets); a GStreamer streaming thread making that
+    // shared context current concurrently with the engine fails with
+    // EGL_BAD_ACCESS ("context already current on another thread"), confirmed
+    // on-device via journald. A separate context shares GL objects with the
+    // main context so uploaded textures are still visible to Flutter, but it
+    // must not be created at plugin init: on this panel's vendor GPU stack,
+    // an idle, always-created native context was implicated in steady RSS
+    // growth. Create it on first video start and destroy it on stop.
     EGLDisplay egl_display;
     EGLContext egl_context;
 
@@ -287,7 +288,34 @@ static void log_pipeline_bus_errors(const char *tag, GstElement *pipeline) {
     gst_object_unref(bus);
 }
 
-static void teardown_pipeline_unlocked(struct syncn_intercom_video *self, GstElement *pipeline, GLuint gl_texture_name) {
+static bool ensure_egl_context_locked(struct syncn_intercom_video *self) {
+    if (self->egl_context != EGL_NO_CONTEXT) {
+        return true;
+    }
+
+    self->egl_display = gl_renderer_get_egl_display(self->gl_renderer);
+    self->egl_context = gl_renderer_create_context(self->gl_renderer);
+    if (self->egl_display == EGL_NO_DISPLAY || self->egl_context == EGL_NO_CONTEXT) {
+        LOG_ERROR("syncn_intercom_video: could not create a dedicated EGL context.\n");
+        self->egl_display = EGL_NO_DISPLAY;
+        self->egl_context = EGL_NO_CONTEXT;
+        return false;
+    }
+    return true;
+}
+
+static void destroy_egl_context_locked(struct syncn_intercom_video *self) {
+    if (self->egl_context == EGL_NO_CONTEXT) {
+        return;
+    }
+
+    eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(self->egl_display, self->egl_context);
+    self->egl_context = EGL_NO_CONTEXT;
+    self->egl_display = EGL_NO_DISPLAY;
+}
+
+static bool teardown_pipeline_unlocked(struct syncn_intercom_video *self, GstElement *pipeline, GLuint gl_texture_name) {
     bool settled = syncn_gst_bounded_teardown("video", pipeline, 3);
     if (settled && gl_texture_name != 0 && eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context)) {
         glDeleteTextures(1, &gl_texture_name);
@@ -295,6 +323,7 @@ static void teardown_pipeline_unlocked(struct syncn_intercom_video *self, GstEle
     } else if (!settled && gl_texture_name != 0) {
         syncn_intercom_debug_log("video", "teardown_pipeline_unlocked: skipped GL texture cleanup after abandoned pipeline");
     }
+    return settled;
 }
 
 static int64_t handle_start(struct syncn_intercom_video *self) {
@@ -312,11 +341,17 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     self->submit_count = 0;
     self->frame_count = 0;
 
+    if (!ensure_egl_context_locked(self)) {
+        pthread_mutex_unlock(&self->lock);
+        return -1;
+    }
+
     if (!gst_is_initialized()) {
         GError *error = NULL;
         if (!gst_init_check(NULL, NULL, &error)) {
             LOG_ERROR("syncn_intercom_video: gst_init_check failed: %s\n", error != NULL ? error->message : "unknown error");
             if (error != NULL) g_error_free(error);
+            destroy_egl_context_locked(self);
             pthread_mutex_unlock(&self->lock);
             return -1;
         }
@@ -325,6 +360,7 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     if (self->texture == NULL) {
         self->texture = texture_new(self->texture_registry);
         if (self->texture == NULL) {
+            destroy_egl_context_locked(self);
             pthread_mutex_unlock(&self->lock);
             return -1;
         }
@@ -341,6 +377,7 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     if (pipeline == NULL) {
         LOG_ERROR("syncn_intercom_video: failed to build pipeline: %s\n", error != NULL ? error->message : "unknown error");
         if (error != NULL) g_error_free(error);
+        destroy_egl_context_locked(self);
         pthread_mutex_unlock(&self->lock);
         return -1;
     }
@@ -352,6 +389,7 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
         gst_object_unref(pipeline);
         if (appsrc != NULL) gst_object_unref(appsrc);
         if (appsink != NULL) gst_object_unref(appsink);
+        destroy_egl_context_locked(self);
         pthread_mutex_unlock(&self->lock);
         return -1;
     }
@@ -382,7 +420,9 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
         log_pipeline_bus_errors("syncn_intercom_video", pipeline);
         gst_object_unref(appsrc);
         gst_object_unref(appsink);
-        syncn_gst_bounded_teardown("video", pipeline, 3);
+        if (syncn_gst_bounded_teardown("video", pipeline, 3)) {
+            destroy_egl_context_locked(self);
+        }
         pthread_mutex_unlock(&self->lock);
         return -1;
     }
@@ -402,7 +442,9 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
         log_pipeline_bus_errors("syncn_intercom_video", pipeline);
         gst_object_unref(appsrc);
         gst_object_unref(appsink);
-        syncn_gst_bounded_teardown("video", pipeline, 3);
+        if (syncn_gst_bounded_teardown("video", pipeline, 3)) {
+            destroy_egl_context_locked(self);
+        }
         pthread_mutex_unlock(&self->lock);
         return -1;
     }
@@ -485,7 +527,15 @@ static void handle_stop(struct syncn_intercom_video *self) {
     teardown_pipeline_locked(self, &pipeline, &gl_texture_name);
     pthread_mutex_unlock(&self->lock);
 
-    teardown_pipeline_unlocked(self, pipeline, gl_texture_name);
+    bool settled = teardown_pipeline_unlocked(self, pipeline, gl_texture_name);
+
+    if (settled) {
+        pthread_mutex_lock(&self->lock);
+        destroy_egl_context_locked(self);
+        pthread_mutex_unlock(&self->lock);
+    } else {
+        syncn_intercom_debug_log("video", "handle_stop: skipped EGL context cleanup after abandoned pipeline");
+    }
 }
 
 static void on_platform_message(void *userdata, const FlutterPlatformMessage *message) {
@@ -530,25 +580,14 @@ enum plugin_init_result syncn_intercom_video_init(struct flutterpi *flutterpi, v
     self->flutterpi = flutterpi;
     self->gl_renderer = flutterpi_get_gl_renderer(flutterpi);
     self->texture_registry = flutterpi_get_texture_registry(flutterpi);
+    self->egl_display = EGL_NO_DISPLAY;
+    self->egl_context = EGL_NO_CONTEXT;
     pthread_mutex_init(&self->lock, NULL);
 
     if (self->gl_renderer == NULL || self->texture_registry == NULL) {
         LOG_ERROR("syncn_intercom_video: GL renderer / texture registry not available. Is EGL/GLES2 enabled?\n");
         free(self);
         return PLUGIN_INIT_RESULT_NOT_APPLICABLE;
-    }
-
-    // Own dedicated EGL context (shared with flutter-pi's main context, so
-    // textures we upload are visible to it) instead of flutter-pi's shared
-    // "resource uploading" context -- see the struct field comment above for
-    // why: that shared context is contended with the Flutter engine's own
-    // internal use of it, confirmed on-device as EGL_BAD_ACCESS.
-    self->egl_display = gl_renderer_get_egl_display(self->gl_renderer);
-    self->egl_context = gl_renderer_create_context(self->gl_renderer);
-    if (self->egl_display == EGL_NO_DISPLAY || self->egl_context == EGL_NO_CONTEXT) {
-        LOG_ERROR("syncn_intercom_video: could not create a dedicated EGL context.\n");
-        free(self);
-        return PLUGIN_INIT_RESULT_ERROR;
     }
 
     int ok = plugin_registry_set_receiver_v2_locked(
@@ -576,9 +615,7 @@ void syncn_intercom_video_deinit(struct flutterpi *flutterpi, void *userdata) {
     if (self->texture != NULL) {
         texture_destroy(self->texture);
     }
-    if (self->egl_context != EGL_NO_CONTEXT) {
-        eglDestroyContext(self->egl_display, self->egl_context);
-    }
+    destroy_egl_context_locked(self);
     pthread_mutex_destroy(&self->lock);
     instance = NULL;
     free(self);
