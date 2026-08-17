@@ -291,14 +291,28 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     bool aec_available = gst_element_available("webrtcechoprobe") && gst_element_available("webrtcdsp");
     syncn_intercom_debug_log("audio", "start_locked: AEC elements available=%d", aec_available);
 
+    // Playback quality notes (parity with Android's AudioTrack path):
+    // - plughw (not raw hw) lets ALSA's plug layer run the codec at its
+    //   native rate instead of forcing the DAC into an 8kHz-derived mode.
+    // - audioresample quality=10 upsamples the 8kHz narrowband stream with
+    //   the best filter instead of the default (audible aliasing/harshness).
+    // - sync=true + a ~80ms jitter queue: with sync=false, network jitter
+    //   went straight to the DAC as underruns (pops/crackle). The queue
+    //   absorbs jitter at the cost of a little added latency.
+    // - volume=1.0: analog gain belongs to the ALSA mixer (see
+    //   set_alsa_voice_routing / boot-time tuning); attenuating in software
+    //   here just burned headroom and resolution.
     static const char *playback_desc_aec =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-        "alawdec ! audioconvert ! audioresample ! volume name=playvol volume=0.75 ! tee name=t ! "
-        "queue ! alsasink device=hw:0,0 sync=false "
+        "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! tee name=t ! "
+        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
+        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000 "
         "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe ! fakesink sync=false async=false";
     static const char *playback_desc_plain =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-        "alawdec ! audioconvert ! audioresample ! volume name=playvol volume=0.75 ! alsasink device=hw:0,0 sync=false";
+        "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! "
+        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
+        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
 
     GError *error = NULL;
     GstElement *playback = gst_parse_launch(aec_available ? playback_desc_aec : playback_desc_plain, &error);
@@ -362,14 +376,24 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         }
     }
 
+    // Capture quality notes: plughw + quality=10 for the same reasons as
+    // playback (capture at the codec's native rate, downsample well).
+    // webrtcdsp tuning beyond the bare AEC/NS/AGC booleans:
+    // - high-pass-filter strips DC offset and low-frequency rumble the wall
+    //   mount picks up (matches Android's voice-processing chain).
+    // - noise-suppression-level=high: hands-free wall panel in a live room,
+    //   not a handset near the mouth -- aggressive NS is the right default.
+    // - extended-filter=true: longer echo tail coverage; speaker and mic sit
+    //   centimeters apart in the same enclosure, so the echo path is strong.
     static const char *capture_desc_aec =
-        "alsasrc device=hw:0,0 ! audioconvert ! audioresample ! "
+        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-        "webrtcdsp echo-cancel=true noise-suppression=true gain-control=true ! "
+        "webrtcdsp echo-cancel=true noise-suppression=true gain-control=true "
+        "high-pass-filter=true noise-suppression-level=high extended-filter=true ! "
         "volume name=capvol ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
     static const char *capture_desc_plain =
-        "alsasrc device=hw:0,0 ! audioconvert ! audioresample ! "
+        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
         "volume name=capvol ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
