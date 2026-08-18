@@ -41,11 +41,18 @@ final class InCallScreen extends StatelessWidget {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
-                      RoundActionButton(
-                        icon: state.muted ? Icons.mic_off : Icons.mic,
-                        caption: state.muted ? 'Muted' : 'Mute',
-                        onPressed: () => controller.setMuted(!state.muted),
-                      ),
+                      if (!state.talking)
+                        RoundActionButton(
+                          icon: Icons.mic_none,
+                          caption: 'Talk',
+                          onPressed: controller.talk,
+                        )
+                      else
+                        RoundActionButton(
+                          icon: state.muted ? Icons.mic_off : Icons.mic,
+                          caption: state.muted ? 'Muted' : 'Mute',
+                          onPressed: () => controller.setMuted(!state.muted),
+                        ),
                       RoundActionButton(
                         icon: Icons.lock_open,
                         caption: 'Unlock',

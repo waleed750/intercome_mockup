@@ -154,11 +154,49 @@ final class CallController extends ChangeNotifier {
     ));
   }
 
-  Future<void> connectToDoor(String host,
-      {int port = CallServer.defaultPort}) async {
-    final socket =
-        await Socket.connect(host, port, timeout: const Duration(seconds: 5));
-    _onSocketAccepted(socket);
+  Future<void> viewDoor({String? host, int? port}) async {
+    if (_state.phase != CallPhase.idle) return;
+    final doorHost = host ?? deviceConfig.identity.doorAddress;
+    final doorPort = port ?? CallServer.defaultPort;
+    try {
+      final socket = await Socket.connect(doorHost, doorPort,
+          timeout: const Duration(seconds: 5));
+      _connection?.close();
+      final conn = CallConnection(
+        socket: socket,
+        onFrame: _onFrame,
+        onClosed: () => _teardownCall(showEnded: true),
+      );
+      _connection = conn;
+      conn.start();
+      for (final frame in Commands.answerFrames()) {
+        conn.enqueue(frame);
+      }
+      final id = deviceConfig.identity;
+      _setState(_state.copyWith(
+        phase: CallPhase.connected,
+        talking: false,
+        callerLabel: id.doorName,
+        videoAvailable: true,
+        hasVideoFrames: false,
+        muted: false,
+        transientMessage: null,
+      ));
+      await _video.start();
+    } catch (_) {
+      _showTransient('Could not reach the door');
+    }
+  }
+
+  Future<void> talk() async {
+    if (_state.phase != CallPhase.connected || _state.talking) return;
+    await _startAudio();
+    _setState(_state.copyWith(talking: true));
+    await Future.delayed(const Duration(seconds: 1));
+    final conn = _connection;
+    if (conn != null && _state.phase == CallPhase.connected) {
+      conn.enqueue(Commands.startTalk());
+    }
   }
 
   Future<void> simulateIncomingCall() async {
@@ -314,6 +352,7 @@ final class CallController extends ChangeNotifier {
     _setState(_state.copyWith(
       phase: CallPhase.idle,
       muted: false,
+      talking: false,
       hasVideoFrames: false,
       videoAvailable: true,
       micAvailable: true,

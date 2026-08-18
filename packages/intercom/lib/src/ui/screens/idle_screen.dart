@@ -71,10 +71,21 @@ final class IdleScreen extends StatelessWidget {
                 ],
               ),
               const SizedBox(height: 24),
-              OutlinedButton.icon(
-                onPressed: controller.simulateIncomingCall,
-                icon: const Icon(Icons.call_received),
-                label: const Text('Simulate call'),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: controller.simulateIncomingCall,
+                    icon: const Icon(Icons.call_received),
+                    label: const Text('Simulate call'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: controller.viewDoor,
+                    icon: const Icon(Icons.visibility),
+                    label: const Text('View Door'),
+                  ),
+                ],
               ),
               const Spacer(),
               if (state.transientMessage != null)

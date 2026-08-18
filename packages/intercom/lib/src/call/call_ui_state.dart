@@ -5,6 +5,7 @@ final class CallUiState {
     this.phase = CallPhase.idle,
     this.callerLabel = 'Front Door',
     this.muted = false,
+    this.talking = false,
     this.videoAvailable = true,
     this.hasVideoFrames = false,
     this.micAvailable = true,
@@ -20,6 +21,7 @@ final class CallUiState {
   final CallPhase phase;
   final String callerLabel;
   final bool muted;
+  final bool talking;
   final bool videoAvailable;
   final bool hasVideoFrames;
   final bool micAvailable;
@@ -39,6 +41,7 @@ final class CallUiState {
     CallPhase? phase,
     String? callerLabel,
     bool? muted,
+    bool? talking,
     bool? videoAvailable,
     bool? hasVideoFrames,
     bool? micAvailable,
@@ -54,6 +57,7 @@ final class CallUiState {
       phase: phase ?? this.phase,
       callerLabel: callerLabel ?? this.callerLabel,
       muted: muted ?? this.muted,
+      talking: talking ?? this.talking,
       videoAvailable: videoAvailable ?? this.videoAvailable,
       hasVideoFrames: hasVideoFrames ?? this.hasVideoFrames,
       micAvailable: micAvailable ?? this.micAvailable,

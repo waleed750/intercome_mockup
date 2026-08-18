@@ -20,6 +20,8 @@ final class _AddIntercomScreenState extends State<AddIntercomScreen> {
       TextEditingController(text: widget.config.identity.alias);
   late final TextEditingController _door =
       TextEditingController(text: widget.config.identity.doorName);
+  late final TextEditingController _doorAddr =
+      TextEditingController(text: widget.config.identity.doorAddress);
   late final TextEditingController _addr =
       TextEditingController(text: widget.config.identity.dstAddr);
   late final TextEditingController _serial =
@@ -32,6 +34,7 @@ final class _AddIntercomScreenState extends State<AddIntercomScreen> {
   void dispose() {
     _unit.dispose();
     _door.dispose();
+    _doorAddr.dispose();
     _addr.dispose();
     _serial.dispose();
     super.dispose();
@@ -51,6 +54,10 @@ final class _AddIntercomScreenState extends State<AddIntercomScreen> {
           TextField(
               controller: _door,
               decoration: const InputDecoration(labelText: 'Door name')),
+          const SizedBox(height: 16),
+          TextField(
+              controller: _doorAddr,
+              decoration: const InputDecoration(labelText: 'Door IP address')),
           const SizedBox(height: 16),
           TextField(
             controller: _addr,
@@ -117,6 +124,7 @@ final class _AddIntercomScreenState extends State<AddIntercomScreen> {
       serial: _serial.text,
       dstAddr: address.toString(),
       doorName: _door.text,
+      doorAddress: _doorAddr.text,
     );
     await widget.config.save(identity);
     widget.onSaved?.call(widget.config.identity);

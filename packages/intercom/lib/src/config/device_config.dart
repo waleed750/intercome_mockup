@@ -12,6 +12,7 @@ final class DeviceConfig {
   static const _serialKey = 'intercom.serial';
   static const _dstAddrKey = 'intercom.dst_addr';
   static const _doorNameKey = 'intercom.door_name';
+  static const _doorAddressKey = 'intercom.door_address';
 
   final SharedPreferences _prefs;
 
@@ -38,6 +39,8 @@ final class DeviceConfig {
         dstAddr: _prefs.getString(_dstAddrKey) ?? _generateDefaults().dstAddr,
         doorName:
             _prefs.getString(_doorNameKey) ?? _generateDefaults().doorName,
+        doorAddress:
+            _prefs.getString(_doorAddressKey) ?? _generateDefaults().doorAddress,
       );
 
   Future<void> ensureDefaults() async {
@@ -51,6 +54,9 @@ final class DeviceConfig {
         _isValidAddress(address ?? '') ? address! : defaults.dstAddr);
     await _prefs.setString(
         _doorNameKey, _prefs.getString(_doorNameKey) ?? defaults.doorName);
+    await _prefs.setString(
+        _doorAddressKey,
+        _prefs.getString(_doorAddressKey) ?? defaults.doorAddress);
   }
 
   Future<void> save(DeviceIdentity identity) async {
@@ -74,6 +80,11 @@ final class DeviceConfig {
         identity.doorName.trim().isEmpty
             ? defaults.doorName
             : identity.doorName.trim());
+    await _prefs.setString(
+        _doorAddressKey,
+        identity.doorAddress.trim().isEmpty
+            ? defaults.doorAddress
+            : identity.doorAddress.trim());
   }
 
   static DeviceIdentity _generateDefaults() {
@@ -87,6 +98,7 @@ final class DeviceConfig {
       serial: serial,
       dstAddr: '$address',
       doorName: 'Front Door',
+      doorAddress: '192.168.100.193',
     );
   }
 
