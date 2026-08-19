@@ -176,9 +176,38 @@ final class CallController extends ChangeNotifier {
 
   Future<void> connectToDoor(String host,
       {int port = CallServer.defaultPort}) async {
+    if (_state.phase != CallPhase.idle) return;
     final socket =
         await Socket.connect(host, port, timeout: const Duration(seconds: 5));
     _onSocketAccepted(socket);
+    final conn = _connection;
+    if (conn == null) return;
+
+    final id = deviceConfig.identity;
+    _setState(_state.copyWith(
+      phase: CallPhase.connecting,
+      callerLabel: id.doorName,
+      videoAvailable: true,
+      hasVideoFrames: false,
+      muted: false,
+      transientMessage: null,
+    ));
+
+    for (final frame in Commands.answerFrames()) {
+      conn.enqueue(frame);
+    }
+    await _video.start();
+    await _startAudio();
+    _setState(_state.copyWith(phase: CallPhase.connected));
+
+    // Door units in this protocol family only start streaming once they've
+    // both received the Answer handshake above AND seen a StartTalk shortly
+    // after -- confirmed via wire capture against the real hardware.
+    Timer(const Duration(seconds: 1), () {
+      if (_state.phase == CallPhase.connected) {
+        _connection?.enqueue(Commands.startTalk());
+      }
+    });
   }
 
   Future<void> simulateIncomingCall() async {
