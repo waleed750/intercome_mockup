@@ -307,7 +307,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! tee name=t ! "
         "queue min-threshold-time=80000000 max-size-time=400000000 ! "
         "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000 "
-        "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe ! fakesink sync=false async=false";
+        "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe name=syncn_echoprobe ! fakesink sync=false async=false";
     static const char *playback_desc_plain =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! "
@@ -388,7 +388,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     static const char *capture_desc_aec =
         "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-        "webrtcdsp echo-cancel=true noise-suppression=true gain-control=true "
+        "webrtcdsp probe=syncn_echoprobe echo-cancel=true noise-suppression=true gain-control=true "
         "high-pass-filter=true noise-suppression-level=high extended-filter=true ! "
         "volume name=capvol ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
