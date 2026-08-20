@@ -177,11 +177,6 @@ final class CallController extends ChangeNotifier {
   Future<void> connectToDoor(String host,
       {int port = CallServer.defaultPort}) async {
     if (_state.phase != CallPhase.idle) return;
-    final socket =
-        await Socket.connect(host, port, timeout: const Duration(seconds: 5));
-    _onSocketAccepted(socket);
-    final conn = _connection;
-    if (conn == null) return;
 
     final id = deviceConfig.identity;
     _setState(_state.copyWith(
@@ -193,11 +188,21 @@ final class CallController extends ChangeNotifier {
       transientMessage: null,
     ));
 
+    final socket =
+        await Socket.connect(host, port, timeout: const Duration(seconds: 5));
+    _onSocketAccepted(socket);
+    final conn = _connection;
+    if (conn == null) return;
+
     for (final frame in Commands.answerFrames()) {
       conn.enqueue(frame);
     }
     await _video.start();
-    await _startAudio();
+    try {
+      await _startAudio();
+    } catch (e) {
+      debugPrint('Failed to start audio: $e');
+    }
     _setState(_state.copyWith(phase: CallPhase.connected));
 
     // Door units in this protocol family only start streaming once they've
