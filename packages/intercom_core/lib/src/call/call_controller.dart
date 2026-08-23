@@ -23,6 +23,15 @@ import 'call_ui_state.dart';
 import 'incoming_call_handler.dart';
 
 final class CallController extends ChangeNotifier {
+  /// G.711 A-law silence byte -- 160 of these = one 20ms uplink frame at
+  /// 8kHz, exactly matching what a healthy mic produces. Tuya-style door
+  /// stations gate their downlink video/audio on seeing *continuous* CC
+  /// frames from us (confirmed against the known-good wire capture), so
+  /// when mic capture is unavailable we send synthetic silence instead --
+  /// listen-only + video still work, and the door starts streaming.
+  static final Uint8List _alawSilenceFrame =
+      Uint8List(160)..fillRange(0, 160, 0xD5);
+
   CallController({
     required this.deviceConfig,
     required this.incomingCallHandler,
@@ -60,6 +69,19 @@ final class CallController extends ChangeNotifier {
   CallConnection? _connection;
   StreamSubscription? _audioSub;
   Timer? _transientTimer;
+  Timer? _uplinkWatchdogTimer;
+  Timer? _silenceTimer;
+  Timer? _statsTimer;
+  bool _uplinkFrameSeen = false;
+
+  // Per-call frame counters (diagnostics for "panel-initiated call shows no
+  // video" -- compare sent vs received on-device to see which side is silent).
+  int _framesSent = 0;
+  int _controlFramesReceived = 0;
+  int _videoFramesReceived = 0;
+  int _audioFramesReceived = 0;
+  Stopwatch? _callStopwatch;
+
   CallUiState _state = const CallUiState();
 
   CallUiState get state => _state;
@@ -177,6 +199,7 @@ final class CallController extends ChangeNotifier {
   Future<void> connectToDoor(String host,
       {int port = CallServer.defaultPort}) async {
     if (_state.phase != CallPhase.idle) return;
+    _resetCallDiagnostics();
 
     final id = deviceConfig.identity;
     _setState(_state.copyWith(
@@ -188,29 +211,35 @@ final class CallController extends ChangeNotifier {
       transientMessage: null,
     ));
 
+    debugPrint('Intercom: connecting to door $host:$port');
     final socket =
         await Socket.connect(host, port, timeout: const Duration(seconds: 5));
     _onSocketAccepted(socket);
     final conn = _connection;
     if (conn == null) return;
 
+    var handshakeSent = 0;
     for (final frame in Commands.answerFrames()) {
-      conn.enqueue(frame);
+      if (_send(frame)) handshakeSent++;
     }
+    debugPrint('Intercom: Answer handshake sent ($handshakeSent frames)');
     await _video.start();
+    debugPrint(
+        'Intercom: video pipeline started (textureId=${_video.textureId})');
     try {
       await _startAudio();
     } catch (e) {
       debugPrint('Failed to start audio: $e');
     }
     _setState(_state.copyWith(phase: CallPhase.connected));
+    _startStatsLogging();
 
     // Door units in this protocol family only start streaming once they've
     // both received the Answer handshake above AND seen a StartTalk shortly
     // after -- confirmed via wire capture against the real hardware.
     Timer(const Duration(seconds: 1), () {
-      if (_state.phase == CallPhase.connected) {
-        _connection?.enqueue(Commands.startTalk());
+      if (_state.phase == CallPhase.connected && _send(Commands.startTalk())) {
+        debugPrint('Intercom: StartTalk sent');
       }
     });
   }
@@ -300,15 +329,21 @@ final class CallController extends ChangeNotifier {
   Future<void> _onFrame(Channel channel, Uint8List payload) async {
     switch (channel) {
       case Channel.control:
+        _controlFramesReceived++;
         await _handleControl(payload);
       case Channel.video:
+        _videoFramesReceived++;
         if (_state.phase != CallPhase.idle) {
           await _video.submit(payload);
           if (!_state.hasVideoFrames) {
+            debugPrint(
+                'Intercom: first video frame received '
+                '(t+${_callStopwatch?.elapsed.inMilliseconds ?? 0}ms)');
             _setState(_state.copyWith(hasVideoFrames: true));
           }
         }
       case Channel.audio:
+        _audioFramesReceived++;
         if (_state.phase == CallPhase.connected) {
           await _audio.playDownlink(payload);
         }
@@ -374,15 +409,90 @@ final class CallController extends ChangeNotifier {
       captureEnabled: micGranted,
       headsetMode: _state.headsetMode,
     );
+    _uplinkFrameSeen = false;
+    _stopUplinkFallbacks();
     _audioSub?.cancel();
     _audioSub = _audio.uplink.listen((alaw) {
-      _connection?.enqueue(Frame.encode(Channel.audio, alaw));
+      _uplinkFrameSeen = true;
+      if (_silenceTimer != null) {
+        debugPrint('Intercom: real mic frames resumed -- silence fallback off');
+        _silenceTimer?.cancel();
+        _silenceTimer = null;
+      }
+      _send(Frame.encode(Channel.audio, alaw));
     });
+    _armUplinkWatchdog();
     _setState(_state.copyWith(micAvailable: micGranted));
+  }
+
+  bool _send(Uint8List frame) {
+    final conn = _connection;
+    if (conn == null) return false;
+    final accepted = conn.enqueue(frame);
+    if (accepted) _framesSent++;
+    return accepted;
+  }
+
+  // The native audio plugin does NOT fail `start` when its capture pipeline
+  // can't come up (it logs "mic will be unavailable" and continues with
+  // playback only), so absence of uplink CC frames is how we detect a dead
+  // mic from Dart. Door stations gate their downlink on seeing continuous
+  // uplink audio, so fall back to synthetic A-law silence frames -- exactly
+  // what the known-good wire capture shows flowing right after the handshake.
+  void _armUplinkWatchdog() {
+    _uplinkWatchdogTimer?.cancel();
+    _uplinkWatchdogTimer = Timer(const Duration(seconds: 2), () {
+      if (_uplinkFrameSeen || _state.phase == CallPhase.idle) return;
+      debugPrint(
+          'Intercom: no uplink mic frames within 2s -- sending silence '
+          'frames so the door starts streaming');
+      _silenceTimer?.cancel();
+      _silenceTimer = Timer.periodic(const Duration(milliseconds: 20), (_) {
+        if (!_send(Frame.encode(Channel.audio, _alawSilenceFrame))) {
+          _silenceTimer?.cancel();
+          _silenceTimer = null;
+        }
+      });
+    });
+  }
+
+  void _stopUplinkFallbacks() {
+    _uplinkWatchdogTimer?.cancel();
+    _uplinkWatchdogTimer = null;
+    _silenceTimer?.cancel();
+    _silenceTimer = null;
+  }
+
+  void _startStatsLogging() {
+    _statsTimer?.cancel();
+    _callStopwatch = Stopwatch()..start();
+    _statsTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (_state.phase == CallPhase.idle) return;
+      debugPrint(
+          'Intercom stats t+${_callStopwatch?.elapsed.inSeconds ?? 0}s: '
+          'sent=$_framesSent rxControl=$_controlFramesReceived '
+          'rxVideo=$_videoFramesReceived rxAudio=$_audioFramesReceived'
+          '${_silenceTimer != null ? ' [SILENCE FALLBACK ACTIVE]' : ''}');
+    });
+  }
+
+  void _resetCallDiagnostics() {
+    _stopUplinkFallbacks();
+    _statsTimer?.cancel();
+    _statsTimer = null;
+    _framesSent = 0;
+    _controlFramesReceived = 0;
+    _videoFramesReceived = 0;
+    _audioFramesReceived = 0;
+    _uplinkFrameSeen = false;
   }
 
   Future<void> _teardownCall({required bool showEnded}) async {
     await incomingCallHandler.onCallDismissed();
+    _stopUplinkFallbacks();
+    _statsTimer?.cancel();
+    _statsTimer = null;
+    _callStopwatch = null;
     await _audioSub?.cancel();
     _audioSub = null;
     await _audio.stop().catchError((_) {});
