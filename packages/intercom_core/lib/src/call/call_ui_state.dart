@@ -16,6 +16,7 @@ final class CallUiState {
     this.localIpAddress,
     this.tcpServerListening = false,
     this.discoveryListening = false,
+    this.isIncoming = false,
   });
 
   final CallPhase phase;
@@ -32,6 +33,12 @@ final class CallUiState {
   final String? localIpAddress;
   final bool tcpServerListening;
   final bool discoveryListening;
+  // True when the current/last ringing-or-connected call originated from
+  // the door calling in, false when it was dialed out from the panel
+  // (connectToDoor/startPreview+upgradeToCall) -- lets the UI show a
+  // fullscreen takeover only for incoming calls, since an outbound call
+  // upgraded from the already-visible preview doesn't need one.
+  final bool isIncoming;
 
   bool get isInCall =>
       phase == CallPhase.connecting || phase == CallPhase.connected;
@@ -52,6 +59,7 @@ final class CallUiState {
     Object? localIpAddress = _sentinel,
     bool? tcpServerListening,
     bool? discoveryListening,
+    bool? isIncoming,
   }) {
     return CallUiState(
       phase: phase ?? this.phase,
@@ -72,6 +80,7 @@ final class CallUiState {
           : localIpAddress as String?,
       tcpServerListening: tcpServerListening ?? this.tcpServerListening,
       discoveryListening: discoveryListening ?? this.discoveryListening,
+      isIncoming: isIncoming ?? this.isIncoming,
     );
   }
 }

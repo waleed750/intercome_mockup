@@ -82,6 +82,14 @@ final class CallController extends ChangeNotifier {
   int _audioFramesReceived = 0;
   Stopwatch? _callStopwatch;
 
+  // Remembered so _teardownCall can silently reconnect the preview after a
+  // call ends, instead of leaving the screen fully idle. Only ever set by
+  // startPreview() -- if a preview was never started (e.g. a cold incoming
+  // call with no prior tab visit), teardown has nothing to resume to and
+  // that's fine, it just goes to idle like before.
+  String? _previewHost;
+  int _previewPort = CallServer.defaultPort;
+
   CallUiState _state = const CallUiState();
 
   CallUiState get state => _state;
@@ -168,13 +176,18 @@ final class CallController extends ChangeNotifier {
         hasVideoFrames: false,
         muted: false,
         transientMessage: null,
+        isIncoming: true,
       ));
       await incomingCallHandler.onIncomingCall(doorName: id.doorName);
     }
   }
 
   Future<void> shutdown() async {
-    await _teardownCall(showEnded: false);
+    await _teardownCall(
+      showEnded: false,
+      resumePreview: false,
+      stopVideo: true,
+    );
     await _discovery.stop();
     await _connectionProvider.stop();
     if (_startForegroundService && Platform.isAndroid) {
@@ -209,6 +222,7 @@ final class CallController extends ChangeNotifier {
       hasVideoFrames: false,
       muted: false,
       transientMessage: null,
+      isIncoming: false,
     ));
 
     debugPrint('Intercom: connecting to door $host:$port');
@@ -252,6 +266,8 @@ final class CallController extends ChangeNotifier {
       {int port = CallServer.defaultPort}) async {
     if (_state.phase != CallPhase.idle) return;
     _resetCallDiagnostics();
+    _previewHost = host;
+    _previewPort = port;
 
     final id = deviceConfig.identity;
     _setState(_state.copyWith(
@@ -261,6 +277,7 @@ final class CallController extends ChangeNotifier {
       hasVideoFrames: false,
       muted: false,
       transientMessage: null,
+      isIncoming: false,
     ));
 
     debugPrint('Intercom: starting preview for $host:$port');
@@ -284,7 +301,7 @@ final class CallController extends ChangeNotifier {
   Future<void> stopPreview() async {
     if (_state.phase != CallPhase.previewing) return;
     debugPrint('Intercom: stopping preview');
-    await _teardownCall(showEnded: false);
+    await _teardownCall(showEnded: false, resumePreview: false);
   }
 
   /// Upgrades a running preview to a full call: starts audio and sends
@@ -322,6 +339,7 @@ final class CallController extends ChangeNotifier {
       hasVideoFrames: false,
       muted: false,
       transientMessage: null,
+      isIncoming: true,
     ));
     await incomingCallHandler.onIncomingCall(doorName: id.doorName);
     await _video.start();
@@ -439,10 +457,16 @@ final class CallController extends ChangeNotifier {
       case InboundCommand.call:
         if (_state.phase != CallPhase.idle &&
             _state.phase != CallPhase.previewing) return;
-        // If previewing, tear it down silently before accepting the call.
+        // If previewing, tear it down silently before accepting the call --
+        // resumePreview: false here since we're about to set up the
+        // incoming call's own state/connection right below; auto-resuming
+        // the preview at this exact moment would race with that and could
+        // stomp _connection with a stray reconnect (startPreview's own
+        // phase==idle check would briefly pass in the gap between this
+        // teardown finishing and the ringing state being set just below).
         if (_state.phase == CallPhase.previewing) {
           debugPrint('Intercom: incoming call during preview -- stopping preview');
-          await _teardownCall(showEnded: false);
+          await _teardownCall(showEnded: false, resumePreview: false);
         }
         debugPrint('Intercom: incoming call from door');
         _resetCallDiagnostics();
@@ -455,6 +479,7 @@ final class CallController extends ChangeNotifier {
           hasVideoFrames: false,
           muted: false,
           transientMessage: null,
+          isIncoming: true,
         ));
         // _video.start() runs first, before the (potentially slower) UI/
         // notification handler: CallFrameHandler is a plain `void Function`
@@ -579,7 +604,20 @@ final class CallController extends ChangeNotifier {
     _uplinkFrameSeen = false;
   }
 
-  Future<void> _teardownCall({required bool showEnded}) async {
+  /// Ends whatever call/preview is active. Video is left running by default
+  /// (`resumePreview: true`) -- only the audio pipeline and the socket
+  /// connection actually get torn down. Once idle, if a preview host is
+  /// known, the preview is silently reconnected so the live camera feed
+  /// keeps showing instead of going blank -- since `_video` was never
+  /// stopped, that reconnect is just a socket handshake, not a pipeline
+  /// rebuild (native handle_start no-ops if already running).
+  /// Pass `resumePreview: false` for a real full stop (app shutdown) --
+  /// that's the only path that actually stops video.
+  Future<void> _teardownCall({
+    required bool showEnded,
+    bool resumePreview = true,
+    bool stopVideo = false,
+  }) async {
     await incomingCallHandler.onCallDismissed();
     _stopUplinkFallbacks();
     _statsTimer?.cancel();
@@ -588,7 +626,9 @@ final class CallController extends ChangeNotifier {
     await _audioSub?.cancel();
     _audioSub = null;
     await _audio.stop().catchError((_) {});
-    await _video.stop().catchError((_) {});
+    if (stopVideo) {
+      await _video.stop().catchError((_) {});
+    }
     final conn = _connection;
     _connection = null;
     await conn?.close();
@@ -598,8 +638,16 @@ final class CallController extends ChangeNotifier {
       hasVideoFrames: false,
       videoAvailable: true,
       micAvailable: true,
+      isIncoming: false,
     ));
     if (showEnded) _showTransient('Call ended');
+
+    if (resumePreview && _previewHost != null) {
+      // Fire-and-forget: callers like decline()/hangup shouldn't block on
+      // the reconnect. startPreview() itself guards on phase == idle,
+      // which we just set above.
+      unawaited(startPreview(_previewHost!, port: _previewPort));
+    }
   }
 
   ScreenInfo _buildScreenInfo() {
