@@ -290,6 +290,17 @@ final class CallController extends ChangeNotifier {
     for (final frame in Commands.answerFrames()) {
       _send(frame);
     }
+    // Door units in this protocol family only start streaming once they've
+    // seen Answer AND StartTalk (confirmed via wire capture for the full
+    // call path -- see connectToDoor()/answer()). Preview intentionally
+    // never starts audio/mic capture, but sending StartTalk as a pure wire
+    // trigger (immediately, not after a delay) gets the door streaming
+    // video right away instead of waiting on whatever internal fallback it
+    // uses when StartTalk never arrives -- confirmed this session: preview
+    // video took 4-7s without this, consistently fast on Android (which
+    // always sends StartTalk as part of its call flow, never a
+    // preview-only connect).
+    _send(Commands.startTalk());
     await _video.start();
     debugPrint(
         'Intercom: preview video started (textureId=${_video.textureId})');
