@@ -468,16 +468,23 @@ final class CallController extends ChangeNotifier {
       case InboundCommand.call:
         if (_state.phase != CallPhase.idle &&
             _state.phase != CallPhase.previewing) return;
-        // If previewing, tear it down silently before accepting the call --
-        // resumePreview: false here since we're about to set up the
-        // incoming call's own state/connection right below; auto-resuming
-        // the preview at this exact moment would race with that and could
-        // stomp _connection with a stray reconnect (startPreview's own
-        // phase==idle check would briefly pass in the gap between this
-        // teardown finishing and the ringing state being set just below).
+        // If previewing, clean up the OLD preview's audio/diagnostics state
+        // silently before proceeding -- but do NOT touch _connection or
+        // resume anything. _onSocketAccepted already swapped _connection
+        // to this new incoming socket before this frame was even parsed,
+        // so _connection here IS the incoming call's own connection, not
+        // the old preview's (closing it would kill the incoming call right
+        // as it arrives -- confirmed on-device: this was the real cause of
+        // a 16+ second delay before video showed on incoming calls).
+        // resumePreview: false since we're about to set up the incoming
+        // call's own state right below.
         if (_state.phase == CallPhase.previewing) {
           debugPrint('Intercom: incoming call during preview -- stopping preview');
-          await _teardownCall(showEnded: false, resumePreview: false);
+          await _teardownCall(
+            showEnded: false,
+            resumePreview: false,
+            closeConnection: false,
+          );
         }
         debugPrint('Intercom: incoming call from door');
         _resetCallDiagnostics();
@@ -624,10 +631,22 @@ final class CallController extends ChangeNotifier {
   /// rebuild (native handle_start no-ops if already running).
   /// Pass `resumePreview: false` for a real full stop (app shutdown) --
   /// that's the only path that actually stops video.
+  /// `closeConnection: false` is for the one case where `_connection` no
+  /// longer refers to the call/preview we're tearing down: when a new
+  /// incoming socket arrives while previewing, `_onSocketAccepted` already
+  /// swaps `_connection` to the new incoming socket *before* any of its
+  /// frames are parsed/classified -- so by the time `_handleControl`'s
+  /// InboundCommand.call case calls this to "stop the preview", `_connection`
+  /// already IS the new incoming connection, not the old preview one.
+  /// Closing it here would kill the incoming call's own connection right as
+  /// it arrives (confirmed on-device this session: this was the actual
+  /// cause of a 16+ second delay before video appeared on incoming calls,
+  /// not anything related to StartTalk timing).
   Future<void> _teardownCall({
     required bool showEnded,
     bool resumePreview = true,
     bool stopVideo = false,
+    bool closeConnection = true,
   }) async {
     await incomingCallHandler.onCallDismissed();
     _stopUplinkFallbacks();
@@ -640,9 +659,11 @@ final class CallController extends ChangeNotifier {
     if (stopVideo) {
       await _video.stop().catchError((_) {});
     }
-    final conn = _connection;
-    _connection = null;
-    await conn?.close();
+    if (closeConnection) {
+      final conn = _connection;
+      _connection = null;
+      await conn?.close();
+    }
     _setState(_state.copyWith(
       phase: CallPhase.idle,
       muted: false,
