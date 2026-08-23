@@ -42,6 +42,7 @@ final class _PhaseSwitcher extends StatelessWidget {
     final controller = context.watch<CallController>();
     switch (controller.state.phase) {
       case CallPhase.idle:
+      case CallPhase.previewing:
         return const IdleScreen();
       case CallPhase.ringing:
         return const IncomingCallScreen();

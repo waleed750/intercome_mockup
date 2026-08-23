@@ -244,6 +244,74 @@ final class CallController extends ChangeNotifier {
     });
   }
 
+  /// Lightweight video-only preview: connects to the door and starts the
+  /// video pipeline, but does NOT start audio or send StartTalk. The door
+  /// should start streaming video frames once it sees the Answer handshake,
+  /// giving the user a live camera peek without committing to a full call.
+  Future<void> startPreview(String host,
+      {int port = CallServer.defaultPort}) async {
+    if (_state.phase != CallPhase.idle) return;
+    _resetCallDiagnostics();
+
+    final id = deviceConfig.identity;
+    _setState(_state.copyWith(
+      phase: CallPhase.previewing,
+      callerLabel: id.doorName,
+      videoAvailable: true,
+      hasVideoFrames: false,
+      muted: false,
+      transientMessage: null,
+    ));
+
+    debugPrint('Intercom: starting preview for $host:$port');
+    final socket =
+        await Socket.connect(host, port, timeout: const Duration(seconds: 5));
+    _onSocketAccepted(socket);
+    final conn = _connection;
+    if (conn == null) return;
+
+    for (final frame in Commands.answerFrames()) {
+      _send(frame);
+    }
+    await _video.start();
+    debugPrint(
+        'Intercom: preview video started (textureId=${_video.textureId})');
+    _startStatsLogging();
+  }
+
+  /// Stops the preview without showing "Call ended". Called when navigating
+  /// away from the intercom tab or when transitioning to a full call.
+  Future<void> stopPreview() async {
+    if (_state.phase != CallPhase.previewing) return;
+    debugPrint('Intercom: stopping preview');
+    await _teardownCall(showEnded: false);
+  }
+
+  /// Upgrades a running preview to a full call: starts audio and sends
+  /// StartTalk. If no preview is active, does nothing — the caller should
+  /// use connectToDoor() for a fresh call.
+  Future<void> upgradeToCall() async {
+    final conn = _connection;
+    if (_state.phase != CallPhase.previewing || conn == null) {
+      debugPrint('Intercom: upgradeToCall called but no preview active');
+      return;
+    }
+    debugPrint('Intercom: upgrading preview to full call');
+    _resetCallDiagnostics();
+    try {
+      await _startAudio();
+    } catch (e) {
+      debugPrint('Failed to start audio: $e');
+    }
+    _setState(_state.copyWith(phase: CallPhase.connected));
+    _startStatsLogging();
+    Timer(const Duration(seconds: 1), () {
+      if (_state.phase == CallPhase.connected && _send(Commands.startTalk())) {
+        debugPrint('Intercom: StartTalk sent');
+      }
+    });
+  }
+
   Future<void> simulateIncomingCall() async {
     if (_state.phase != CallPhase.idle) return;
     final id = deviceConfig.identity;
@@ -266,13 +334,27 @@ final class CallController extends ChangeNotifier {
       await _teardownCall(showEnded: true);
       return;
     }
+    debugPrint(
+        'Intercom: answering call (t+${_callStopwatch?.elapsed.inMilliseconds ?? 0}ms)');
     await incomingCallHandler.onCallDismissed();
     _setState(_state.copyWith(phase: CallPhase.connecting));
+    var handshakeSent = 0;
     for (final frame in Commands.answerFrames()) {
-      conn.enqueue(frame);
+      if (_send(frame)) handshakeSent++;
     }
-    await _startAudio();
+    debugPrint('Intercom: Answer handshake sent ($handshakeSent frames)');
+    try {
+      await _startAudio();
+    } catch (e) {
+      debugPrint('Failed to start audio: $e');
+    }
     _setState(_state.copyWith(phase: CallPhase.connected));
+    _startStatsLogging();
+    Timer(const Duration(seconds: 1), () {
+      if (_state.phase == CallPhase.connected && _send(Commands.startTalk())) {
+        debugPrint('Intercom: StartTalk sent');
+      }
+    });
   }
 
   Future<void> decline() async {
@@ -303,7 +385,8 @@ final class CallController extends ChangeNotifier {
   void _onSocketAccepted(Socket socket) {
     if (_connection != null &&
         _state.phase != CallPhase.idle &&
-        _state.phase != CallPhase.ringing) {
+        _state.phase != CallPhase.ringing &&
+        _state.phase != CallPhase.previewing) {
       socket.add(Commands.deviceBusy());
       socket.destroy();
       return;
@@ -354,7 +437,16 @@ final class CallController extends ChangeNotifier {
     final message = Commands.parse(payload);
     switch (message?.classify() ?? InboundCommand.unknown) {
       case InboundCommand.call:
-        if (_state.phase != CallPhase.idle) return;
+        if (_state.phase != CallPhase.idle &&
+            _state.phase != CallPhase.previewing) return;
+        // If previewing, tear it down silently before accepting the call.
+        if (_state.phase == CallPhase.previewing) {
+          debugPrint('Intercom: incoming call during preview -- stopping preview');
+          await _teardownCall(showEnded: false);
+        }
+        debugPrint('Intercom: incoming call from door');
+        _resetCallDiagnostics();
+        _callStopwatch = Stopwatch()..start();
         final id = deviceConfig.identity;
         _setState(_state.copyWith(
           phase: CallPhase.ringing,
