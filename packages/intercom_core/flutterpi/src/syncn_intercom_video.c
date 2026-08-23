@@ -367,8 +367,24 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     }
 
     GError *error = NULL;
+    // The leaky queue right after appsrc is the fix for a steady-state lag bug:
+    // submit() (Dart side) fires NAL units into appsrc as fast as the network
+    // delivers them, with no backpressure from decode speed. appsrc's own
+    // internal queue has no leaky-type set, so if avdec_h264 (software decode)
+    // ever falls even slightly behind the incoming rate, undecoded NALs pile
+    // up and are decoded in strict FIFO order -- the viewer ends up watching a
+    // growing backlog of old frames instead of the latest one, with the lag
+    // increasing the longer the stream runs (confirmed matches the reported
+    // "picture is 5-10+ sec behind reality, gets worse over time" symptom).
+    // leaky=downstream (2) drops the OLDEST buffered NAL(s) once more than
+    // max-size-time worth is queued, capping how far behind real-time decode
+    // is allowed to drift to ~150ms -- at the cost of visibly dropping/
+    // corrupting whatever access unit those NALs belonged to, self-healing at
+    // the next IDU/keyframe. Trading a brief glitch for staying live beats a
+    // multi-second-and-growing delay.
     GstElement *pipeline = gst_parse_launch(
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
+        "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=150000000 leaky=downstream ! "
         "h264parse config-interval=-1 ! avdec_h264 ! videoconvert ! "
         "video/x-raw,format=RGBA ! "
         "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false",
