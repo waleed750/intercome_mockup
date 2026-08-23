@@ -167,11 +167,29 @@ static void log_pipeline_bus_errors(const char *tag, GstElement *pipeline) {
     gst_object_unref(bus);
 }
 
-// Issues the PLAYING state change and actually waits for the real outcome
-// (see log_pipeline_bus_errors' comment for why the immediate return value
-// alone isn't trustworthy). Returns true if the pipeline is confirmed
-// playing (or still legitimately pending as ASYNC), false on a real failure
-// -- logging bus errors either way so real hardware failures are visible.
+// Non-blocking start for playback pipelines: set_state + failure check only,
+// no blocking gst_element_get_state() wait. The playback pipeline uses
+// appsrc is-live=true, which reaches PLAYING without needing buffers, and
+// real failures surface asynchronously via the bus log. The blocking 3s
+// get_state() was deadlocking the flutter-pi platform thread -- while it
+// blocked, no submit() method-channel calls could reach appsrc, creating a
+// chicken-and-egg deadlock that added exactly 3s to every call setup (see
+// syncn_intercom_video.c's identical fix).
+static bool start_pipeline_non_blocking(const char *tag, GstElement *pipeline) {
+    GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    syncn_intercom_debug_log("audio", "%s: gst_element_set_state(PLAYING) -> %d (non-blocking)", tag, state_ret);
+    if (state_ret == GST_STATE_CHANGE_FAILURE) {
+        log_pipeline_bus_errors(tag, pipeline);
+        return false;
+    }
+    log_pipeline_bus_errors(tag, pipeline);
+    return true;
+}
+
+// Blocking start for capture pipelines: confirms PLAYING via get_state().
+// Kept for capture only -- it's a separate, already-fast path (31ms in the
+// measured log) and captures need the pipeline confirmed running before
+// on_new_capture_sample can deliver useful uplink frames.
 static bool start_and_confirm_playing(const char *tag, GstElement *pipeline) {
     GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     syncn_intercom_debug_log("audio", "%s: gst_element_set_state(PLAYING) -> %d", tag, state_ret);
@@ -349,7 +367,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         gst_caps_unref(appsrc_caps);
         gst_app_src_set_stream_type(GST_APP_SRC(playback_appsrc), GST_APP_STREAM_TYPE_STREAM);
     }
-    if (playback_appsrc == NULL || !start_and_confirm_playing("syncn_intercom_audio playback", playback)) {
+    if (playback_appsrc == NULL || !start_pipeline_non_blocking("syncn_intercom_audio playback", playback)) {
         if (aec_available) {
             // The echo probe/tee branch is the one new failure mode here (e.g.
             // fakesink negotiation); retry once without it before giving up
@@ -368,12 +386,25 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
                 gst_app_src_set_stream_type(GST_APP_SRC(playback_appsrc), GST_APP_STREAM_TYPE_STREAM);
             }
         }
-        if (playback_appsrc == NULL || !start_and_confirm_playing("syncn_intercom_audio playback (retry)", playback)) {
+        if (playback_appsrc == NULL || !start_pipeline_non_blocking("syncn_intercom_audio playback (retry)", playback)) {
             LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
             if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
             if (playback != NULL) syncn_gst_bounded_teardown("audio-playback", playback, 3);
             return false;
         }
+    }
+
+    // Retrieve the echo probe element from the playback pipeline so we can
+    // hand it to webrtcdsp in the capture pipeline below. The probe property
+    // is a GstElement pointer -- gst_parse_launch's `probe=syncn_echoprobe`
+    // syntax can't resolve references across separate pipelines, so we must
+    // set it via g_object_set after both pipelines exist.
+    GstElement *echoprobe = aec_available
+        ? gst_bin_get_by_name(GST_BIN(playback), "syncn_echoprobe")
+        : NULL;
+    if (aec_available && echoprobe == NULL) {
+        LOG_ERROR("syncn_intercom_audio: AEC enabled but webrtcechoprobe element not found in playback pipeline\n");
+        aec_available = false;
     }
 
     // Capture quality notes: plughw + quality=10 for the same reasons as
@@ -388,7 +419,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     static const char *capture_desc_aec =
         "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-        "webrtcdsp probe=syncn_echoprobe echo-cancel=true noise-suppression=true gain-control=true "
+        "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=true "
         "high-pass-filter=true noise-suppression-level=high extended-filter=true ! "
         "volume name=capvol ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
@@ -423,6 +454,23 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
                 continue;
             }
             g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
+            // Hand the playback pipeline's echo probe to webrtcdsp via
+            // g_object_set -- gst_parse_launch can't resolve cross-pipeline
+            // element references (the `probe=` syntax only works within the
+            // same bin), which is why the probe property was silently unset
+            // before this fix (webrtcdsp fell back to looking for the default
+            // `webrtcechoprobe0` name, which doesn't exist, causing AEC to
+            // silently degrade to no-echo-cancellation on every call).
+            if (use_aec && echoprobe != NULL) {
+                GstElement *dsp = gst_bin_get_by_name(GST_BIN(capture), "dsp");
+                if (dsp != NULL) {
+                    g_object_set(dsp, "probe", echoprobe, NULL);
+                    syncn_intercom_debug_log("audio", "start_locked: set webrtcdsp probe -> syncn_echoprobe (AEC engaged)");
+                    gst_object_unref(dsp);
+                } else {
+                    LOG_ERROR("syncn_intercom_audio: webrtcdsp element not found in AEC capture pipeline\n");
+                }
+            }
             if (!start_and_confirm_playing("syncn_intercom_audio capture", capture)) {
                 LOG_ERROR("syncn_intercom_audio: failed to start capture pipeline (aec=%d)\n", use_aec);
                 gst_object_unref(capture_appsink);
@@ -446,6 +494,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     self->capture_enabled = capture_enabled && capture != NULL;
     self->running = true;
     syncn_intercom_debug_log("audio", "start_locked: SUCCESS, capture_enabled=%d (requested %d)", self->capture_enabled, capture_enabled);
+    if (echoprobe != NULL) gst_object_unref(echoprobe);
     return true;
 }
 

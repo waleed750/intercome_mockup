@@ -427,27 +427,14 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
         return -1;
     }
 
-    // set_state()'s immediate return is almost always ASYNC/NO_PREROLL here
-    // (see log_pipeline_bus_errors' comment) -- actually wait for the real
-    // outcome instead of assuming it worked.
-    GstState final_state;
-    GstStateChangeReturn wait_ret = gst_element_get_state(pipeline, &final_state, NULL, 3 * GST_SECOND);
-    syncn_intercom_debug_log("video", "handle_start: gst_element_get_state -> wait_ret=%d, final_state=%d", wait_ret, final_state);
-    if (wait_ret == GST_STATE_CHANGE_FAILURE || (final_state != GST_STATE_PLAYING && wait_ret != GST_STATE_CHANGE_ASYNC)) {
-        LOG_ERROR(
-            "syncn_intercom_video: pipeline did not reach PLAYING (wait_ret=%d, final_state=%d)\n",
-            wait_ret,
-            final_state
-        );
-        log_pipeline_bus_errors("syncn_intercom_video", pipeline);
-        gst_object_unref(appsrc);
-        gst_object_unref(appsink);
-        if (syncn_gst_bounded_teardown("video", pipeline, 3)) {
-            destroy_egl_context_locked(self);
-        }
-        pthread_mutex_unlock(&self->lock);
-        return -1;
-    }
+    // Non-blocking start: do NOT call gst_element_get_state() here.
+    // That call blocks the flutter-pi platform thread for up to 3s while
+    // the pipeline negotiates -- and while the platform thread is blocked,
+    // it cannot process the submit() method-channel calls that deliver
+    // incoming NAL frames to appsrc (confirmed deadlock-by-timeout on
+    // real hardware, always exactly 3s, matching the reported delay).
+    // A live appsrc pipeline reaches PLAYING without needing buffers, and
+    // real failures surface asynchronously via the bus log below.
     log_pipeline_bus_errors("syncn_intercom_video", pipeline);
 
     self->pipeline = pipeline;
