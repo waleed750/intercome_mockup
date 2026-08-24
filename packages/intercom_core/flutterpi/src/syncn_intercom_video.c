@@ -428,7 +428,19 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     // net again instead of the everyday path.
     GstElement *pipeline = gst_parse_launch(
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-        "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=450000000 leaky=downstream ! "
+        // DIAGNOSTIC (2026-08-24): max-size-time bumped from 450ms to 5s as a
+        // one-shot test -- avdec_h264, mppvideodec, and mppvideodec with
+        // qos=false all independently produced the identical ~300ms/frame
+        // output cadence despite NALs arriving steadily at ~25/sec and our
+        // own pull_sample+GL-upload path measuring ~2.5ms, which rules out
+        // decode speed and our render path. This queue is the one thing
+        // common to every test. If loosening it this much restores a real
+        // frame rate, it confirms the queue itself (leaking mid-NAL,
+        // corrupting the H.264 reference chain almost every frame) was
+        // capping us at roughly the door's keyframe interval, not a genuine
+        // backlog. Not meant to ship at 5s -- revert to a bounded value
+        // once confirmed, this time dropping at access-unit boundaries only.
+        "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 leaky=downstream ! "
         // qos=false: mppvideodec defaults to qos=true, meaning it can drop
         // frames on its own based on QoS events from downstream in a live
         // pipeline -- independent of anything the leaky queue above does.
