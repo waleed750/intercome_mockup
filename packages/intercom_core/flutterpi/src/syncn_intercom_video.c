@@ -378,13 +378,18 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     // "picture is 5-10+ sec behind reality, gets worse over time" symptom).
     // leaky=downstream (2) drops the OLDEST buffered NAL(s) once more than
     // max-size-time worth is queued, capping how far behind real-time decode
-    // is allowed to drift to ~150ms -- at the cost of visibly dropping/
-    // corrupting whatever access unit those NALs belonged to, self-healing at
-    // the next IDU/keyframe. Trading a brief glitch for staying live beats a
-    // multi-second-and-growing delay.
+    // is allowed to drift -- at the cost of visibly dropping/corrupting
+    // whatever access unit those NALs belonged to, self-healing at the next
+    // IDR/keyframe. Trading a brief glitch for staying live beats a
+    // multi-second-and-growing delay. 150ms was too tight in practice: it
+    // dropped NALs on essentially every normal jitter blip, causing frequent
+    // visible glitches/corrupted frames instead of only shedding under real
+    // sustained backlog -- confirmed on-device 2026-08-24. 450ms leaves
+    // headroom for that jitter while still bounding drift to well under a
+    // second (vs. the original unbounded, multi-second-and-growing lag).
     GstElement *pipeline = gst_parse_launch(
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-        "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=150000000 leaky=downstream ! "
+        "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=450000000 leaky=downstream ! "
         "h264parse config-interval=-1 ! avdec_h264 ! videoconvert ! "
         "video/x-raw,format=RGBA ! "
         "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false",
