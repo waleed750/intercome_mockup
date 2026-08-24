@@ -28,6 +28,7 @@
 
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
@@ -95,12 +96,31 @@ static void on_texture_frame_destroy(const struct texture_frame *frame, void *us
     // time), so there's nothing to free here.
 }
 
+static double ms_since(const struct timespec *start) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - start->tv_sec) * 1000.0 + (now.tv_nsec - start->tv_nsec) / 1e6;
+}
+
 // Called on a GStreamer streaming thread (not the flutter-pi platform
 // thread), once per decoded frame.
 static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
     struct syncn_intercom_video *self = userdata;
 
+    // Diagnostic timing (2026-08-24): both avdec_h264 and mppvideodec
+    // independently settled at the identical ~300ms/frame rate, and NALs are
+    // confirmed arriving from the network much faster than that -- so the
+    // bottleneck is somewhere in this function's own path (pull/map/EGL/
+    // upload), not in decode itself. t_pull_start brackets
+    // gst_app_sink_pull_sample() specifically: if THAT call is what's slow,
+    // the pacing is coming from upstream (queue/decoder handing us samples
+    // slowly); if it returns fast and the delay shows up in the later
+    // stages instead, it's the EGL context switch or GL upload.
+    struct timespec t_pull_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_pull_start);
+
     GstSample *sample = gst_app_sink_pull_sample(sink);
+    double pull_ms = ms_since(&t_pull_start);
     if (sample == NULL) {
         return GST_FLOW_OK;
     }
@@ -142,12 +162,13 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
     if (should_log) {
         syncn_intercom_debug_log(
             "video",
-            "on_new_sample #%d: running=%d, decoded %dx%d, buffer size=%zu",
+            "on_new_sample #%d: running=%d, decoded %dx%d, buffer size=%zu, pull_sample took %.1fms",
             self->frame_count,
             self->running,
             width,
             height,
-            map.size
+            map.size,
+            pull_ms
         );
     }
 
@@ -159,10 +180,15 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
         return GST_FLOW_OK;
     }
 
+    struct timespec t_egl_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_egl_start);
     int gl_context_ret = eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context) ? 0 : EIO;
-    if (should_log) syncn_intercom_debug_log("video", "on_new_sample #%d: eglMakeCurrent(own context) -> %d (eglGetError=0x%x)", self->frame_count, gl_context_ret, eglGetError());
+    double egl_ms = ms_since(&t_egl_start);
+    if (should_log) syncn_intercom_debug_log("video", "on_new_sample #%d: eglMakeCurrent(own context) -> %d (eglGetError=0x%x), took %.1fms", self->frame_count, gl_context_ret, eglGetError(), egl_ms);
 
     if (gl_context_ret == 0) {
+        struct timespec t_upload_start;
+        clock_gettime(CLOCK_MONOTONIC, &t_upload_start);
         if (self->gl_texture_name == 0) {
             glGenTextures(1, &self->gl_texture_name);
             glBindTexture(GL_TEXTURE_2D, self->gl_texture_name);
@@ -214,14 +240,21 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
             .destroy = on_texture_frame_destroy,
             .userdata = NULL,
         };
+        double upload_ms = ms_since(&t_upload_start);
+        struct timespec t_push_start;
+        clock_gettime(CLOCK_MONOTONIC, &t_push_start);
         int push_ret = texture_push_frame(self->texture, &frame);
+        double push_ms = ms_since(&t_push_start);
         if (should_log) {
             syncn_intercom_debug_log(
                 "video",
-                "on_new_sample #%d: uploaded gl_texture_name=%u, texture_push_frame -> %d",
+                "on_new_sample #%d: uploaded gl_texture_name=%u (glTex* took %.1fms), texture_push_frame -> %d (took %.1fms), TOTAL since pull_sample returned: %.1fms",
                 self->frame_count,
                 self->gl_texture_name,
-                push_ret
+                upload_ms,
+                push_ret,
+                push_ms,
+                ms_since(&t_egl_start)
             );
         }
 
