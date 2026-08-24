@@ -223,14 +223,17 @@ static bool ensure_yuv_gl_resources_locked(struct syncn_intercom_video *self) {
     self->yuv_uniform_y_texture = glGetUniformLocation(program, "u_y_texture");
     self->yuv_uniform_uv_texture = glGetUniformLocation(program, "u_uv_texture");
 
-    // Full-screen quad as a triangle strip: (x, y, u, v) per vertex. Texture
-    // v is flipped (1-v) here so the FBO-rendered result comes out the same
-    // way up as the previous direct-upload path did.
+    // Full-screen quad as a triangle strip: (x, y, u, v) per vertex.
+    // No v-flip here (2026-08-24 correction): an earlier version flipped v
+    // assuming a general FBO-rendering convention mismatch, but confirmed
+    // wrong on-device -- the result came out upside down. Direct 1:1
+    // mapping (NDC bottom -> v=0, NDC top -> v=1) is correct for this
+    // straightforward sample-and-write pass.
     const GLfloat quad[] = {
-        -1.0f, -1.0f, 0.0f, 1.0f,
-         1.0f, -1.0f, 1.0f, 1.0f,
-        -1.0f,  1.0f, 0.0f, 0.0f,
-         1.0f,  1.0f, 1.0f, 0.0f,
+        -1.0f, -1.0f, 0.0f, 0.0f,
+         1.0f, -1.0f, 1.0f, 0.0f,
+        -1.0f,  1.0f, 0.0f, 1.0f,
+         1.0f,  1.0f, 1.0f, 1.0f,
     };
     glGenBuffers(1, &self->yuv_quad_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, self->yuv_quad_vbo);
