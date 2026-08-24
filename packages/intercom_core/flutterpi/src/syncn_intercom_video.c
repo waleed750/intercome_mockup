@@ -130,7 +130,15 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
     pthread_mutex_lock(&self->lock);
 
     self->frame_count++;
-    bool should_log = self->frame_count <= 30;
+    // Logging every frame forever would spam the log file, but capping it at
+    // the first 30 frames ever (the old behavior) made it impossible to see
+    // frame timing during any test more than a few seconds after pipeline
+    // start -- confirmed on-device 2026-08-24: this looked exactly like a
+    // silently-stalled pipeline (no new log lines) when the video was
+    // actually still running fine, just past frame 30. Log the first 30
+    // always (covers startup), then every 15th frame after that, so a long
+    // soak test still shows periodic real timing data.
+    bool should_log = self->frame_count <= 30 || self->frame_count % 15 == 0;
     if (should_log) {
         syncn_intercom_debug_log(
             "video",
