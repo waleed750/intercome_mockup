@@ -429,7 +429,16 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     GstElement *pipeline = gst_parse_launch(
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=450000000 leaky=downstream ! "
-        "h264parse config-interval=-1 ! mppvideodec ! videoconvert ! "
+        // qos=false: mppvideodec defaults to qos=true, meaning it can drop
+        // frames on its own based on QoS events from downstream in a live
+        // pipeline -- independent of anything the leaky queue above does.
+        // Timing diagnostics confirmed pull_sample+our own GL upload total
+        // ~2.5ms/frame (not the bottleneck) while NALs keep arriving at a
+        // steady ~25/sec the whole time -- decode is only *producing*
+        // output ~3x/sec despite input and our own consumption both being
+        // fast, which points straight at self-throttling inside the
+        // decoder rather than a real backlog.
+        "h264parse config-interval=-1 ! mppvideodec qos=false ! videoconvert ! "
         "video/x-raw,format=RGBA ! "
         "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false",
         &error
