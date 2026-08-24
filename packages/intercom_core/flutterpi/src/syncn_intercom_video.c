@@ -147,6 +147,22 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
     int width = GST_VIDEO_INFO_WIDTH(&info);
     int height = GST_VIDEO_INFO_HEIGHT(&info);
 
+    // Real internal pipeline latency for this specific frame: PTS is the
+    // running-time this buffer was stamped with when appsrc received it
+    // (do-timestamp=true), and current running-time is "now" in the same
+    // clock domain -- the difference is exactly how long the buffer has
+    // been in the pipeline (queue dwell + decode), independent of wall-clock
+    // drift. This is what pull_sample/GL-upload timing could NOT show: that
+    // only covers work after the decoder already finished.
+    double pipeline_latency_ms = -1.0;
+    GstClockTime buf_pts = GST_BUFFER_PTS(buffer);
+    if (self->pipeline != NULL && GST_CLOCK_TIME_IS_VALID(buf_pts)) {
+        GstClockTime running_time = gst_element_get_current_running_time(self->pipeline);
+        if (GST_CLOCK_TIME_IS_VALID(running_time) && running_time >= buf_pts) {
+            pipeline_latency_ms = (double) (running_time - buf_pts) / 1e6;
+        }
+    }
+
     pthread_mutex_lock(&self->lock);
 
     self->frame_count++;
@@ -162,13 +178,14 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
     if (should_log) {
         syncn_intercom_debug_log(
             "video",
-            "on_new_sample #%d: running=%d, decoded %dx%d, buffer size=%zu, pull_sample took %.1fms",
+            "on_new_sample #%d: running=%d, decoded %dx%d, buffer size=%zu, pull_sample took %.1fms, pipeline latency (queue dwell + decode) %.1fms",
             self->frame_count,
             self->running,
             width,
             height,
             map.size,
-            pull_ms
+            pull_ms,
+            pipeline_latency_ms
         );
     }
 
@@ -367,7 +384,35 @@ static bool teardown_pipeline_unlocked(struct syncn_intercom_video *self, GstEle
     return settled;
 }
 
-static int64_t handle_start(struct syncn_intercom_video *self) {
+// Fits the door's known 16:9 source aspect inside a screen_w x screen_h
+// bounding box (never upscaling past the source, never distorting aspect),
+// rounded down to even numbers since YUV/H.264 formats require it. Screens
+// vary per panel model (4-inch vs 10-inch builds use different physical
+// resolutions -- see panel_home_4inch.dart / panel_home_10inch.dart), so
+// this is computed per-call from whatever Dart reports at start() time
+// rather than a value hardcoded for one specific panel.
+static void compute_decode_target(int screen_w, int screen_h, int *out_w, int *out_h) {
+    const int src_w = 1280, src_h = 720;
+    if (screen_w <= 0 || screen_h <= 0) {
+        *out_w = 0;
+        *out_h = 0;
+        return;
+    }
+    int candidate_w = screen_w;
+    int candidate_h = (int) ((int64_t) candidate_w * src_h / src_w);
+    if (candidate_h > screen_h) {
+        candidate_h = screen_h;
+        candidate_w = (int) ((int64_t) candidate_h * src_w / src_h);
+    }
+    if (candidate_w > src_w || candidate_h > src_h) {
+        candidate_w = src_w;
+        candidate_h = src_h;
+    }
+    *out_w = candidate_w & ~1;
+    *out_h = candidate_h & ~1;
+}
+
+static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int screen_h) {
     pthread_mutex_lock(&self->lock);
 
     syncn_intercom_debug_log("video", "handle_start called, self->running=%d", self->running);
@@ -408,53 +453,62 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
     }
 
     GError *error = NULL;
-    // Root cause found on-device 2026-08-24: this board's CPU was already
-    // running near-saturated (~78% user, load avg 3.7+) and avdec_h264
-    // (software decode) could not sustain real-time decode on top of that,
-    // so it chronically fell behind the incoming stream. The leaky queue
-    // below (added as an earlier band-aid) was firing constantly as a
-    // result, and because submit() pushes one NAL at a time (not a whole
-    // frame), dropping mid-frame NALs corrupts that access unit AND breaks
-    // the H.264 reference chain for every subsequent P-frame until the next
-    // IDR -- producing exactly the observed "blocky/stale regions, smearing,
-    // sudden clean recovery" pattern. Queue tuning alone can't fix a
-    // sustained throughput deficit, only mask jitter.
-    //
-    // This board has a Rockchip MPP hardware video decoder available
-    // (confirmed via `gst-inspect-1.0 | grep mpp`: rockchipmpp's
-    // mppvideodec), which offloads H.264 decode to a dedicated hardware
-    // block instead of the CPU -- switching to it should let decode keep up
-    // in real time on its own, making the leaky queue a rarely-used safety
-    // net again instead of the everyday path.
-    GstElement *pipeline = gst_parse_launch(
-        "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-        // DIAGNOSTIC (2026-08-24): max-size-time bumped from 450ms to 5s as a
-        // one-shot test -- avdec_h264, mppvideodec, and mppvideodec with
-        // qos=false all independently produced the identical ~300ms/frame
-        // output cadence despite NALs arriving steadily at ~25/sec and our
-        // own pull_sample+GL-upload path measuring ~2.5ms, which rules out
-        // decode speed and our render path. This queue is the one thing
-        // common to every test. If loosening it this much restores a real
-        // frame rate, it confirms the queue itself (leaking mid-NAL,
-        // corrupting the H.264 reference chain almost every frame) was
-        // capping us at roughly the door's keyframe interval, not a genuine
-        // backlog. Not meant to ship at 5s -- revert to a bounded value
-        // once confirmed, this time dropping at access-unit boundaries only.
-        "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 leaky=downstream ! "
-        // qos=false: mppvideodec defaults to qos=true, meaning it can drop
-        // frames on its own based on QoS events from downstream in a live
-        // pipeline -- independent of anything the leaky queue above does.
-        // Timing diagnostics confirmed pull_sample+our own GL upload total
-        // ~2.5ms/frame (not the bottleneck) while NALs keep arriving at a
-        // steady ~25/sec the whole time -- decode is only *producing*
-        // output ~3x/sec despite input and our own consumption both being
-        // fast, which points straight at self-throttling inside the
-        // decoder rather than a real backlog.
-        "h264parse config-interval=-1 ! mppvideodec qos=false ! videoconvert ! "
-        "video/x-raw,format=RGBA ! "
-        "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false",
-        &error
+    // Findings so far (2026-08-24): bumping the leaky queue to 5s (a one-shot
+    // diagnostic, now reverted to 800ms below) made lag WORSE (grew to a
+    // full 5s, matching the cap exactly) and framerate WORSE too -- proving
+    // decode genuinely cannot sustain the incoming rate in real time, and
+    // that the queue was correctly protecting against a real backlog, not
+    // manufacturing one. Our own pull_sample+GL-upload timing (~2.5-5ms)
+    // only measures work AFTER the decoder has already produced a frame --
+    // it says nothing about how long decode itself takes, which happens
+    // entirely before on_new_sample's callback fires. mppvideodec's caps
+    // negotiation was also confirmed forcing it to output RGBA directly
+    // (buffer size matched 1280*720*4 exactly), meaning any NV12->RGBA
+    // colorspace conversion happens *inside* the decoder call, not in the
+    // separate videoconvert element -- if that conversion isn't going
+    // through the SoC's RGA hardware block, it could be a slow per-pixel
+    // software path scaling with full 1280x720 resolution when the actual
+    // screen is much smaller. mppvideodec's width/height properties let it
+    // decode-and-scale in one hardware pass instead of full-res decode +
+    // separate convert -- compute_decode_target() sizes that per-call to
+    // whatever screen Dart reports, instead of a value hardcoded for one
+    // specific panel model.
+    int decode_w, decode_h;
+    compute_decode_target(screen_w, screen_h, &decode_w, &decode_h);
+    syncn_intercom_debug_log(
+        "video",
+        "handle_start: screen=%dx%d -> decode target=%dx%d (0x0 means native 1280x720, no scaling)",
+        screen_w,
+        screen_h,
+        decode_w,
+        decode_h
     );
+
+    char pipeline_desc[512];
+    if (decode_w > 0 && decode_h > 0) {
+        snprintf(
+            pipeline_desc,
+            sizeof(pipeline_desc),
+            "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
+            "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=800000000 leaky=downstream ! "
+            "h264parse config-interval=-1 ! mppvideodec qos=false width=%d height=%d ! videoconvert ! "
+            "video/x-raw,format=RGBA ! "
+            "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false",
+            decode_w,
+            decode_h
+        );
+    } else {
+        snprintf(
+            pipeline_desc,
+            sizeof(pipeline_desc),
+            "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
+            "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=800000000 leaky=downstream ! "
+            "h264parse config-interval=-1 ! mppvideodec qos=false ! videoconvert ! "
+            "video/x-raw,format=RGBA ! "
+            "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false"
+        );
+    }
+    GstElement *pipeline = gst_parse_launch(pipeline_desc, &error);
     if (pipeline == NULL) {
         LOG_ERROR("syncn_intercom_video: failed to build pipeline: %s\n", error != NULL ? error->message : "unknown error");
         if (error != NULL) g_error_free(error);
@@ -620,7 +674,20 @@ static void on_platform_message(void *userdata, const FlutterPlatformMessage *me
     }
 
     if (strcmp(object.method, "start") == 0) {
-        int64_t id = handle_start(self);
+        int screen_w = 0, screen_h = 0;
+        if (object.std_arg.type == kStdMap) {
+            for (size_t i = 0; i < object.std_arg.size; i++) {
+                struct std_value *key = &object.std_arg.keys[i];
+                if (key->type != kStdString) continue;
+                struct std_value *value = &object.std_arg.values[i];
+                if (strcmp(key->string_value, "screenWidth") == 0) {
+                    screen_w = STDVALUE_IS_INT(*value) ? (int) STDVALUE_AS_INT(*value) : 0;
+                } else if (strcmp(key->string_value, "screenHeight") == 0) {
+                    screen_h = STDVALUE_IS_INT(*value) ? (int) STDVALUE_AS_INT(*value) : 0;
+                }
+            }
+        }
+        int64_t id = handle_start(self, screen_w, screen_h);
         if (id < 0) {
             platch_respond_error_std(message->response_handle, "video_start_failed", "Could not start the GStreamer video pipeline.", NULL);
         } else {
