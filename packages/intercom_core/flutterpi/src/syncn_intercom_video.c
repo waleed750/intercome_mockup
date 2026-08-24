@@ -9,9 +9,12 @@
 // ffmpeg's Annex-B output on start codes and sends each NAL individually via
 // `encode_frame(VIDEO, nalu)`; h264parse reassembles NALs into access units),
 // `stop()` tears everything down. Decoding is done by a GStreamer pipeline
-// (appsrc -> h264parse -> avdec_h264 -> videoconvert), and each decoded RGBA
-// frame is uploaded into a plain GL_TEXTURE_2D via glTexImage2D/glTexSubImage2D
-// on a dedicated EGL context shared with flutter-pi's main GL context, then
+// (appsrc -> h264parse -> mppvideodec, Rockchip's hardware decoder, scaled
+// to the caller's screen size and output as NV12). NV12->RGB conversion is
+// done ourselves via a small GLES2 shader (not GStreamer's videoconvert,
+// which benchmarked ~18x slower than decode itself on this board -- see the
+// struct's yuv_program field comment) into an FBO-backed GL_TEXTURE_2D, on
+// a dedicated EGL context shared with flutter-pi's main GL context, then
 // pushed into a flutter-pi `struct texture`.
 //
 // NOTE: mock_door is a development stand-in for the real door unit -- its
@@ -78,6 +81,35 @@ struct syncn_intercom_video {
     int gl_texture_width;
     int gl_texture_height;
 
+    // NV12->RGBA GPU conversion resources (2026-08-24): GStreamer's
+    // videoconvert element produces the RGBA appsink needs, but measured
+    // ~72s of the ~76s spent processing a small test capture -- vs. ~4s for
+    // mppvideodec's decode+scale alone (isolated via gst-launch-1.0 file
+    // benchmarks off-device from the app). Decode is fast; that one
+    // conversion element is pathologically slow on this board's GStreamer
+    // build, likely a per-frame caps/pool renegotiation rather than genuine
+    // per-pixel cost. Fix: mppvideodec now outputs NV12 directly (no
+    // videoconvert in the pipeline at all), and this file does the
+    // NV12->RGB conversion itself via a tiny GLES2 shader into an FBO,
+    // reusing the GPU we already touch for texture upload every frame
+    // anyway. flutter-pi's own EGL context is GLES2-only (confirmed via its
+    // gl_renderer.c: EGL_CONTEXT_CLIENT_VERSION=2), so this uses
+    // GL_LUMINANCE/GL_LUMINANCE_ALPHA (core GLES2, no extension needed) for
+    // the Y/UV planes rather than GLES3's GL_R8/GL_RG8.
+    GLuint yuv_program;
+    GLint yuv_attr_position;
+    GLint yuv_attr_texcoord;
+    GLint yuv_uniform_y_texture;
+    GLint yuv_uniform_uv_texture;
+    GLuint yuv_quad_vbo;
+    GLuint y_texture_name;
+    GLuint uv_texture_name;
+    int yuv_texture_width;
+    int yuv_texture_height;
+    GLuint fbo;
+    GLuint fbo_texture_name; // which gl_texture_name the FBO is currently bound to
+    bool yuv_gl_resources_ready;
+
     int submit_count;
     int frame_count;
 };
@@ -100,6 +132,158 @@ static double ms_since(const struct timespec *start) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (now.tv_sec - start->tv_sec) * 1000.0 + (now.tv_nsec - start->tv_nsec) / 1e6;
+}
+
+static const char *k_yuv_vertex_shader_src =
+    "attribute vec2 a_position;\n"
+    "attribute vec2 a_texcoord;\n"
+    "varying vec2 v_texcoord;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(a_position, 0.0, 1.0);\n"
+    "    v_texcoord = a_texcoord;\n"
+    "}\n";
+
+// BT.601 limited-range NV12->RGB, the conventional default for H.264 camera
+// streams at this resolution class. GL_LUMINANCE sampling returns the byte
+// in .r (==.g==.b); GL_LUMINANCE_ALPHA returns the two interleaved UV bytes
+// as .r (U) and .a (V).
+static const char *k_yuv_fragment_shader_src =
+    "precision mediump float;\n"
+    "varying vec2 v_texcoord;\n"
+    "uniform sampler2D u_y_texture;\n"
+    "uniform sampler2D u_uv_texture;\n"
+    "void main() {\n"
+    "    float y = texture2D(u_y_texture, v_texcoord).r;\n"
+    "    vec4 uv_sample = texture2D(u_uv_texture, v_texcoord);\n"
+    "    float u = uv_sample.r - 0.5;\n"
+    "    float v = uv_sample.a - 0.5;\n"
+    "    float y_adj = y - 0.0625;\n"
+    "    float r = 1.164 * y_adj + 1.596 * v;\n"
+    "    float g = 1.164 * y_adj - 0.391 * u - 0.813 * v;\n"
+    "    float b = 1.164 * y_adj + 2.018 * u;\n"
+    "    gl_FragColor = vec4(clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0), 1.0);\n"
+    "}\n";
+
+static GLuint compile_shader(GLenum type, const char *src) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &src, NULL);
+    glCompileShader(shader);
+    GLint compiled = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (!compiled) {
+        char log[512];
+        glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+        LOG_ERROR("syncn_intercom_video: shader compile failed: %s\n", log);
+        syncn_intercom_debug_log("video", "shader compile failed: %s", log);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+// Lazily builds the YUV->RGB shader program, a full-screen-quad VBO, the Y/UV
+// texture objects, and an FBO -- called with the dedicated EGL context
+// already current. Mirrors ensure_egl_context_locked's lazy-init pattern
+// (see that function's comment): avoid allocating GPU resources until video
+// actually starts.
+static bool ensure_yuv_gl_resources_locked(struct syncn_intercom_video *self) {
+    if (self->yuv_gl_resources_ready) {
+        return true;
+    }
+
+    GLuint vertex_shader = compile_shader(GL_VERTEX_SHADER, k_yuv_vertex_shader_src);
+    GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, k_yuv_fragment_shader_src);
+    if (vertex_shader == 0 || fragment_shader == 0) {
+        if (vertex_shader != 0) glDeleteShader(vertex_shader);
+        if (fragment_shader != 0) glDeleteShader(fragment_shader);
+        return false;
+    }
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertex_shader);
+    glAttachShader(program, fragment_shader);
+    glLinkProgram(program);
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+
+    GLint linked = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        char log[512];
+        glGetProgramInfoLog(program, sizeof(log), NULL, log);
+        LOG_ERROR("syncn_intercom_video: shader link failed: %s\n", log);
+        syncn_intercom_debug_log("video", "shader link failed: %s", log);
+        glDeleteProgram(program);
+        return false;
+    }
+
+    self->yuv_program = program;
+    self->yuv_attr_position = glGetAttribLocation(program, "a_position");
+    self->yuv_attr_texcoord = glGetAttribLocation(program, "a_texcoord");
+    self->yuv_uniform_y_texture = glGetUniformLocation(program, "u_y_texture");
+    self->yuv_uniform_uv_texture = glGetUniformLocation(program, "u_uv_texture");
+
+    // Full-screen quad as a triangle strip: (x, y, u, v) per vertex. Texture
+    // v is flipped (1-v) here so the FBO-rendered result comes out the same
+    // way up as the previous direct-upload path did.
+    const GLfloat quad[] = {
+        -1.0f, -1.0f, 0.0f, 1.0f,
+         1.0f, -1.0f, 1.0f, 1.0f,
+        -1.0f,  1.0f, 0.0f, 0.0f,
+         1.0f,  1.0f, 1.0f, 0.0f,
+    };
+    glGenBuffers(1, &self->yuv_quad_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, self->yuv_quad_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    glGenTextures(1, &self->y_texture_name);
+    glBindTexture(GL_TEXTURE_2D, self->y_texture_name);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenTextures(1, &self->uv_texture_name);
+    glBindTexture(GL_TEXTURE_2D, self->uv_texture_name);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenFramebuffers(1, &self->fbo);
+
+    self->yuv_gl_resources_ready = true;
+    return true;
+}
+
+// Safe to call unconditionally before destroy_egl_context_locked, from any
+// teardown/error path -- no-ops if resources were never created, and makes
+// the dedicated context current itself (mirrors teardown_pipeline_unlocked's
+// own eglMakeCurrent-before-glDelete* pattern) rather than assuming the
+// caller already has it current.
+static void destroy_yuv_gl_resources_locked(struct syncn_intercom_video *self) {
+    if (!self->yuv_gl_resources_ready) {
+        return;
+    }
+    if (self->egl_context != EGL_NO_CONTEXT &&
+        eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context)) {
+        if (self->yuv_program != 0) glDeleteProgram(self->yuv_program);
+        if (self->yuv_quad_vbo != 0) glDeleteBuffers(1, &self->yuv_quad_vbo);
+        if (self->y_texture_name != 0) glDeleteTextures(1, &self->y_texture_name);
+        if (self->uv_texture_name != 0) glDeleteTextures(1, &self->uv_texture_name);
+        if (self->fbo != 0) glDeleteFramebuffers(1, &self->fbo);
+        eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
+    self->yuv_program = 0;
+    self->yuv_quad_vbo = 0;
+    self->y_texture_name = 0;
+    self->uv_texture_name = 0;
+    self->fbo = 0;
+    self->fbo_texture_name = 0;
+    self->yuv_texture_width = 0;
+    self->yuv_texture_height = 0;
+    self->yuv_gl_resources_ready = false;
 }
 
 // Called on a GStreamer streaming thread (not the flutter-pi platform
@@ -203,9 +387,75 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
     double egl_ms = ms_since(&t_egl_start);
     if (should_log) syncn_intercom_debug_log("video", "on_new_sample #%d: eglMakeCurrent(own context) -> %d (eglGetError=0x%x), took %.1fms", self->frame_count, gl_context_ret, eglGetError(), egl_ms);
 
-    if (gl_context_ret == 0) {
+    if (gl_context_ret == 0 && ensure_yuv_gl_resources_locked(self)) {
         struct timespec t_upload_start;
         clock_gettime(CLOCK_MONOTONIC, &t_upload_start);
+
+        // Upstream is now NV12 (2 planes: full-res Y, then half-res
+        // interleaved UV) -- see this struct's comment for why videoconvert
+        // was removed. Same stride-aware upload approach as before (GLES2
+        // has no GL_UNPACK_ROW_LENGTH without an extension, so fall back to
+        // row-by-row when a plane isn't tightly packed).
+        int y_width = width;
+        int y_height = height;
+        int y_stride = GST_VIDEO_INFO_PLANE_STRIDE(&info, 0);
+        const uint8_t *y_plane = map.data + GST_VIDEO_INFO_PLANE_OFFSET(&info, 0);
+
+        int uv_width = GST_VIDEO_INFO_COMP_WIDTH(&info, 1);
+        int uv_height = GST_VIDEO_INFO_COMP_HEIGHT(&info, 1);
+        int uv_stride = GST_VIDEO_INFO_PLANE_STRIDE(&info, 1);
+        const uint8_t *uv_plane = map.data + GST_VIDEO_INFO_PLANE_OFFSET(&info, 1);
+
+        bool size_changed = (y_width != self->yuv_texture_width || y_height != self->yuv_texture_height);
+
+        glBindTexture(GL_TEXTURE_2D, self->y_texture_name);
+        if (size_changed) {
+            if (y_stride == y_width) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, y_width, y_height, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_plane);
+            } else {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, y_width, y_height, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+                for (int y = 0; y < y_height; y++) {
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, y_width, 1, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_plane + y * y_stride);
+                }
+            }
+        } else {
+            if (y_stride == y_width) {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, y_width, y_height, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_plane);
+            } else {
+                for (int y = 0; y < y_height; y++) {
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, y_width, 1, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_plane + y * y_stride);
+                }
+            }
+        }
+
+        glBindTexture(GL_TEXTURE_2D, self->uv_texture_name);
+        if (size_changed) {
+            if (uv_stride == uv_width * 2) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, uv_width, uv_height, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_plane);
+            } else {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, uv_width, uv_height, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, NULL);
+                for (int y = 0; y < uv_height; y++) {
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, uv_width, 1, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_plane + y * uv_stride);
+                }
+            }
+        } else {
+            if (uv_stride == uv_width * 2) {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_plane);
+            } else {
+                for (int y = 0; y < uv_height; y++) {
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, uv_width, 1, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_plane + y * uv_stride);
+                }
+            }
+        }
+
+        if (size_changed) {
+            self->yuv_texture_width = y_width;
+            self->yuv_texture_height = y_height;
+        }
+
+        // Output (RGBA) texture: same reused gl_texture_name as before, just
+        // now filled by rendering through the shader instead of a direct
+        // pixel upload.
         if (self->gl_texture_name == 0) {
             glGenTextures(1, &self->gl_texture_name);
             glBindTexture(GL_TEXTURE_2D, self->gl_texture_name);
@@ -216,35 +466,42 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
         } else {
             glBindTexture(GL_TEXTURE_2D, self->gl_texture_name);
         }
-
-        // videoconvert's output stride can be padded; GST_VIDEO_INFO gives us
-        // the real plane stride, but glTexImage2D assumes tightly packed rows,
-        // so upload row-by-row when stride != width * 4 rather than assuming
-        // GL_UNPACK_ROW_LENGTH is available (it isn't in GLES2 without an
-        // extension).
-        int stride = GST_VIDEO_INFO_PLANE_STRIDE(&info, 0);
-        const uint8_t *plane = map.data + GST_VIDEO_INFO_PLANE_OFFSET(&info, 0);
-
         if (width != self->gl_texture_width || height != self->gl_texture_height) {
-            if (stride == width * 4) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, plane);
-            } else {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-                for (int y = 0; y < height; y++) {
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, width, 1, GL_RGBA, GL_UNSIGNED_BYTE, plane + y * stride);
-                }
-            }
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
             self->gl_texture_width = width;
             self->gl_texture_height = height;
-        } else {
-            if (stride == width * 4) {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, plane);
-            } else {
-                for (int y = 0; y < height; y++) {
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, width, 1, GL_RGBA, GL_UNSIGNED_BYTE, plane + y * stride);
-                }
-            }
         }
+
+        // (Re)attach the FBO's color target whenever the output texture
+        // object or its size changed -- glFramebufferTexture2D must be
+        // re-issued after a glTexImage2D resize, not just on first bind.
+        glBindFramebuffer(GL_FRAMEBUFFER, self->fbo);
+        if (self->fbo_texture_name != self->gl_texture_name || size_changed) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self->gl_texture_name, 0);
+            self->fbo_texture_name = self->gl_texture_name;
+        }
+
+        glViewport(0, 0, width, height);
+        glUseProgram(self->yuv_program);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, self->y_texture_name);
+        glUniform1i(self->yuv_uniform_y_texture, 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, self->uv_texture_name);
+        glUniform1i(self->yuv_uniform_uv_texture, 1);
+
+        glBindBuffer(GL_ARRAY_BUFFER, self->yuv_quad_vbo);
+        glEnableVertexAttribArray((GLuint) self->yuv_attr_position);
+        glVertexAttribPointer((GLuint) self->yuv_attr_position, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void *) 0);
+        glEnableVertexAttribArray((GLuint) self->yuv_attr_texcoord);
+        glVertexAttribPointer((GLuint) self->yuv_attr_texcoord, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void *) (2 * sizeof(GLfloat)));
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glDisableVertexAttribArray((GLuint) self->yuv_attr_position);
+        glDisableVertexAttribArray((GLuint) self->yuv_attr_texcoord);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
         struct texture_frame frame = {
             .gl = {
@@ -265,7 +522,7 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer userdata) {
         if (should_log) {
             syncn_intercom_debug_log(
                 "video",
-                "on_new_sample #%d: uploaded gl_texture_name=%u (glTex* took %.1fms), texture_push_frame -> %d (took %.1fms), TOTAL since pull_sample returned: %.1fms",
+                "on_new_sample #%d: NV12->RGB shader gl_texture_name=%u (took %.1fms), texture_push_frame -> %d (took %.1fms), TOTAL since pull_sample returned: %.1fms",
                 self->frame_count,
                 self->gl_texture_name,
                 upload_ms,
@@ -437,6 +694,7 @@ static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int
         if (!gst_init_check(NULL, NULL, &error)) {
             LOG_ERROR("syncn_intercom_video: gst_init_check failed: %s\n", error != NULL ? error->message : "unknown error");
             if (error != NULL) g_error_free(error);
+            destroy_yuv_gl_resources_locked(self);
             destroy_egl_context_locked(self);
             pthread_mutex_unlock(&self->lock);
             return -1;
@@ -446,6 +704,7 @@ static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int
     if (self->texture == NULL) {
         self->texture = texture_new(self->texture_registry);
         if (self->texture == NULL) {
+            destroy_yuv_gl_resources_locked(self);
             destroy_egl_context_locked(self);
             pthread_mutex_unlock(&self->lock);
             return -1;
@@ -515,8 +774,15 @@ static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int
             // conclusively tested (build issues) and is unsafe to ship
             // regardless, since a single bad frame can kill the whole
             // pipeline with it set false.
-            "mppvideodec qos=false width=%d height=%d ! videoconvert ! "
-            "video/x-raw,format=RGBA ! "
+            // No videoconvert / RGBA caps here anymore -- benchmarked
+            // off-device with gst-launch-1.0 against a real captured NAL
+            // stream (2026-08-24): decode+scale alone took ~4s for the test
+            // file, decode+scale+NV12 (no videoconvert) also ~4s, but
+            // decode+scale+videoconvert-to-RGBA took ~76s. The conversion
+            // element itself is the entire cost (~18x), not decode. NV12
+            // output is converted to RGB ourselves in on_new_sample via a
+            // GLES2 shader instead.
+            "mppvideodec qos=false width=%d height=%d ! video/x-raw,format=NV12 ! "
             "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false",
             decode_w,
             decode_h
@@ -528,8 +794,7 @@ static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int
             "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
             "h264parse config-interval=-1 ! video/x-h264,alignment=au ! "
             "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=800000000 leaky=downstream ! "
-            "mppvideodec qos=false ! videoconvert ! "
-            "video/x-raw,format=RGBA ! "
+            "mppvideodec qos=false ! video/x-raw,format=NV12 ! "
             "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false"
         );
     }
@@ -537,6 +802,7 @@ static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int
     if (pipeline == NULL) {
         LOG_ERROR("syncn_intercom_video: failed to build pipeline: %s\n", error != NULL ? error->message : "unknown error");
         if (error != NULL) g_error_free(error);
+        destroy_yuv_gl_resources_locked(self);
         destroy_egl_context_locked(self);
         pthread_mutex_unlock(&self->lock);
         return -1;
@@ -549,6 +815,7 @@ static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int
         gst_object_unref(pipeline);
         if (appsrc != NULL) gst_object_unref(appsrc);
         if (appsink != NULL) gst_object_unref(appsink);
+        destroy_yuv_gl_resources_locked(self);
         destroy_egl_context_locked(self);
         pthread_mutex_unlock(&self->lock);
         return -1;
@@ -581,6 +848,7 @@ static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int
         gst_object_unref(appsrc);
         gst_object_unref(appsink);
         if (syncn_gst_bounded_teardown("video", pipeline, 3)) {
+            destroy_yuv_gl_resources_locked(self);
             destroy_egl_context_locked(self);
         }
         pthread_mutex_unlock(&self->lock);
@@ -681,6 +949,7 @@ static void handle_stop(struct syncn_intercom_video *self) {
 
     if (settled) {
         pthread_mutex_lock(&self->lock);
+        destroy_yuv_gl_resources_locked(self);
         destroy_egl_context_locked(self);
         pthread_mutex_unlock(&self->lock);
     } else {
@@ -778,6 +1047,7 @@ void syncn_intercom_video_deinit(struct flutterpi *flutterpi, void *userdata) {
     if (self->texture != NULL) {
         texture_destroy(self->texture);
     }
+    destroy_yuv_gl_resources_locked(self);
     destroy_egl_context_locked(self);
     pthread_mutex_destroy(&self->lock);
     instance = NULL;
