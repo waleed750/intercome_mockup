@@ -478,7 +478,10 @@ static int64_t handle_start(struct syncn_intercom_video *self) {
 static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data, size_t size) {
     pthread_mutex_lock(&self->lock);
     self->submit_count++;
-    bool should_log = self->submit_count <= 30;
+    // See the same fix/rationale on frame_count's should_log in
+    // on_new_sample() -- a hard cutoff at 30 made it impossible to see NAL
+    // arrival timing during any test longer than a couple seconds.
+    bool should_log = self->submit_count <= 30 || self->submit_count % 15 == 0;
     if (!self->running || self->appsrc == NULL || size == 0) {
         if (should_log) {
             syncn_intercom_debug_log(
