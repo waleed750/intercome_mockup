@@ -484,14 +484,28 @@ static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int
         decode_h
     );
 
+    // The leaky queue moved from before h264parse to after it (2026-08-24):
+    // sitting before h264parse, it was leaking raw individual NALs -- a drop
+    // could take out some but not all of a single access unit's NALs,
+    // corrupting that frame's decode directly (not just breaking the
+    // reference chain for later frames). h264parse's output caps are pinned
+    // to alignment=au below (mppvideodec's own sink pad already requires
+    // au alignment, so this just makes explicit what negotiation would have
+    // forced anyway) -- so the queue now only ever sees, and only ever
+    // drops, complete parsed frames. A drop still means the decoder has to
+    // wait for the next IDR to fully recover (fundamental to H.264 P-frame
+    // referencing, no way around that without touching the encoder), but it
+    // no longer manufactures blocky/smeared corruption from partial NALs --
+    // worst case is a clean skip/freeze instead.
     char pipeline_desc[512];
     if (decode_w > 0 && decode_h > 0) {
         snprintf(
             pipeline_desc,
             sizeof(pipeline_desc),
             "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
+            "h264parse config-interval=-1 ! video/x-h264,alignment=au ! "
             "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=800000000 leaky=downstream ! "
-            "h264parse config-interval=-1 ! mppvideodec qos=false width=%d height=%d ! videoconvert ! "
+            "mppvideodec qos=false width=%d height=%d ! videoconvert ! "
             "video/x-raw,format=RGBA ! "
             "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false",
             decode_w,
@@ -502,8 +516,9 @@ static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int
             pipeline_desc,
             sizeof(pipeline_desc),
             "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
+            "h264parse config-interval=-1 ! video/x-h264,alignment=au ! "
             "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=800000000 leaky=downstream ! "
-            "h264parse config-interval=-1 ! mppvideodec qos=false ! videoconvert ! "
+            "mppvideodec qos=false ! videoconvert ! "
             "video/x-raw,format=RGBA ! "
             "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false"
         );
