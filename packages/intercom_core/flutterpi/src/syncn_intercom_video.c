@@ -505,20 +505,17 @@ static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int
             "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
             "h264parse config-interval=-1 ! video/x-h264,alignment=au ! "
             "queue name=inq max-size-buffers=0 max-size-bytes=0 max-size-time=800000000 leaky=downstream ! "
-            // DIAGNOSTIC (2026-08-24): ignore-error=false, one-shot test.
-            // mppvideodec defaults to ignore-error=true, which may be
-            // silently swallowing real decode failures on the real door's
-            // bitstream (not mock_door's -- see this file's header comment
-            // on that gap) without even posting a WARNING bus message,
-            // which would explain corruption persisting after the
-            // AU-aligned queue fix ruled out partial-NAL drops as the
-            // cause. If this now surfaces ERROR/WARNING messages in the
-            // log, that confirms genuine decode errors; if the pipeline
-            // just dies outright with no messages, the failure mode itself
-            // is the next thing to chase. Not meant to ship as-is --
-            // ignore-error=false can be fatal to the whole pipeline on a
-            // single bad frame, which is too fragile for production.
-            "mppvideodec qos=false ignore-error=false width=%d height=%d ! videoconvert ! "
+            // ignore-error stays at its default (true): setting it false was
+            // a one-shot diagnostic (2026-08-24) to check whether mppvideodec
+            // was silently swallowing real decode errors, but the actual
+            // root cause of the corruption turned out to be the Dart-side
+            // unbounded submit() queue (see CallController's
+            // _maxVideoSubmitsInFlight) forcing the native pipeline to drop
+            // over half of all frames -- ignore-error=false was never
+            // conclusively tested (build issues) and is unsafe to ship
+            // regardless, since a single bad frame can kill the whole
+            // pipeline with it set false.
+            "mppvideodec qos=false width=%d height=%d ! videoconvert ! "
             "video/x-raw,format=RGBA ! "
             "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false",
             decode_w,

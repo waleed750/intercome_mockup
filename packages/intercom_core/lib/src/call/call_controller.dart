@@ -79,8 +79,27 @@ final class CallController extends ChangeNotifier {
   int _framesSent = 0;
   int _controlFramesReceived = 0;
   int _videoFramesReceived = 0;
+  int _videoFramesDroppedBackpressure = 0;
   int _audioFramesReceived = 0;
   Stopwatch? _callStopwatch;
+
+  // Bounds how many submit() platform-channel calls can be in flight to the
+  // native video decoder at once. _onFrame is invoked synchronously from the
+  // socket's raw byte stream (via FrameParser), fire-and-forget -- nothing
+  // upstream ever awaited native, so if native drains slower than the
+  // network delivers, calls piled up in the engine's platform-message queue
+  // with no bound and no visibility (confirmed on-device 2026-08-24: native
+  // pipeline latency, measured from the moment a NAL actually reaches native
+  // via GstBuffer PTS, stayed flat around ~1.8s the whole time, while the
+  // user-visible delay kept growing to 5-10s+ -- proving the growth was
+  // happening before native ever saw the data, in this exact gap). Video
+  // already tolerates dropped frames by design (self-heals at the next IDR,
+  // same as the native leaky queue), so applying the same drop-instead-of-
+  // queue policy here, before crossing into the platform channel at all, is
+  // consistent with the rest of the design and much simpler than plumbing
+  // real backpressure through a multiplexed control/audio/video socket.
+  int _videoSubmitsInFlight = 0;
+  static const int _maxVideoSubmitsInFlight = 2;
 
   // Remembered so _teardownCall can silently reconnect the preview after a
   // call ends, instead of leaving the screen fully idle. Only ever set by
@@ -446,7 +465,21 @@ final class CallController extends ChangeNotifier {
       case Channel.video:
         _videoFramesReceived++;
         if (_state.phase != CallPhase.idle) {
-          await _video.submit(payload);
+          if (_videoSubmitsInFlight >= _maxVideoSubmitsInFlight) {
+            _videoFramesDroppedBackpressure++;
+            if (_videoFramesDroppedBackpressure <= 30 ||
+                _videoFramesDroppedBackpressure % 30 == 0) {
+              debugPrint(
+                  'Intercom: dropped video NAL, backpressure '
+                  '(inFlight=$_videoSubmitsInFlight, '
+                  'totalDropped=$_videoFramesDroppedBackpressure)');
+            }
+            return;
+          }
+          _videoSubmitsInFlight++;
+          unawaited(
+            _video.submit(payload).whenComplete(() => _videoSubmitsInFlight--),
+          );
           if (!_state.hasVideoFrames) {
             debugPrint(
                 'Intercom: first video frame received '
@@ -606,7 +639,9 @@ final class CallController extends ChangeNotifier {
       debugPrint(
           'Intercom stats t+${_callStopwatch?.elapsed.inSeconds ?? 0}s: '
           'sent=$_framesSent rxControl=$_controlFramesReceived '
-          'rxVideo=$_videoFramesReceived rxAudio=$_audioFramesReceived'
+          'rxVideo=$_videoFramesReceived rxAudio=$_audioFramesReceived '
+          'videoInFlight=$_videoSubmitsInFlight '
+          'videoDroppedBackpressure=$_videoFramesDroppedBackpressure'
           '${_silenceTimer != null ? ' [SILENCE FALLBACK ACTIVE]' : ''}');
     });
   }
@@ -618,8 +653,14 @@ final class CallController extends ChangeNotifier {
     _framesSent = 0;
     _controlFramesReceived = 0;
     _videoFramesReceived = 0;
+    _videoFramesDroppedBackpressure = 0;
     _audioFramesReceived = 0;
     _uplinkFrameSeen = false;
+    // _videoSubmitsInFlight is intentionally NOT reset here -- it tracks
+    // genuinely in-flight platform-channel calls, which can still be
+    // draining across a call/preview boundary since the video pipeline
+    // itself is persistent by design. Zeroing it here would let more
+    // submits through than the cap intends right at that boundary.
   }
 
   /// Ends whatever call/preview is active. Video is left running by default
