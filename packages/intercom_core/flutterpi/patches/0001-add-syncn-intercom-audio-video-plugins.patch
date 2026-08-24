@@ -886,10 +886,10 @@ index 0000000..5a502d7
 +#endif  // _SYNCN_INTERCOM_GST_UTIL_H
 diff --git a/src/plugins/syncn_intercom_video.c b/src/plugins/syncn_intercom_video.c
 new file mode 100644
-index 0000000..566d96a
+index 0000000..bdb39ea
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_video.c
-@@ -0,0 +1,638 @@
+@@ -0,0 +1,641 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of the "syncn_intercom/video" MethodChannel.
@@ -1370,7 +1370,10 @@ index 0000000..566d96a
 +static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data, size_t size) {
 +    pthread_mutex_lock(&self->lock);
 +    self->submit_count++;
-+    bool should_log = self->submit_count <= 30;
++    // See the same fix/rationale on frame_count's should_log in
++    // on_new_sample() -- a hard cutoff at 30 made it impossible to see NAL
++    // arrival timing during any test longer than a couple seconds.
++    bool should_log = self->submit_count <= 30 || self->submit_count % 15 == 0;
 +    if (!self->running || self->appsrc == NULL || size == 0) {
 +        if (should_log) {
 +            syncn_intercom_debug_log(
