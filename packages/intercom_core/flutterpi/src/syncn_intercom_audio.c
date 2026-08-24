@@ -458,13 +458,31 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
             // g_object_set -- gst_parse_launch can't resolve cross-pipeline
             // element references (the `probe=` syntax only works within the
             // same bin), which is why the probe property was silently unset
-            // before this fix (webrtcdsp fell back to looking for the default
-            // `webrtcechoprobe0` name, which doesn't exist, causing AEC to
-            // silently degrade to no-echo-cancellation on every call).
+            // before an earlier fix attempt (webrtcdsp fell back to looking
+            // for the default `webrtcechoprobe0` name, which doesn't exist).
+            //
+            // That earlier fix was itself still wrong (found 2026-08-24):
+            // `probe` is a STRING property (the target element's *name*,
+            // confirmed via `gst-inspect-1.0 webrtcdsp`: "String. Default:
+            // webrtcechoprobe0"), not a GstElement* reference. Passing the
+            // raw `echoprobe` object pointer here made g_object_set treat
+            // that pointer's bits as a C string and read whatever garbage
+            // memory followed it -- visible on-device as webrtcdsp's error
+            // reporting nonsense probe names ("No echo probe with name 801
+            // found", "No echo probe with name ??+& found"), which failed
+            // gst_webrtc_dsp_start() every time, which crashed the whole
+            // capture pipeline's PLAYING transition, which fell through to
+            // this function's no-AEC retry path -- so AEC has been silently
+            // disabled on every real call, letting the mic pick up the
+            // speaker uncancelled (the actual cause of "hearing my own
+            // voice" during a call, reported same day). Pass the probe's
+            // name string instead -- it's the fixed literal from the
+            // pipeline description above, not worth an allocating
+            // gst_element_get_name() round-trip.
             if (use_aec && echoprobe != NULL) {
                 GstElement *dsp = gst_bin_get_by_name(GST_BIN(capture), "dsp");
                 if (dsp != NULL) {
-                    g_object_set(dsp, "probe", echoprobe, NULL);
+                    g_object_set(dsp, "probe", "syncn_echoprobe", NULL);
                     syncn_intercom_debug_log("audio", "start_locked: set webrtcdsp probe -> syncn_echoprobe (AEC engaged)");
                     gst_object_unref(dsp);
                 } else {
