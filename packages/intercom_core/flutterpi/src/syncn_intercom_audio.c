@@ -616,7 +616,28 @@ static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_
         g_signal_emit_by_name(self->playback_appsrc, "push-buffer", buffer, &ret);
         gst_buffer_unref(buffer);
         if (should_log) {
-            syncn_intercom_debug_log("audio", "handle_play_downlink #%d: pushed %zu bytes, ret=%d", self->playback_count, size, ret);
+            // Diagnostic only (2026-08-25): logs whether the raw A-law bytes
+            // received actually vary (real audio) or are constant (digital
+            // silence, A-law encodes silence as a constant 0xD5 byte) --
+            // added after a "no audio" report survived a confirmed-working
+            // pipeline/hardware/PulseAudio path, narrowing down whether the
+            // problem is upstream (nothing real being received) or in this
+            // pipeline (real data failing to render).
+            uint8_t min_byte = data[0];
+            uint8_t max_byte = data[0];
+            for (size_t i = 1; i < size; i++) {
+                if (data[i] < min_byte) min_byte = data[i];
+                if (data[i] > max_byte) max_byte = data[i];
+            }
+            syncn_intercom_debug_log(
+                "audio",
+                "handle_play_downlink #%d: pushed %zu bytes, ret=%d, byte range [0x%02x, 0x%02x] (0xd5=A-law silence)",
+                self->playback_count,
+                size,
+                ret,
+                min_byte,
+                max_byte
+            );
         }
     } else if (should_log) {
         syncn_intercom_debug_log(
