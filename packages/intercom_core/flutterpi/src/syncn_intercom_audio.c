@@ -372,9 +372,24 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     //   native rate instead of forcing the DAC into an 8kHz-derived mode.
     // - audioresample quality=10 upsamples the 8kHz narrowband stream with
     //   the best filter instead of the default (audible aliasing/harshness).
-    // - sync=true + a ~80ms jitter queue: with sync=false, network jitter
-    //   went straight to the DAC as underruns (pops/crackle). The queue
-    //   absorbs jitter at the cost of a little added latency.
+    // - sync=true + a small buffer-count queue: with sync=false, network
+    //   jitter went straight to the DAC as underruns (pops/crackle). The
+    //   queue absorbs jitter at the cost of a little added latency.
+    //   Previously a min-threshold-time=80000000 (80ms) TIME-based queue --
+    //   changed 2026-08-25 after switching to pulsesink surfaced a silent
+    //   pipeline that reported itself healthy end to end (PLAYING, an
+    //   active unmuted 100%-volume PulseAudio sink-input, real varying
+    //   downlink byte content confirmed via diagnostic logging) with
+    //   nothing audible: the queue gates release on buffered TIMESTAMP
+    //   duration reaching the threshold, computed from appsrc's
+    //   do-timestamp=true values relative to the pipeline clock/base-time --
+    //   if pulsesink negotiates that clock differently than the raw
+    //   alsasink path this pipeline was originally built and proven against,
+    //   those timestamps can end up inconsistent with what the queue
+    //   expects, and it silently never reaches the threshold. A
+    //   buffer-count queue can't get stuck this way; leaky=downstream keeps
+    //   it self-correcting the same way the intercom video queue already
+    //   is if the sink can't keep up.
     // - volume=1.0: analog gain belongs to the ALSA mixer (see
     //   set_alsa_voice_routing / boot-time tuning); attenuating in software
     //   here just burned headroom and resolution.
@@ -395,7 +410,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     gchar *playback_desc_aec = g_strdup_printf(
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! tee name=t ! "
-        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
+        "queue max-size-buffers=20 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
         "%s "
         "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe name=syncn_echoprobe ! fakesink sync=false async=false",
         playback_sink_desc
@@ -403,7 +418,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     gchar *playback_desc_plain = g_strdup_printf(
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! "
-        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
+        "queue max-size-buffers=20 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
         "%s",
         playback_sink_desc
     );
