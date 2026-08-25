@@ -186,6 +186,43 @@ static bool start_pipeline_non_blocking(const char *tag, GstElement *pipeline) {
     return true;
 }
 
+// Retries a non-blocking pipeline start on failure, resetting to NULL and
+// backing off briefly between attempts. Added after an on-device failure
+// (2026-08-25): alsasink's exclusive `plughw:0,0` device open failed with
+// "Device is being used by another application" on BOTH the AEC and no-AEC
+// attempts back to back -- almost certainly the doorbell ringtone
+// (`aplay -D default`, likely resolving to the same physical card/device)
+// not having released the hardware yet at the exact moment a call is
+// answered. That's a transient race with a process in a different package
+// entirely (the Dart-side ring service) with no way to synchronize against
+// it directly, so tolerate it here instead: a pipeline can't distinguish
+// "this device is broken" from "this device is busy for another 100ms", and
+// retrying costs nothing in the (common) non-failing case. Bounded to a few
+// short attempts -- worst case adds under a second of latency to call setup
+// in the failure path only, which beats a permanently silent call.
+static bool start_pipeline_with_retry(const char *tag, GstElement *pipeline, int max_attempts, guint retry_delay_ms) {
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        if (start_pipeline_non_blocking(tag, pipeline)) {
+            if (attempt > 1) {
+                syncn_intercom_debug_log("audio", "%s: succeeded on retry attempt %d/%d", tag, attempt, max_attempts);
+            }
+            return true;
+        }
+        if (attempt == max_attempts) break;
+        syncn_intercom_debug_log(
+            "audio",
+            "%s: start failed (attempt %d/%d), likely transient ALSA device contention -- resetting to NULL and retrying in %ums",
+            tag,
+            attempt,
+            max_attempts,
+            retry_delay_ms
+        );
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        g_usleep(retry_delay_ms * 1000);
+    }
+    return false;
+}
+
 // Blocking start for capture pipelines: confirms PLAYING via get_state().
 // Kept for capture only -- it's a separate, already-fast path (31ms in the
 // measured log) and captures need the pipeline confirmed running before
@@ -367,7 +404,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         gst_caps_unref(appsrc_caps);
         gst_app_src_set_stream_type(GST_APP_SRC(playback_appsrc), GST_APP_STREAM_TYPE_STREAM);
     }
-    if (playback_appsrc == NULL || !start_pipeline_non_blocking("syncn_intercom_audio playback", playback)) {
+    if (playback_appsrc == NULL || !start_pipeline_with_retry("syncn_intercom_audio playback", playback, 3, 150)) {
         if (aec_available) {
             // The echo probe/tee branch is the one new failure mode here (e.g.
             // fakesink negotiation); retry once without it before giving up
@@ -386,7 +423,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
                 gst_app_src_set_stream_type(GST_APP_SRC(playback_appsrc), GST_APP_STREAM_TYPE_STREAM);
             }
         }
-        if (playback_appsrc == NULL || !start_pipeline_non_blocking("syncn_intercom_audio playback (retry)", playback)) {
+        if (playback_appsrc == NULL || !start_pipeline_with_retry("syncn_intercom_audio playback (retry)", playback, 3, 150)) {
             LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
             if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
             if (playback != NULL) syncn_gst_bounded_teardown("audio-playback", playback, 3);
