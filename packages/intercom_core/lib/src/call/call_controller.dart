@@ -415,8 +415,21 @@ final class CallController extends ChangeNotifier {
   Future<void> endCall() => decline();
 
   void unlock() {
-    if (_state.phase != CallPhase.connected) return;
-    _connection?.enqueue(Commands.openDoor());
+    // No logging existed here before 2026-08-25 -- a user report of "unlock
+    // not working" produced zero log output because there was nothing to
+    // log on either the guard-fail or success path. Instrumented so the
+    // next report actually says which branch it took.
+    if (_state.phase != CallPhase.connected) {
+      debugPrint('Intercom: unlock() ignored -- phase is ${_state.phase}, not connected');
+      return;
+    }
+    final conn = _connection;
+    if (conn == null) {
+      debugPrint('Intercom: unlock() -- no active connection, cannot send OpenDoor');
+      return;
+    }
+    final enqueued = conn.enqueue(Commands.openDoor());
+    debugPrint('Intercom: unlock() -- OpenDoor enqueue -> $enqueued');
     _showTransient('Door unlocked');
   }
 
