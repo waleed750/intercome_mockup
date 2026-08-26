@@ -40,10 +40,12 @@ final class CallController extends ChangeNotifier {
     AudioPipeline? audio,
     bool startDiscovery = true,
     bool startForegroundService = true,
+    bool micAvailable = true,
   })  : _video = video ?? VideoDecoder(),
         _audio = audio ?? AudioPipeline(),
         _startDiscovery = startDiscovery,
-        _startForegroundService = startForegroundService {
+        _startForegroundService = startForegroundService,
+        _hardwareMicAvailable = micAvailable {
     final id = deviceConfig.identity;
     _state = _state.copyWith(
         unitName: id.alias, pairedDoor: id.doorName, callerLabel: id.doorName);
@@ -63,6 +65,15 @@ final class CallController extends ChangeNotifier {
   final AudioPipeline _audio;
   final bool _startDiscovery;
   final bool _startForegroundService;
+  // Hardware capability, not an OS permission: some panel models have no
+  // physical microphone at all (confirmed 2026-08-25 on one such unit).
+  // Capturing/transmitting uplink audio on those panels was found to feed a
+  // repeating self-echo -- with no real mic, that capture path was picking
+  // up electrical crosstalk from the speaker/DAC on the shared audio codec
+  // rather than real acoustic sound, which AEC (built for acoustic echo) did
+  // not meaningfully cancel. Defaults to true so every other panel model
+  // (which does have a working mic) is unaffected.
+  final bool _hardwareMicAvailable;
 
   late final ConnectionProvider _connectionProvider;
   late final DiscoveryResponder _discovery;
@@ -573,13 +584,18 @@ final class CallController extends ChangeNotifier {
   }
 
   Future<void> _startAudio() async {
+    // _hardwareMicAvailable gates on whether this panel HAS a mic at all
+    // (see its declaration); the block below only further gates on OS
+    // *permission* to use one, and only applies on non-Linux where that
+    // permission model exists.
+    bool micGranted = _hardwareMicAvailable;
     // permission_handler has no Linux platform implementation -- there's no
     // OS-level permission prompt to check/request there, so treat mic access
     // as always granted (same as the app itself being allowed to open the
     // audio device, which is a system/user configuration concern, not
-    // something this plugin can gate on Linux).
-    bool micGranted = true;
-    if (!Platform.isLinux) {
+    // something this plugin can gate on Linux) once hardware availability
+    // has already been established above.
+    if (micGranted && !Platform.isLinux) {
       var micStatus = await Permission.microphone.status;
       if (!micStatus.isGranted) {
         micStatus = await Permission.microphone.request();
