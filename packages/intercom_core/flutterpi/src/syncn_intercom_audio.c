@@ -182,27 +182,6 @@ static bool start_pipeline_non_blocking(const char *tag, GstElement *pipeline) {
         log_pipeline_bus_errors(tag, pipeline);
         return false;
     }
-    // Diagnostic only (2026-08-25): a zero-timeout get_state() poll never
-    // blocks (unlike the 3s wait removed for the deadlock this function's
-    // header comment describes), so it's safe here. Added after an
-    // on-device report of "no audio from the call" that produced a clean
-    // log -- no GStreamer ERROR at all -- meaning the pipeline reports this
-    // function's success but may be stuck ASYNC (never actually reaching
-    // PLAYING) rather than genuinely failing, which the immediate
-    // set_state() return value alone can't distinguish. This won't fix a
-    // stuck transition, only reveal whether that's what's happening.
-    GstState current = GST_STATE_VOID_PENDING;
-    GstState pending = GST_STATE_VOID_PENDING;
-    GstStateChangeReturn poll_ret = gst_element_get_state(pipeline, &current, &pending, 0);
-    syncn_intercom_debug_log(
-        "audio",
-        "%s: immediate state poll -> poll_ret=%d, current=%d, pending=%d (PLAYING=%d)",
-        tag,
-        poll_ret,
-        current,
-        pending,
-        GST_STATE_PLAYING
-    );
     log_pipeline_bus_errors(tag, pipeline);
     return true;
 }
@@ -372,56 +351,23 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     //   native rate instead of forcing the DAC into an 8kHz-derived mode.
     // - audioresample quality=10 upsamples the 8kHz narrowband stream with
     //   the best filter instead of the default (audible aliasing/harshness).
-    // - sync=true + a small buffer-count queue: with sync=false, network
-    //   jitter went straight to the DAC as underruns (pops/crackle). The
-    //   queue absorbs jitter at the cost of a little added latency.
-    //   Previously a min-threshold-time=80000000 (80ms) TIME-based queue --
-    //   changed 2026-08-25 after switching to pulsesink surfaced a silent
-    //   pipeline that reported itself healthy end to end (PLAYING, an
-    //   active unmuted 100%-volume PulseAudio sink-input, real varying
-    //   downlink byte content confirmed via diagnostic logging) with
-    //   nothing audible: the queue gates release on buffered TIMESTAMP
-    //   duration reaching the threshold, computed from appsrc's
-    //   do-timestamp=true values relative to the pipeline clock/base-time --
-    //   if pulsesink negotiates that clock differently than the raw
-    //   alsasink path this pipeline was originally built and proven against,
-    //   those timestamps can end up inconsistent with what the queue
-    //   expects, and it silently never reaches the threshold. A
-    //   buffer-count queue can't get stuck this way; leaky=downstream keeps
-    //   it self-correcting the same way the intercom video queue already
-    //   is if the sink can't keep up.
+    // - sync=true + a ~80ms jitter queue: with sync=false, network jitter
+    //   went straight to the DAC as underruns (pops/crackle). The queue
+    //   absorbs jitter at the cost of a little added latency.
     // - volume=1.0: analog gain belongs to the ALSA mixer (see
     //   set_alsa_voice_routing / boot-time tuning); attenuating in software
     //   here just burned headroom and resolution.
-    // Prefer pulsesink over alsasink+device=default (2026-08-25): "default"
-    // resolving through ALSA's PulseAudio-compatibility plugin fixed the
-    // earlier "device is being used by another application" conflict (this
-    // board's PulseAudio holds the hw device persistently), but a follow-up
-    // report of a clean-looking log with no audible playback suggests that
-    // shim may not negotiate clock/latency with GStreamer as cleanly as
-    // talking to PulseAudio directly via its native GStreamer element.
-    // Falls back to alsasink+default if pulsesink isn't available on this
-    // panel image.
-    bool pulse_available = gst_element_available("pulsesink") && gst_element_available("pulsesrc");
-    syncn_intercom_debug_log("audio", "start_locked: pulsesink/pulsesrc available=%d", pulse_available);
-    const char *playback_sink_desc = pulse_available
-        ? "pulsesink sync=true buffer-time=200000 latency-time=20000"
-        : "alsasink device=default sync=true buffer-time=200000 latency-time=20000";
-    gchar *playback_desc_aec = g_strdup_printf(
+    static const char *playback_desc_aec =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! tee name=t ! "
-        "queue max-size-buffers=20 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
-        "%s "
-        "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe name=syncn_echoprobe ! fakesink sync=false async=false",
-        playback_sink_desc
-    );
-    gchar *playback_desc_plain = g_strdup_printf(
+        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
+        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000 "
+        "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe name=syncn_echoprobe ! fakesink sync=false async=false";
+    static const char *playback_desc_plain =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! "
-        "queue max-size-buffers=20 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
-        "%s",
-        playback_sink_desc
-    );
+        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
+        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
 
     GError *error = NULL;
     GstElement *playback = gst_parse_launch(aec_available ? playback_desc_aec : playback_desc_plain, &error);
@@ -440,8 +386,6 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     if (playback == NULL) {
         LOG_ERROR("syncn_intercom_audio: failed to build playback pipeline: %s\n", error != NULL ? error->message : "unknown error");
         if (error != NULL) g_error_free(error);
-        g_free(playback_desc_aec);
-        g_free(playback_desc_plain);
         return false;
     }
     GstElement *playback_appsrc = gst_bin_get_by_name(GST_BIN(playback), "src");
@@ -483,13 +427,9 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
             LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
             if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
             if (playback != NULL) syncn_gst_bounded_teardown("audio-playback", playback, 3);
-            g_free(playback_desc_aec);
-            g_free(playback_desc_plain);
             return false;
         }
     }
-    g_free(playback_desc_aec);
-    g_free(playback_desc_plain);
 
     // Retrieve the echo probe element from the playback pipeline so we can
     // hand it to webrtcdsp in the capture pipeline below. The probe property
@@ -513,23 +453,18 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     //   not a handset near the mouth -- aggressive NS is the right default.
     // - extended-filter=true: longer echo tail coverage; speaker and mic sit
     //   centimeters apart in the same enclosure, so the echo path is strong.
-    const char *capture_src_desc = pulse_available ? "pulsesrc" : "alsasrc device=default";
-    gchar *capture_desc_aec = g_strdup_printf(
-        "%s ! audioconvert ! audioresample quality=10 ! "
+    static const char *capture_desc_aec =
+        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
         "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=true "
         "high-pass-filter=true noise-suppression-level=high extended-filter=true ! "
         "volume name=capvol ! alawenc ! "
-        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true",
-        capture_src_desc
-    );
-    gchar *capture_desc_plain = g_strdup_printf(
-        "%s ! audioconvert ! audioresample quality=10 ! "
+        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
+    static const char *capture_desc_plain =
+        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
         "volume name=capvol ! alawenc ! "
-        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true",
-        capture_src_desc
-    );
+        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 
     GstElement *capture = NULL;
     GstElement *capture_appsink = NULL;
@@ -605,8 +540,6 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
             LOG_ERROR("syncn_intercom_audio: mic will be unavailable for this call\n");
         }
     }
-    g_free(capture_desc_aec);
-    g_free(capture_desc_plain);
 
     self->playback_pipeline = playback;
     self->playback_appsrc = playback_appsrc;
