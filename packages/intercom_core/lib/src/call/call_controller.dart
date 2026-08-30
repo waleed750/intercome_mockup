@@ -455,23 +455,49 @@ final class CallController extends ChangeNotifier {
 
   Future<void> endCall() => decline();
 
-  void unlock() {
-    // No logging existed here before 2026-08-25 -- a user report of "unlock
-    // not working" produced zero log output because there was nothing to
-    // log on either the guard-fail or success path. Instrumented so the
-    // next report actually says which branch it took.
-    if (_state.phase != CallPhase.connected) {
-      debugPrint('Intercom: unlock() ignored -- phase is ${_state.phase}, not connected');
-      return;
-    }
+  /// Sends the door-open command. Works regardless of call state: if a
+  /// connection is already open (an active call, or a video preview -- both
+  /// `_connection != null`), the command rides that existing socket. With no
+  /// connection at all (the idle screen, before the user has ever tapped
+  /// Talk/preview this session), a short-lived standalone connection is
+  /// opened to `_previewHost` (the last door host this controller talked
+  /// to), the command is sent, and the socket is closed immediately after --
+  /// unlock never waits on or transitions through the ringing/connected call
+  /// state machine.
+  Future<void> unlock() async {
     final conn = _connection;
-    if (conn == null) {
-      debugPrint('Intercom: unlock() -- no active connection, cannot send OpenDoor');
+    if (conn != null) {
+      final enqueued = conn.enqueue(Commands.openDoor());
+      debugPrint(
+          'Intercom: unlock() [in-call, phase=${_state.phase}] -- OpenDoor enqueue -> $enqueued');
+      if (enqueued) _showTransient('Door unlocked');
       return;
     }
-    final enqueued = conn.enqueue(Commands.openDoor());
-    debugPrint('Intercom: unlock() -- OpenDoor enqueue -> $enqueued');
-    _showTransient('Door unlocked');
+
+    final host = _previewHost;
+    if (host == null || host.isEmpty) {
+      debugPrint(
+          'Intercom: unlock() [standalone] ignored -- no connection and no known door host yet');
+      return;
+    }
+
+    debugPrint('Intercom: unlock() [standalone] -- connecting to $host:$_previewPort');
+    Socket? socket;
+    try {
+      socket = await Socket.connect(host, _previewPort,
+          timeout: const Duration(seconds: 5));
+      for (final frame in Commands.answerFrames()) {
+        socket.add(frame);
+      }
+      socket.add(Commands.openDoor());
+      await socket.flush();
+      debugPrint('Intercom: unlock() [standalone] -- OpenDoor sent to $host');
+      _showTransient('Door unlocked');
+    } catch (e) {
+      debugPrint('Intercom: unlock() [standalone] failed -- $e');
+    } finally {
+      unawaited(socket?.close());
+    }
   }
 
   Future<void> setMuted(bool muted) async {
