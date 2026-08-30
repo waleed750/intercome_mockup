@@ -41,11 +41,13 @@ final class CallController extends ChangeNotifier {
     bool startDiscovery = true,
     bool startForegroundService = true,
     bool micAvailable = true,
+    bool requestNotificationPermission = true,
   })  : _video = video ?? VideoDecoder(),
         _audio = audio ?? AudioPipeline(),
         _startDiscovery = startDiscovery,
         _startForegroundService = startForegroundService,
-        _hardwareMicAvailable = micAvailable {
+        _hardwareMicAvailable = micAvailable,
+        _requestNotificationPermission = requestNotificationPermission {
     final id = deviceConfig.identity;
     _state = _state.copyWith(
         unitName: id.alias, pairedDoor: id.doorName, callerLabel: id.doorName);
@@ -74,6 +76,13 @@ final class CallController extends ChangeNotifier {
   // not meaningfully cancel. Defaults to true so every other panel model
   // (which does have a working mic) is unaffected.
   final bool _hardwareMicAvailable;
+  // UI-dev/mock-build escape hatch: permission_handler's Permission.notification
+  // .request() has been observed to hang (not fail, not deny -- just never
+  // resolve) on at least one Android emulator image even when the OS already
+  // reports the permission granted, which blocked Intercom entirely there.
+  // Real devices are unaffected by this flag (defaults true), so this is not
+  // a behavior change for production panels.
+  final bool _requestNotificationPermission;
 
   late final ConnectionProvider _connectionProvider;
   late final DiscoveryResponder _discovery;
@@ -143,7 +152,7 @@ final class CallController extends ChangeNotifier {
     // notification daemon to grant permission to in the first place (see
     // FullScreenCallHandler's Linux handling), so this step is meaningless
     // there and skipped entirely rather than treated as a failure.
-    if (!Platform.isLinux) {
+    if (!Platform.isLinux && _requestNotificationPermission) {
       await _startupStep('permission.notification.request',
           () => Permission.notification.request());
     }
@@ -384,6 +393,27 @@ final class CallController extends ChangeNotifier {
     ));
     await incomingCallHandler.onIncomingCall(doorName: id.doorName);
     await _video.start();
+  }
+
+  /// Mock-build counterpart to [simulateIncomingCall]: moves to
+  /// [CallPhase.previewing] without a real socket connection, for UI-dev
+  /// testing of the preview screen where there's no real door unit to dial.
+  /// Deliberately does NOT call `_video.start()` -- `videoTextureId` stays
+  /// null, so the app's own placeholder (e.g. a looping sample clip) shows
+  /// through `VideoSurface` instead of a real decoded texture. Real preview
+  /// still goes through [startPreview], which this does not replace.
+  Future<void> simulatePreview() async {
+    if (_state.phase != CallPhase.idle) return;
+    final id = deviceConfig.identity;
+    _setState(_state.copyWith(
+      phase: CallPhase.previewing,
+      callerLabel: id.doorName,
+      videoAvailable: true,
+      hasVideoFrames: false,
+      muted: false,
+      transientMessage: null,
+      isIncoming: false,
+    ));
   }
 
   Future<void> answer() async {

@@ -14,6 +14,7 @@ final class IntercomModule {
     bool startDiscovery = true,
     bool startForegroundService = true,
     bool micAvailable = true,
+    bool requestNotificationPermission = true,
   }) async {
     final config = await _startupStep('device_config.load', DeviceConfig.load);
     final controller = CallController(
@@ -23,6 +24,7 @@ final class IntercomModule {
       startDiscovery: startDiscovery,
       startForegroundService: startForegroundService,
       micAvailable: micAvailable,
+      requestNotificationPermission: requestNotificationPermission,
     );
     try {
       await _startupStep('call_controller.start', controller.start);
