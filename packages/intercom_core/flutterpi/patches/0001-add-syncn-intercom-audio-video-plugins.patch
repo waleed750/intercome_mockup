@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..70bcf3a
+index 0000000..8891068
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,755 @@
+@@ -0,0 +1,808 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -98,6 +98,7 @@ index 0000000..70bcf3a
 +
 +#include "syncn_intercom_audio.h"
 +
++#include <pthread.h>
 +#include <string.h>
 +#include <sys/wait.h>
 +
@@ -668,6 +669,49 @@ index 0000000..70bcf3a
 +    pthread_mutex_unlock(&self->lock);
 +}
 +
++// Args for start_thread_main. Heap-allocated per call, freed by the thread
++// itself once it has sent its response.
++struct start_thread_args {
++    struct syncn_intercom_audio *self;
++    bool capture_enabled;
++    bool headset_mode;
++    const FlutterPlatformMessageResponseHandle *response_handle;
++};
++
++// Runs start_locked() off the platform thread and replies once done.
++//
++// start_locked() can block for up to ~1s inside start_pipeline_with_retry's
++// g_usleep() calls, retrying alsasink's exclusive plughw:0,0 open against a
++// transient race with the doorbell ringtone player not having released the
++// device yet (see that function's comment). on_method_channel_message runs
++// on flutter-pi's platform thread -- the same thread driving the whole
++// event loop, input handling, and DRM frame presentation -- so calling
++// start_locked() there directly froze the entire app (touch, rendering,
++// even the video call's own picture) for the retry's duration every time
++// this race was hit (confirmed on-device 2026-09-07: "the whole app
++// freezes with the video too" right after answering a call, exactly the
++// span start_pipeline_with_retry's own comment already knew about but
++// assumed was cheap enough not to matter). platch_respond_*_std/
++// FlutterEngineSendPlatformMessageResponse is safe to call from any thread
++// -- this file's own bus-watcher-style async event pattern elsewhere in
++// this plugin family already relies on that same guarantee.
++static void *start_thread_main(void *userdata) {
++    struct start_thread_args *args = userdata;
++
++    pthread_mutex_lock(&args->self->lock);
++    bool ok = start_locked(args->self, args->capture_enabled, args->headset_mode);
++    pthread_mutex_unlock(&args->self->lock);
++
++    if (ok) {
++        platch_respond_success_std(args->response_handle, NULL);
++    } else {
++        platch_respond_error_std(args->response_handle, "audio_start_failed", "Could not start the GStreamer audio pipeline.", NULL);
++    }
++
++    free(args);
++    return NULL;
++}
++
 +static void on_method_channel_message(void *userdata, const FlutterPlatformMessage *message) {
 +    struct syncn_intercom_audio *self = userdata;
 +
@@ -693,14 +737,23 @@ index 0000000..70bcf3a
 +            }
 +        }
 +
-+        pthread_mutex_lock(&self->lock);
-+        bool ok = start_locked(self, capture_enabled, headset_mode);
-+        pthread_mutex_unlock(&self->lock);
-+
-+        if (ok) {
-+            platch_respond_success_std(message->response_handle, NULL);
++        struct start_thread_args *start_args = malloc(sizeof(struct start_thread_args));
++        if (start_args == NULL) {
++            platch_respond_error_std(message->response_handle, "audio_start_failed", "Out of memory.", NULL);
 +        } else {
-+            platch_respond_error_std(message->response_handle, "audio_start_failed", "Could not start the GStreamer audio pipeline.", NULL);
++            start_args->self = self;
++            start_args->capture_enabled = capture_enabled;
++            start_args->headset_mode = headset_mode;
++            start_args->response_handle = message->response_handle;
++
++            pthread_t start_thread;
++            int thread_ret = pthread_create(&start_thread, NULL, start_thread_main, start_args);
++            if (thread_ret != 0) {
++                free(start_args);
++                platch_respond_error_std(message->response_handle, "audio_start_failed", "Could not spawn start thread.", NULL);
++            } else {
++                pthread_detach(start_thread);
++            }
 +        }
 +    } else if (strcmp(object.method, "playDownlink") == 0) {
 +        if (object.std_arg.type == kStdUInt8Array) {
