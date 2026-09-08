@@ -1015,10 +1015,10 @@ index 0000000..5a502d7
 +#endif  // _SYNCN_INTERCOM_GST_UTIL_H
 diff --git a/src/plugins/syncn_intercom_video.c b/src/plugins/syncn_intercom_video.c
 new file mode 100644
-index 0000000..c03af0b
+index 0000000..a1d48f2
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_video.c
-@@ -0,0 +1,1060 @@
+@@ -0,0 +1,1087 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of the "syncn_intercom/video" MethodChannel.
@@ -1672,6 +1672,31 @@ index 0000000..c03af0b
 +// resolutions -- see panel_home_4inch.dart / panel_home_10inch.dart), so
 +// this is computed per-call from whatever Dart reports at start() time
 +// rather than a value hardcoded for one specific panel.
++//
++// screen_w/screen_h come from Dart's view.physicalSize (video_decoder.dart)
++// -- the WHOLE SCREEN's physical size, not the actual on-screen video
++// widget's rendered size (Dart has no cheap way to measure the latter
++// before the first frame). On a small panel (e.g. 480x480) that's already
++// a reasonable proxy and this function scales down accordingly. On a
++// large/landscape panel (confirmed on-device 2026-09-08: 1280x800 after
++// this board's -r 90 rotation) it isn't: the source is only 1280x720, so
++// fitting it inside a 1280x800 box computes right back to the full
++// 1280x720 source with zero scaling, even though the call UI's actual
++// video tile is far smaller than the whole screen. Full-res NV12->RGB
++// shader conversion costs ~25-35ms of real GPU time per frame (measured
++// on-device via this file's own on_new_sample timing log) on a GPU with a
++// single hardware command queue shared with flutter-pi's own UI
++// compositing -- confirmed via live kernel stack traces to periodically
++// stall flutter-pi's raster thread in drm_atomic_helper_wait_for_vblanks
++// for 300ms+ at a time (freezing the whole app, video included) whenever
++// this queued shader work backs up behind a vblank deadline. The 480x480
++// panel never hit this because its screen size alone already forced
++// meaningful downscaling. Cap the target hard, independent of screen size,
++// so no panel can end up requesting a full-resolution decode+shader pass
++// for what is, in every real call UI on this app, a small preview tile.
++#define SYNCN_INTERCOM_VIDEO_MAX_DECODE_W 640
++#define SYNCN_INTERCOM_VIDEO_MAX_DECODE_H 480
++
 +static void compute_decode_target(int screen_w, int screen_h, int *out_w, int *out_h) {
 +    const int src_w = 1280, src_h = 720;
 +    if (screen_w <= 0 || screen_h <= 0) {
@@ -1679,6 +1704,8 @@ index 0000000..c03af0b
 +        *out_h = 0;
 +        return;
 +    }
++    if (screen_w > SYNCN_INTERCOM_VIDEO_MAX_DECODE_W) screen_w = SYNCN_INTERCOM_VIDEO_MAX_DECODE_W;
++    if (screen_h > SYNCN_INTERCOM_VIDEO_MAX_DECODE_H) screen_h = SYNCN_INTERCOM_VIDEO_MAX_DECODE_H;
 +    int candidate_w = screen_w;
 +    int candidate_h = (int) ((int64_t) candidate_w * src_h / src_w);
 +    if (candidate_h > screen_h) {
