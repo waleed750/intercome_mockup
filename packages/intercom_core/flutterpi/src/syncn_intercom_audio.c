@@ -39,6 +39,7 @@
 #include "syncn_intercom_audio.h"
 
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 
@@ -405,6 +406,30 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         gst_caps_unref(appsrc_caps);
         gst_app_src_set_stream_type(GST_APP_SRC(playback_appsrc), GST_APP_STREAM_TYPE_STREAM);
     }
+    // volume=1.0 in the pipeline strings above is the correct default: analog
+    // gain belongs to the ALSA mixer (see set_alsa_voice_routing / boot-time
+    // tuning). But confirmed on-device 2026-09-09 that the 800x1280 panel's
+    // rk809/rk817 codec exposes NO gain/volume control at all -- amixer -c 0
+    // scontrols on that board lists only enum path-selectors (Playback Path,
+    // Capture MIC Path, etc.), nothing with a settable level -- so on that
+    // specific panel there is no ALSA-side gain to rely on and call audio is
+    // audibly much quieter than the ringtone (a plain WAV played via aplay,
+    // unaffected by this). Boost playvol's gain in software, but ONLY on that
+    // panel model (matched via the same PANEL_WIDTH env var syncnhome.service
+    // already sets from /etc/syncn/panel-display.conf) -- every other panel
+    // keeps the original 1.0 default so this doesn't reintroduce the
+    // headroom/resolution cost the comment above warns about where a real
+    // ALSA gain control does exist.
+    GstElement *playback_volume_elem = gst_bin_get_by_name(GST_BIN(playback), "playvol");
+    if (playback_volume_elem != NULL) {
+        const char *panel_width = getenv("PANEL_WIDTH");
+        if (panel_width != NULL && strcmp(panel_width, "800") == 0) {
+            g_object_set(playback_volume_elem, "volume", 2.5, NULL);
+            syncn_intercom_debug_log("audio", "start_locked: boosted playvol gain to 2.5 for PANEL_WIDTH=800");
+        }
+        gst_object_unref(playback_volume_elem);
+    }
+
     if (playback_appsrc == NULL || !start_pipeline_with_retry("syncn_intercom_audio playback", playback, 3, 150)) {
         if (aec_available) {
             // The echo probe/tee branch is the one new failure mode here (e.g.
