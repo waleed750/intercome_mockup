@@ -478,15 +478,23 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     // webrtcdsp tuning beyond the bare AEC/NS/AGC booleans:
     // - high-pass-filter strips DC offset and low-frequency rumble the wall
     //   mount picks up (matches Android's voice-processing chain).
-    // - noise-suppression-level=high: hands-free wall panel in a live room,
-    //   not a handset near the mouth -- aggressive NS is the right default.
+    // - noise-suppression-level=moderate: `high` combined with gain-control
+    //   was confirmed on-device 2026-09-09 to make call audio sound noisy
+    //   and voice-cancelled even at low playback volume -- `high` NS is
+    //   tuned for a noisy room, but on this 8kHz A-law call path it was
+    //   stripping/distorting speech itself, not just background noise, and
+    //   the effect was independent of volume since it happens upstream of
+    //   any gain change (matches the reported symptom exactly). gain-control
+    //   (AGC) is dropped too -- AGC's automatic level-chasing was compounding
+    //   with aggressive NS as the more likely source of the choppy/robotic
+    //   artifact than either alone.
     // - extended-filter=true: longer echo tail coverage; speaker and mic sit
     //   centimeters apart in the same enclosure, so the echo path is strong.
     static const char *capture_desc_aec =
         "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-        "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=true "
-        "high-pass-filter=true noise-suppression-level=high extended-filter=true ! "
+        "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=false "
+        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
         "volume name=capvol ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
     static const char *capture_desc_plain =
