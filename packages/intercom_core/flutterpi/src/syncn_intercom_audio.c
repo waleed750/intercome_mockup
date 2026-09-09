@@ -27,10 +27,17 @@
 // Headset routing: this board (rk809 codec) exposes no kernel jack-detect
 // input device (confirmed via /proc/bus/input/devices), so the panel can't
 // tell in software whether a headset is plugged in. `Playback Path`
-// defaults to SPK_HP (speaker + headphone, both always on) and can be
-// switched to headset-only (HP + Hands Free Mic) via the `headsetMode`
-// start() arg / `setHeadsetMode` method, driven by a manual toggle in the
-// app -- see AudioPipeline.setHeadsetMode in the Dart layer.
+// defaults to SPK (speaker only) and can be switched to headset-only (HP +
+// Hands Free Mic) via the `headsetMode` start() arg / `setHeadsetMode`
+// method, driven by a manual toggle in the app -- see
+// AudioPipeline.setHeadsetMode in the Dart layer.
+//
+// Was SPK_HP (speaker + headphone always both on) until confirmed
+// on-device 2026-09-09 that SPK_HP produced quiet/unclear call audio on
+// this rk817_codec driver, while plain SPK alone was loud and clear on
+// the same hardware/enclosure -- this panel has no headphone jack in
+// active use, so there's no benefit to keeping HP live simultaneously,
+// only the apparent cost of split/attenuated output.
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -253,7 +260,7 @@ static bool start_and_confirm_playing(const char *tag, GstElement *pipeline) {
 // is purely driven by the caller (app-side toggle) -- it is not, and cannot
 // be, automatic.
 static void set_alsa_voice_routing(bool headset_mode) {
-    const char *playback_path = headset_mode ? "HP" : "SPK_HP";
+    const char *playback_path = headset_mode ? "HP" : "SPK";
     const char *capture_mic_path = headset_mode ? "Hands Free Mic" : "Main Mic";
     const char *playback_argv[] = { "amixer", "-c", "0", "sset", "Playback Path", playback_path, NULL };
     const char *capture_argv[] = { "amixer", "-c", "0", "sset", "Capture MIC Path", capture_mic_path, NULL };
@@ -261,7 +268,7 @@ static void set_alsa_voice_routing(bool headset_mode) {
         const char *tag;
         const char **argv;
     } controls[] = {
-        { headset_mode ? "Playback Path -> HP" : "Playback Path -> SPK_HP", playback_argv },
+        { headset_mode ? "Playback Path -> HP" : "Playback Path -> SPK", playback_argv },
         { headset_mode ? "Capture MIC Path -> Hands Free Mic" : "Capture MIC Path -> Main Mic", capture_argv },
     };
 
