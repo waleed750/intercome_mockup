@@ -38,6 +38,33 @@
 // the same hardware/enclosure -- this panel has no headphone jack in
 // active use, so there's no benefit to keeping HP live simultaneously,
 // only the apparent cost of split/attenuated output.
+//
+// Diagnostic mode (SYNCN_INTERCOM_AUDIO_DIAG=1): the original per-buffer
+// logging in handle_play_downlink/on_new_capture_sample stopped after the
+// first 30 buffers (~600ms at 20ms/frame) -- nowhere near long enough to
+// catch a whine/noise that starts or persists later into a call. This env
+// var extends logging to a bounded ~20s window (SYNCN_DIAG_MAX_BUFFERS)
+// per pipeline start, rate-limited to 1-in-N buffers within that window so
+// the extra fopen/fprintf/fclose per logged buffer (see
+// syncn_intercom_debug_log, which blocks on real file I/O on this same
+// GStreamer streaming thread) doesn't itself perturb the audio it's
+// measuring. Off by default -- every call still gets the original
+// unconditional first-30-buffers logging regardless of this flag, this
+// only ADDS the extended window on top when explicitly enabled.
+//
+// Computes A-law-domain stats (min/max/distinct-byte-count over the
+// buffer) rather than decoding to PCM here -- PCM decode is alawdec's job
+// downstream of appsrc; duplicating that decode in this diagnostic path
+// would risk drifting from what the real pipeline does. distinct-byte-
+// count is a cheap, decode-free proxy for "is this buffer constant/near-
+// silent" (true digital silence is a single repeated byte; real encoded
+// speech is not) -- good enough to tell "nothing being received" apart
+// from "something is being received, decoded PCM quality unknown", which
+// is the actual open question per the fix plan: whether the whine
+// originates in the encoded bytes arriving over the network (this layer)
+// or gets introduced later during decode/DSP/playback (a separate,
+// PCM-level check would be needed downstream in alawdec/webrtcdsp/alsasink
+// to fully rule that in or out -- not done here).
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -60,6 +87,66 @@
 #include "syncn_intercom_debug.h"
 #include "syncn_intercom_gst_util.h"
 #include "util/logging.h"
+
+// See "Diagnostic mode" comment in the file header. -1 means "not yet
+// read from the environment"; read lazily once on first use rather than
+// at load time, since getenv() this early in plugin registration has
+// bitten this codebase before (see set_alsa_voice_routing's PANEL_WIDTH
+// usage, which is read at start_locked() time for the same reason -- env
+// vars set by the launching systemd unit are guaranteed present by then).
+static int g_diag_enabled = -1;
+static bool diag_mode_enabled(void) {
+    if (g_diag_enabled < 0) {
+        const char *v = getenv("SYNCN_INTERCOM_AUDIO_DIAG");
+        g_diag_enabled = (v != NULL && strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    return g_diag_enabled == 1;
+}
+
+// ~20s at 20ms/frame (160-byte A-law frames per the file header), per
+// pipeline start -- matches the fix plan's suggested bounded-capture
+// window. Diagnostic logging is additionally rate-limited to 1-in-10
+// buffers within this window (see callers) to keep the extra blocking
+// file I/O off the hot path as much as possible while still covering
+// enough of a real call to catch a whine that starts after the original
+// 30-buffer cutoff.
+#define SYNCN_DIAG_MAX_BUFFERS 1000
+#define SYNCN_DIAG_LOG_EVERY_N 10
+
+// Cheap, decode-free A-law-domain buffer summary: min/max byte value and
+// count of distinct byte values seen (capped at 256, obviously, but we
+// only need to distinguish "1" i.e. perfectly constant from "more than
+// 1"). Real encoded speech/noise varies buffer-to-buffer and byte-to-byte;
+// true digital silence in A-law is a single repeated byte (0xD5). This
+// does NOT decode to PCM -- see file header comment for why -- so it
+// cannot report RMS/peak/clipping in PCM terms, only "does this look like
+// silence in the encoded domain or not".
+struct syncn_alaw_buffer_stats {
+    uint8_t min_byte;
+    uint8_t max_byte;
+    int distinct_count;
+    bool is_constant;
+};
+
+static struct syncn_alaw_buffer_stats syncn_alaw_stats(const uint8_t *data, size_t size) {
+    struct syncn_alaw_buffer_stats stats = { .min_byte = 0, .max_byte = 0, .distinct_count = 0, .is_constant = true };
+    if (size == 0) return stats;
+
+    bool seen[256] = { false };
+    stats.min_byte = data[0];
+    stats.max_byte = data[0];
+    for (size_t i = 0; i < size; i++) {
+        uint8_t b = data[i];
+        if (b < stats.min_byte) stats.min_byte = b;
+        if (b > stats.max_byte) stats.max_byte = b;
+        if (!seen[b]) {
+            seen[b] = true;
+            stats.distinct_count++;
+        }
+    }
+    stats.is_constant = (stats.distinct_count == 1);
+    return stats;
+}
 
 struct syncn_intercom_audio {
     struct flutterpi *flutterpi;
@@ -125,11 +212,22 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
     pthread_mutex_lock(&self->lock);
     bool listening = self->uplink_listening;
     self->capture_count++;
-    bool should_log = self->capture_count <= 30;
+    int count = self->capture_count;
     pthread_mutex_unlock(&self->lock);
 
+    bool should_log = count <= 30;
+    bool diag_log = !should_log && diag_mode_enabled() && count <= SYNCN_DIAG_MAX_BUFFERS &&
+        (count % SYNCN_DIAG_LOG_EVERY_N == 0);
+
     if (should_log) {
-        syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: listening=%d, size=%zu", self->capture_count, listening, map.size);
+        syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: listening=%d, size=%zu", count, listening, map.size);
+    } else if (diag_log) {
+        struct syncn_alaw_buffer_stats stats = syncn_alaw_stats(map.data, map.size);
+        syncn_intercom_debug_log(
+            "audio-diag",
+            "on_new_capture_sample #%d: listening=%d, size=%zu, byte range [0x%02x, 0x%02x], distinct=%d, constant=%d",
+            count, listening, map.size, stats.min_byte, stats.max_byte, stats.distinct_count, stats.is_constant
+        );
     }
 
     if (listening && map.size > 0) {
@@ -140,7 +238,9 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
         };
         int send_ret = platch_send_success_event_std(SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, &event);
         if (should_log) {
-            syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: platch_send_success_event_std -> %d", self->capture_count, send_ret);
+            syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: platch_send_success_event_std -> %d", count, send_ret);
+        } else if (diag_log) {
+            syncn_intercom_debug_log("audio-diag", "on_new_capture_sample #%d: platch_send_success_event_std -> %d", count, send_ret);
         }
     }
 
@@ -616,7 +716,18 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
 static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_t *data, size_t size) {
     pthread_mutex_lock(&self->lock);
     self->playback_count++;
-    bool should_log = self->playback_count <= 30;
+    int count = self->playback_count;
+    bool should_log = count <= 30;
+    // See "Diagnostic mode" file header comment. Computed under the same
+    // lock the original should_log logging already runs under (this
+    // function already does real work -- push-buffer -- while holding
+    // self->lock, so the diagnostic path adds CPU-only stat computation on
+    // top of an existing pattern rather than a new kind of lock-held cost;
+    // the actual blocking file I/O in syncn_intercom_debug_log was already
+    // happening inside this lock for the first 30 buffers before this
+    // change).
+    bool diag_log = !should_log && diag_mode_enabled() && count <= SYNCN_DIAG_MAX_BUFFERS &&
+        (count % SYNCN_DIAG_LOG_EVERY_N == 0);
     if (self->running && self->playback_appsrc != NULL && size > 0) {
         GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
         gst_buffer_fill(buffer, 0, data, size);
@@ -640,18 +751,34 @@ static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_
             syncn_intercom_debug_log(
                 "audio",
                 "handle_play_downlink #%d: pushed %zu bytes, ret=%d, byte range [0x%02x, 0x%02x] (0xd5=A-law silence)",
-                self->playback_count,
+                count,
                 size,
                 ret,
                 min_byte,
                 max_byte
+            );
+        } else if (diag_log) {
+            struct syncn_alaw_buffer_stats stats = syncn_alaw_stats(data, size);
+            syncn_intercom_debug_log(
+                "audio-diag",
+                "handle_play_downlink #%d: pushed %zu bytes, ret=%d, byte range [0x%02x, 0x%02x], distinct=%d, constant=%d",
+                count, size, ret, stats.min_byte, stats.max_byte, stats.distinct_count, stats.is_constant
             );
         }
     } else if (should_log) {
         syncn_intercom_debug_log(
             "audio",
             "handle_play_downlink #%d: DROPPED (running=%d, playback_appsrc=%p, size=%zu)",
-            self->playback_count,
+            count,
+            self->running,
+            (void *) self->playback_appsrc,
+            size
+        );
+    } else if (diag_log) {
+        syncn_intercom_debug_log(
+            "audio-diag",
+            "handle_play_downlink #%d: DROPPED (running=%d, playback_appsrc=%p, size=%zu)",
+            count,
             self->running,
             (void *) self->playback_appsrc,
             size
