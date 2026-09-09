@@ -424,8 +424,11 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     if (playback_volume_elem != NULL) {
         const char *panel_width = getenv("PANEL_WIDTH");
         if (panel_width != NULL && strcmp(panel_width, "800") == 0) {
-            g_object_set(playback_volume_elem, "volume", 2.5, NULL);
-            syncn_intercom_debug_log("audio", "start_locked: boosted playvol gain to 2.5 for PANEL_WIDTH=800");
+            // 2.5 (confirmed on-device 2026-09-09) made call audio noisy --
+            // amplifying an 8kHz A-law stream's quantization/noise floor
+            // right along with the voice. 1.5 is a more moderate boost.
+            g_object_set(playback_volume_elem, "volume", 1.5, NULL);
+            syncn_intercom_debug_log("audio", "start_locked: boosted playvol gain to 1.5 for PANEL_WIDTH=800");
         }
         gst_object_unref(playback_volume_elem);
     }
