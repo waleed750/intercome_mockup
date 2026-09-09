@@ -535,6 +535,27 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
                 continue;
             }
             g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
+            // Same rationale as playvol above: this codec has no ALSA-side
+            // capture gain control at all (Capture MIC Path is an enum
+            // path-selector only), so a raw mic recording on this panel
+            // (confirmed on-device 2026-09-09, after a clean reboot ruled
+            // out a stuck codec state from live testing as the cause of a
+            // separate total-silence symptom) came back real but very
+            // quiet. Boost capvol's gain in software, same PANEL_WIDTH=800
+            // gate as playvol so other panel models keep the 1.0 default.
+            // 1.8 is a starting point, not re-verified on-device yet --
+            // deliberately more conservative than playvol's 1.5-after-2.5
+            // history, since capture gain amplifies mic self-noise the same
+            // way playback gain amplified stream noise, and NS was just
+            // turned down (see webrtcdsp noise-suppression-level change
+            // above), so there's less noise-floor headroom to spend here.
+            if (capture_volume != NULL) {
+                const char *panel_width = getenv("PANEL_WIDTH");
+                if (panel_width != NULL && strcmp(panel_width, "800") == 0) {
+                    g_object_set(capture_volume, "volume", 1.8, NULL);
+                    syncn_intercom_debug_log("audio", "start_locked: boosted capvol gain to 1.8 for PANEL_WIDTH=800");
+                }
+            }
             // Hand the playback pipeline's echo probe to webrtcdsp via
             // g_object_set -- gst_parse_launch can't resolve cross-pipeline
             // element references (the `probe=` syntax only works within the
