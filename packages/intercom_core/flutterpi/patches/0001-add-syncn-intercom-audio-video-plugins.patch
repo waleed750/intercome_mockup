@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..8891068
+index 0000000..965ea7a
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,808 @@
+@@ -0,0 +1,994 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -87,10 +87,44 @@ index 0000000..8891068
 +// Headset routing: this board (rk809 codec) exposes no kernel jack-detect
 +// input device (confirmed via /proc/bus/input/devices), so the panel can't
 +// tell in software whether a headset is plugged in. `Playback Path`
-+// defaults to SPK_HP (speaker + headphone, both always on) and can be
-+// switched to headset-only (HP + Hands Free Mic) via the `headsetMode`
-+// start() arg / `setHeadsetMode` method, driven by a manual toggle in the
-+// app -- see AudioPipeline.setHeadsetMode in the Dart layer.
++// defaults to SPK (speaker only) and can be switched to headset-only (HP +
++// Hands Free Mic) via the `headsetMode` start() arg / `setHeadsetMode`
++// method, driven by a manual toggle in the app -- see
++// AudioPipeline.setHeadsetMode in the Dart layer.
++//
++// Was SPK_HP (speaker + headphone always both on) until confirmed
++// on-device 2026-09-09 that SPK_HP produced quiet/unclear call audio on
++// this rk817_codec driver, while plain SPK alone was loud and clear on
++// the same hardware/enclosure -- this panel has no headphone jack in
++// active use, so there's no benefit to keeping HP live simultaneously,
++// only the apparent cost of split/attenuated output.
++//
++// Diagnostic mode (SYNCN_INTERCOM_AUDIO_DIAG=1): the original per-buffer
++// logging in handle_play_downlink/on_new_capture_sample stopped after the
++// first 30 buffers (~600ms at 20ms/frame) -- nowhere near long enough to
++// catch a whine/noise that starts or persists later into a call. This env
++// var extends logging to a bounded ~20s window (SYNCN_DIAG_MAX_BUFFERS)
++// per pipeline start, rate-limited to 1-in-N buffers within that window so
++// the extra fopen/fprintf/fclose per logged buffer (see
++// syncn_intercom_debug_log, which blocks on real file I/O on this same
++// GStreamer streaming thread) doesn't itself perturb the audio it's
++// measuring. Off by default -- every call still gets the original
++// unconditional first-30-buffers logging regardless of this flag, this
++// only ADDS the extended window on top when explicitly enabled.
++//
++// Computes A-law-domain stats (min/max/distinct-byte-count over the
++// buffer) rather than decoding to PCM here -- PCM decode is alawdec's job
++// downstream of appsrc; duplicating that decode in this diagnostic path
++// would risk drifting from what the real pipeline does. distinct-byte-
++// count is a cheap, decode-free proxy for "is this buffer constant/near-
++// silent" (true digital silence is a single repeated byte; real encoded
++// speech is not) -- good enough to tell "nothing being received" apart
++// from "something is being received, decoded PCM quality unknown", which
++// is the actual open question per the fix plan: whether the whine
++// originates in the encoded bytes arriving over the network (this layer)
++// or gets introduced later during decode/DSP/playback (a separate,
++// PCM-level check would be needed downstream in alawdec/webrtcdsp/alsasink
++// to fully rule that in or out -- not done here).
 +
 +#ifndef _GNU_SOURCE
 +#define _GNU_SOURCE
@@ -99,6 +133,7 @@ index 0000000..8891068
 +#include "syncn_intercom_audio.h"
 +
 +#include <pthread.h>
++#include <stdlib.h>
 +#include <string.h>
 +#include <sys/wait.h>
 +
@@ -112,6 +147,66 @@ index 0000000..8891068
 +#include "syncn_intercom_debug.h"
 +#include "syncn_intercom_gst_util.h"
 +#include "util/logging.h"
++
++// See "Diagnostic mode" comment in the file header. -1 means "not yet
++// read from the environment"; read lazily once on first use rather than
++// at load time, since getenv() this early in plugin registration has
++// bitten this codebase before (see set_alsa_voice_routing's PANEL_WIDTH
++// usage, which is read at start_locked() time for the same reason -- env
++// vars set by the launching systemd unit are guaranteed present by then).
++static int g_diag_enabled = -1;
++static bool diag_mode_enabled(void) {
++    if (g_diag_enabled < 0) {
++        const char *v = getenv("SYNCN_INTERCOM_AUDIO_DIAG");
++        g_diag_enabled = (v != NULL && strcmp(v, "1") == 0) ? 1 : 0;
++    }
++    return g_diag_enabled == 1;
++}
++
++// ~20s at 20ms/frame (160-byte A-law frames per the file header), per
++// pipeline start -- matches the fix plan's suggested bounded-capture
++// window. Diagnostic logging is additionally rate-limited to 1-in-10
++// buffers within this window (see callers) to keep the extra blocking
++// file I/O off the hot path as much as possible while still covering
++// enough of a real call to catch a whine that starts after the original
++// 30-buffer cutoff.
++#define SYNCN_DIAG_MAX_BUFFERS 1000
++#define SYNCN_DIAG_LOG_EVERY_N 10
++
++// Cheap, decode-free A-law-domain buffer summary: min/max byte value and
++// count of distinct byte values seen (capped at 256, obviously, but we
++// only need to distinguish "1" i.e. perfectly constant from "more than
++// 1"). Real encoded speech/noise varies buffer-to-buffer and byte-to-byte;
++// true digital silence in A-law is a single repeated byte (0xD5). This
++// does NOT decode to PCM -- see file header comment for why -- so it
++// cannot report RMS/peak/clipping in PCM terms, only "does this look like
++// silence in the encoded domain or not".
++struct syncn_alaw_buffer_stats {
++    uint8_t min_byte;
++    uint8_t max_byte;
++    int distinct_count;
++    bool is_constant;
++};
++
++static struct syncn_alaw_buffer_stats syncn_alaw_stats(const uint8_t *data, size_t size) {
++    struct syncn_alaw_buffer_stats stats = { .min_byte = 0, .max_byte = 0, .distinct_count = 0, .is_constant = true };
++    if (size == 0) return stats;
++
++    bool seen[256] = { false };
++    stats.min_byte = data[0];
++    stats.max_byte = data[0];
++    for (size_t i = 0; i < size; i++) {
++        uint8_t b = data[i];
++        if (b < stats.min_byte) stats.min_byte = b;
++        if (b > stats.max_byte) stats.max_byte = b;
++        if (!seen[b]) {
++            seen[b] = true;
++            stats.distinct_count++;
++        }
++    }
++    stats.is_constant = (stats.distinct_count == 1);
++    return stats;
++}
 +
 +struct syncn_intercom_audio {
 +    struct flutterpi *flutterpi;
@@ -177,11 +272,22 @@ index 0000000..8891068
 +    pthread_mutex_lock(&self->lock);
 +    bool listening = self->uplink_listening;
 +    self->capture_count++;
-+    bool should_log = self->capture_count <= 30;
++    int count = self->capture_count;
 +    pthread_mutex_unlock(&self->lock);
 +
++    bool should_log = count <= 30;
++    bool diag_log = !should_log && diag_mode_enabled() && count <= SYNCN_DIAG_MAX_BUFFERS &&
++        (count % SYNCN_DIAG_LOG_EVERY_N == 0);
++
 +    if (should_log) {
-+        syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: listening=%d, size=%zu", self->capture_count, listening, map.size);
++        syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: listening=%d, size=%zu", count, listening, map.size);
++    } else if (diag_log) {
++        struct syncn_alaw_buffer_stats stats = syncn_alaw_stats(map.data, map.size);
++        syncn_intercom_debug_log(
++            "audio-diag",
++            "on_new_capture_sample #%d: listening=%d, size=%zu, byte range [0x%02x, 0x%02x], distinct=%d, constant=%d",
++            count, listening, map.size, stats.min_byte, stats.max_byte, stats.distinct_count, stats.is_constant
++        );
 +    }
 +
 +    if (listening && map.size > 0) {
@@ -192,7 +298,9 @@ index 0000000..8891068
 +        };
 +        int send_ret = platch_send_success_event_std(SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, &event);
 +        if (should_log) {
-+            syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: platch_send_success_event_std -> %d", self->capture_count, send_ret);
++            syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: platch_send_success_event_std -> %d", count, send_ret);
++        } else if (diag_log) {
++            syncn_intercom_debug_log("audio-diag", "on_new_capture_sample #%d: platch_send_success_event_std -> %d", count, send_ret);
 +        }
 +    }
 +
@@ -312,7 +420,7 @@ index 0000000..8891068
 +// is purely driven by the caller (app-side toggle) -- it is not, and cannot
 +// be, automatic.
 +static void set_alsa_voice_routing(bool headset_mode) {
-+    const char *playback_path = headset_mode ? "HP" : "SPK_HP";
++    const char *playback_path = headset_mode ? "HP" : "SPK";
 +    const char *capture_mic_path = headset_mode ? "Hands Free Mic" : "Main Mic";
 +    const char *playback_argv[] = { "amixer", "-c", "0", "sset", "Playback Path", playback_path, NULL };
 +    const char *capture_argv[] = { "amixer", "-c", "0", "sset", "Capture MIC Path", capture_mic_path, NULL };
@@ -320,7 +428,7 @@ index 0000000..8891068
 +        const char *tag;
 +        const char **argv;
 +    } controls[] = {
-+        { headset_mode ? "Playback Path -> HP" : "Playback Path -> SPK_HP", playback_argv },
++        { headset_mode ? "Playback Path -> HP" : "Playback Path -> SPK", playback_argv },
 +        { headset_mode ? "Capture MIC Path -> Hands Free Mic" : "Capture MIC Path -> Main Mic", capture_argv },
 +    };
 +
@@ -465,6 +573,33 @@ index 0000000..8891068
 +        gst_caps_unref(appsrc_caps);
 +        gst_app_src_set_stream_type(GST_APP_SRC(playback_appsrc), GST_APP_STREAM_TYPE_STREAM);
 +    }
++    // volume=1.0 in the pipeline strings above is the correct default: analog
++    // gain belongs to the ALSA mixer (see set_alsa_voice_routing / boot-time
++    // tuning). But confirmed on-device 2026-09-09 that the 800x1280 panel's
++    // rk809/rk817 codec exposes NO gain/volume control at all -- amixer -c 0
++    // scontrols on that board lists only enum path-selectors (Playback Path,
++    // Capture MIC Path, etc.), nothing with a settable level -- so on that
++    // specific panel there is no ALSA-side gain to rely on and call audio is
++    // audibly much quieter than the ringtone (a plain WAV played via aplay,
++    // unaffected by this). Boost playvol's gain in software, but ONLY on that
++    // panel model (matched via the same PANEL_WIDTH env var syncnhome.service
++    // already sets from /etc/syncn/panel-display.conf) -- every other panel
++    // keeps the original 1.0 default so this doesn't reintroduce the
++    // headroom/resolution cost the comment above warns about where a real
++    // ALSA gain control does exist.
++    GstElement *playback_volume_elem = gst_bin_get_by_name(GST_BIN(playback), "playvol");
++    if (playback_volume_elem != NULL) {
++        const char *panel_width = getenv("PANEL_WIDTH");
++        if (panel_width != NULL && strcmp(panel_width, "800") == 0) {
++            // 2.5 (confirmed on-device 2026-09-09) made call audio noisy --
++            // amplifying an 8kHz A-law stream's quantization/noise floor
++            // right along with the voice. 1.5 is a more moderate boost.
++            g_object_set(playback_volume_elem, "volume", 1.5, NULL);
++            syncn_intercom_debug_log("audio", "start_locked: boosted playvol gain to 1.5 for PANEL_WIDTH=800");
++        }
++        gst_object_unref(playback_volume_elem);
++    }
++
 +    if (playback_appsrc == NULL || !start_pipeline_with_retry("syncn_intercom_audio playback", playback, 3, 150)) {
 +        if (aec_available) {
 +            // The echo probe/tee branch is the one new failure mode here (e.g.
@@ -510,15 +645,23 @@ index 0000000..8891068
 +    // webrtcdsp tuning beyond the bare AEC/NS/AGC booleans:
 +    // - high-pass-filter strips DC offset and low-frequency rumble the wall
 +    //   mount picks up (matches Android's voice-processing chain).
-+    // - noise-suppression-level=high: hands-free wall panel in a live room,
-+    //   not a handset near the mouth -- aggressive NS is the right default.
++    // - noise-suppression-level=moderate: `high` combined with gain-control
++    //   was confirmed on-device 2026-09-09 to make call audio sound noisy
++    //   and voice-cancelled even at low playback volume -- `high` NS is
++    //   tuned for a noisy room, but on this 8kHz A-law call path it was
++    //   stripping/distorting speech itself, not just background noise, and
++    //   the effect was independent of volume since it happens upstream of
++    //   any gain change (matches the reported symptom exactly). gain-control
++    //   (AGC) is dropped too -- AGC's automatic level-chasing was compounding
++    //   with aggressive NS as the more likely source of the choppy/robotic
++    //   artifact than either alone.
 +    // - extended-filter=true: longer echo tail coverage; speaker and mic sit
 +    //   centimeters apart in the same enclosure, so the echo path is strong.
 +    static const char *capture_desc_aec =
 +        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
 +        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-+        "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=true "
-+        "high-pass-filter=true noise-suppression-level=high extended-filter=true ! "
++        "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=false "
++        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
 +        "volume name=capvol ! alawenc ! "
 +        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 +    static const char *capture_desc_plain =
@@ -552,6 +695,22 @@ index 0000000..8891068
 +                continue;
 +            }
 +            g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
++            // Tried boosting capvol's gain to 1.8 on this panel (same
++            // PANEL_WIDTH=800 rationale as playvol) to compensate for this
++            // codec having no ALSA-side capture gain control -- confirmed
++            // on-device 2026-09-09 that 1.8 made call audio a loud
++            // whine/buzz (mechanical-sounding, not voice-shaped) that
++            // drowned out speech entirely, worse than the original quiet-
++            // but-clean mic. This is consistent with amplifying the mic's
++            // own electrical/self-noise floor rather than the voice signal
++            // -- there's no real gain-control silicon here to separate the
++            // two, unlike a proper mic preamp. Reverted to the unmodified
++            // 1.0 default (capture_volume kept only for the mute toggle
++            // below); quiet-but-intelligible beats loud-but-unusable, and
++            // there's no ALSA-side alternative to fall back to on this
++            // hardware. Do not re-attempt a capvol gain boost without a
++            // real on-device A/B of intermediate values (e.g. 1.2-1.4)
++            // first.
 +            // Hand the playback pipeline's echo probe to webrtcdsp via
 +            // g_object_set -- gst_parse_launch can't resolve cross-pipeline
 +            // element references (the `probe=` syntax only works within the
@@ -617,7 +776,18 @@ index 0000000..8891068
 +static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_t *data, size_t size) {
 +    pthread_mutex_lock(&self->lock);
 +    self->playback_count++;
-+    bool should_log = self->playback_count <= 30;
++    int count = self->playback_count;
++    bool should_log = count <= 30;
++    // See "Diagnostic mode" file header comment. Computed under the same
++    // lock the original should_log logging already runs under (this
++    // function already does real work -- push-buffer -- while holding
++    // self->lock, so the diagnostic path adds CPU-only stat computation on
++    // top of an existing pattern rather than a new kind of lock-held cost;
++    // the actual blocking file I/O in syncn_intercom_debug_log was already
++    // happening inside this lock for the first 30 buffers before this
++    // change).
++    bool diag_log = !should_log && diag_mode_enabled() && count <= SYNCN_DIAG_MAX_BUFFERS &&
++        (count % SYNCN_DIAG_LOG_EVERY_N == 0);
 +    if (self->running && self->playback_appsrc != NULL && size > 0) {
 +        GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
 +        gst_buffer_fill(buffer, 0, data, size);
@@ -641,18 +811,34 @@ index 0000000..8891068
 +            syncn_intercom_debug_log(
 +                "audio",
 +                "handle_play_downlink #%d: pushed %zu bytes, ret=%d, byte range [0x%02x, 0x%02x] (0xd5=A-law silence)",
-+                self->playback_count,
++                count,
 +                size,
 +                ret,
 +                min_byte,
 +                max_byte
++            );
++        } else if (diag_log) {
++            struct syncn_alaw_buffer_stats stats = syncn_alaw_stats(data, size);
++            syncn_intercom_debug_log(
++                "audio-diag",
++                "handle_play_downlink #%d: pushed %zu bytes, ret=%d, byte range [0x%02x, 0x%02x], distinct=%d, constant=%d",
++                count, size, ret, stats.min_byte, stats.max_byte, stats.distinct_count, stats.is_constant
 +            );
 +        }
 +    } else if (should_log) {
 +        syncn_intercom_debug_log(
 +            "audio",
 +            "handle_play_downlink #%d: DROPPED (running=%d, playback_appsrc=%p, size=%zu)",
-+            self->playback_count,
++            count,
++            self->running,
++            (void *) self->playback_appsrc,
++            size
++        );
++    } else if (diag_log) {
++        syncn_intercom_debug_log(
++            "audio-diag",
++            "handle_play_downlink #%d: DROPPED (running=%d, playback_appsrc=%p, size=%zu)",
++            count,
 +            self->running,
 +            (void *) self->playback_appsrc,
 +            size
