@@ -597,30 +597,20 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     //   artifact than either alone.
     // - extended-filter=true: longer echo tail coverage; speaker and mic sit
     //   centimeters apart in the same enclosure, so the echo path is strong.
-    // - echo-cancel (2026-09-10, PANEL_WIDTH=800 only): client A/B'd real
-    //   call audio on the 800x1280 panel against a plain arecord capture
-    //   (no webrtcdsp at all) and explicitly preferred the raw recording,
-    //   describing AEC-processed call audio as "unclean". Isolated
-    //   on-device tests confirmed this capture chain sounds clean with
-    //   noise-suppression=true and echo-cancel=false -- the complaint is
-    //   specific to real two-way AEC (i.e. with actual far-end audio for
-    //   webrtcdsp to act on), which no single-ended isolated test can
-    //   reproduce. Speaker and mic sit centimeters apart in the same
-    //   enclosure so some echo risk exists without AEC, but the client's
-    //   explicit preference for the cleaner, non-echo-cancelled sound
-    //   outweighs that here. Reported as specific to the 800x1280 panel,
-    //   so gated the same way as the playvol/capvol gain boosts below
-    //   rather than disabling AEC for every panel size -- other panels
-    //   keep AEC on until/unless the same complaint is confirmed there.
-    //   Do not flip this back to echo-cancel=true for PANEL_WIDTH=800
-    //   without a new real-call A/B confirming the client is fine with it.
-    static const char *capture_desc_aec_noecho =
-        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
-        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-        "webrtcdsp name=dsp echo-cancel=false noise-suppression=true gain-control=false "
-        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
-        "volume name=capvol ! alawenc ! "
-        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
+    // - echo-cancel=true (reverted 2026-09-10): tried disabling AEC for
+    //   PANEL_WIDTH=800 after the client preferred a plain arecord capture
+    //   over real-call audio in isolated A/B testing. Shipped as
+    //   panel-v1.3.52/53 and confirmed on-device WORSE than the original
+    //   echo-cancel=true baseline -- client reported it as still bad, and
+    //   specifically still choppy/gappy on a real two-way call even after
+    //   also reverting the capvol gain experiment shipped in the same
+    //   build. The clean sound in isolated single-ended testing did not
+    //   carry over to a real call with both sides talking; whatever AEC
+    //   was doing there evidently mattered. Fully reverted back to
+    //   echo-cancel=true for all panel sizes, matching pre-2026-09-10
+    //   behavior. Do not re-attempt disabling AEC without isolating it
+    //   from every other audio change in its own build AND testing on a
+    //   real two-way call (not just a local recording) before shipping.
     static const char *capture_desc_aec =
         "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
@@ -634,9 +624,6 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         "volume name=capvol ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 
-    const char *panel_width_for_aec = getenv("PANEL_WIDTH");
-    bool disable_echo_cancel_800 = panel_width_for_aec != NULL && strcmp(panel_width_for_aec, "800") == 0;
-
     GstElement *capture = NULL;
     GstElement *capture_appsink = NULL;
     GstElement *capture_volume = NULL;
@@ -644,10 +631,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         for (int attempt = 0; attempt < 2 && capture == NULL; attempt++) {
             bool use_aec = aec_available && attempt == 0;
             error = NULL;
-            const char *capture_desc_to_use = !use_aec
-                ? capture_desc_plain
-                : (disable_echo_cancel_800 ? capture_desc_aec_noecho : capture_desc_aec);
-            capture = gst_parse_launch(capture_desc_to_use, &error);
+            capture = gst_parse_launch(use_aec ? capture_desc_aec : capture_desc_plain, &error);
             if (capture == NULL) {
                 LOG_ERROR(
                     "syncn_intercom_audio: failed to build capture pipeline (aec=%d): %s\n",
