@@ -682,20 +682,13 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
             // real on-device A/B of intermediate values (e.g. 1.2-1.4)
             // first.
             //
-            // 2026-09-10: Attempting 1.2x gain (low end of the suggested
-            // range) for PANEL_WIDTH=800, same gating as playvol boost.
-            // The prior 1.8x attempt (2026-09-09) produced a loud whine/
-            // buzz -- amplifying the mic's electrical self-noise floor.
-            // 1.2x is a cautious first step; if whine/buzz reappears even
-            // at this level, revert to 1.0 immediately and update this
-            // comment with the new confirmed failure point.
-            if (capture_volume != NULL) {
-                const char *panel_width = getenv("PANEL_WIDTH");
-                if (panel_width != NULL && strcmp(panel_width, "800") == 0) {
-                    g_object_set(capture_volume, "volume", 1.2, NULL);
-                    syncn_intercom_debug_log("audio", "start_locked: boosted capvol gain to 1.2 for PANEL_WIDTH=800");
-                }
-            }
+            // 2026-09-10: Tried 1.2x gain (low end of the suggested range)
+            // for PANEL_WIDTH=800. Confirmed on-device this build (with
+            // echo-cancel also disabled the same build, so not fully
+            // isolated) that the client wanted back to 1.0 -- reverted.
+            // Do not re-attempt a capvol gain boost without a real
+            // on-device A/B, isolated from any other audio change in the
+            // same build, confirming the client is fine with it.
             // Hand the playback pipeline's echo probe to webrtcdsp via
             // g_object_set -- gst_parse_launch can't resolve cross-pipeline
             // element references (the `probe=` syntax only works within the
