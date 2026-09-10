@@ -528,22 +528,35 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     //   native rate instead of forcing the DAC into an 8kHz-derived mode.
     // - audioresample quality=10 upsamples the 8kHz narrowband stream with
     //   the best filter instead of the default (audible aliasing/harshness).
-    // - sync=true + a ~80ms jitter queue: with sync=false, network jitter
-    //   went straight to the DAC as underruns (pops/crackle). The queue
-    //   absorbs jitter at the cost of a little added latency.
+    // - sync=true + a jitter queue: with sync=false, network jitter went
+    //   straight to the DAC as underruns (pops/crackle). The queue absorbs
+    //   jitter at the cost of a little added latency.
+    // - min-threshold-time=160ms (2026-09-10, up from 80ms): root-caused
+    //   an intermittent mid-phrase audio cutoff complaint to network
+    //   contention -- confirmed on-device that a second device sharing
+    //   this panel's wired connection was degrading call audio, and the
+    //   cutoffs persisted even after removing that device, just less
+    //   often. 80ms of jitter buffer isn't enough headroom for this
+    //   panel's real-world network conditions; doubling it gives the
+    //   queue more room to absorb a stall before it underruns and audio
+    //   drops out, at the cost of ~80ms more one-way audio latency.
+    //   max-size-time doubled to match, so the larger threshold has
+    //   headroom within the queue's own cap. If cutoffs persist even at
+    //   160ms, that points more strongly at the network path itself
+    //   (switch/cabling) than at anything tunable in this pipeline.
     // - volume=1.0: analog gain belongs to the ALSA mixer (see
     //   set_alsa_voice_routing / boot-time tuning); attenuating in software
     //   here just burned headroom and resolution.
     static const char *playback_desc_aec =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! tee name=t ! "
-        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
+        "queue min-threshold-time=160000000 max-size-time=800000000 ! "
         "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000 "
         "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe name=syncn_echoprobe ! fakesink sync=false async=false";
     static const char *playback_desc_plain =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! "
-        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
+        "queue min-threshold-time=160000000 max-size-time=800000000 ! "
         "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
 
     GError *error = NULL;
@@ -653,28 +666,18 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     // webrtcdsp tuning beyond the bare AEC/NS/AGC booleans:
     // - high-pass-filter strips DC offset and low-frequency rumble the wall
     //   mount picks up (matches Android's voice-processing chain).
-    // - noise-suppression-level=high (2026-09-10, retrying): `high` combined
-    //   with gain-control=true was confirmed on-device 2026-09-09 to make
-    //   call audio sound noisy and voice-cancelled -- reverted to `moderate`
-    //   at the time. gain-control has stayed `false` ever since (it was the
-    //   other half of that combination, suspected as the actual source of
-    //   the choppy/robotic artifact). Retrying `high` NOW, isolated as the
-    //   only change in this build: (1) gain-control is already off and has
-    //   been for weeks, removing the other half of the original bad
-    //   combination: (2) AEC is now independently confirmed via on-device
-    //   logging to be genuinely active during real calls (see
-    //   "capture pipeline confirmed PLAYING (aec=1)" in
-    //   syncn_intercom_debug_log output), ruling out "AEC silently failed"
-    //   as a confound; (3) real call-audio spectrograms captured via
-    //   SYNCN_INTERCOM_AUDIO_RAW_CAPTURE on 2026-09-10 show a persistent
-    //   broadband noise floor across 0-4kHz on both directions (worse on
-    //   uplink/mic than downlink), a textbook case for MORE noise
-    //   suppression, not less -- moderate is evidently not aggressive
-    //   enough for this panel's acoustic environment. If `high` reproduces
-    //   the 2026-09-09 stripped/distorted-speech symptom even with AGC off,
-    //   revert to `moderate` and treat that as confirming NS itself (not
-    //   AGC) was always the real cause -- do not re-attempt `high` a third
-    //   time without changing something else first.
+    // - noise-suppression-level=moderate (reverted 2026-09-10): retried
+    //   `high` isolated from the earlier failed gain-control=true
+    //   combination (see git history) and confirmed on-device it made
+    //   ZERO audible difference from `moderate` -- ruling out NS level
+    //   entirely as a lever for the "noisy/unclear" complaint. The real
+    //   cause was found the same day: a second device sharing this
+    //   panel's wired network connection was degrading call audio quality
+    //   (confirmed by the complaint clearing after disconnecting it);
+    //   remaining intermittent mid-phrase audio cutoffs after that are
+    //   being addressed via the playback jitter queue size below, not NS.
+    //   Reverted to `moderate` since `high` provided no benefit to justify
+    //   the config drift from the long-verified default.
     // - extended-filter=true: longer echo tail coverage; speaker and mic sit
     //   centimeters apart in the same enclosure, so the echo path is strong.
     // - echo-cancel=true (reverted 2026-09-10): tried disabling AEC for
@@ -695,7 +698,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
         "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=false "
-        "high-pass-filter=true noise-suppression-level=high extended-filter=true ! "
+        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
         "volume name=capvol ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
     static const char *capture_desc_plain =
