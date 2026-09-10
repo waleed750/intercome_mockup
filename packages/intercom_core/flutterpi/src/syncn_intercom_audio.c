@@ -653,16 +653,28 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     // webrtcdsp tuning beyond the bare AEC/NS/AGC booleans:
     // - high-pass-filter strips DC offset and low-frequency rumble the wall
     //   mount picks up (matches Android's voice-processing chain).
-    // - noise-suppression-level=moderate: `high` combined with gain-control
-    //   was confirmed on-device 2026-09-09 to make call audio sound noisy
-    //   and voice-cancelled even at low playback volume -- `high` NS is
-    //   tuned for a noisy room, but on this 8kHz A-law call path it was
-    //   stripping/distorting speech itself, not just background noise, and
-    //   the effect was independent of volume since it happens upstream of
-    //   any gain change (matches the reported symptom exactly). gain-control
-    //   (AGC) is dropped too -- AGC's automatic level-chasing was compounding
-    //   with aggressive NS as the more likely source of the choppy/robotic
-    //   artifact than either alone.
+    // - noise-suppression-level=high (2026-09-10, retrying): `high` combined
+    //   with gain-control=true was confirmed on-device 2026-09-09 to make
+    //   call audio sound noisy and voice-cancelled -- reverted to `moderate`
+    //   at the time. gain-control has stayed `false` ever since (it was the
+    //   other half of that combination, suspected as the actual source of
+    //   the choppy/robotic artifact). Retrying `high` NOW, isolated as the
+    //   only change in this build: (1) gain-control is already off and has
+    //   been for weeks, removing the other half of the original bad
+    //   combination: (2) AEC is now independently confirmed via on-device
+    //   logging to be genuinely active during real calls (see
+    //   "capture pipeline confirmed PLAYING (aec=1)" in
+    //   syncn_intercom_debug_log output), ruling out "AEC silently failed"
+    //   as a confound; (3) real call-audio spectrograms captured via
+    //   SYNCN_INTERCOM_AUDIO_RAW_CAPTURE on 2026-09-10 show a persistent
+    //   broadband noise floor across 0-4kHz on both directions (worse on
+    //   uplink/mic than downlink), a textbook case for MORE noise
+    //   suppression, not less -- moderate is evidently not aggressive
+    //   enough for this panel's acoustic environment. If `high` reproduces
+    //   the 2026-09-09 stripped/distorted-speech symptom even with AGC off,
+    //   revert to `moderate` and treat that as confirming NS itself (not
+    //   AGC) was always the real cause -- do not re-attempt `high` a third
+    //   time without changing something else first.
     // - extended-filter=true: longer echo tail coverage; speaker and mic sit
     //   centimeters apart in the same enclosure, so the echo path is strong.
     // - echo-cancel=true (reverted 2026-09-10): tried disabling AEC for
@@ -683,7 +695,7 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
         "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=false "
-        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
+        "high-pass-filter=true noise-suppression-level=high extended-filter=true ! "
         "volume name=capvol ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
     static const char *capture_desc_plain =
