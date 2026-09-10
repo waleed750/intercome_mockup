@@ -73,6 +73,7 @@
 #include "syncn_intercom_audio.h"
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -112,6 +113,64 @@ static bool diag_mode_enabled(void) {
 // 30-buffer cutoff.
 #define SYNCN_DIAG_MAX_BUFFERS 1000
 #define SYNCN_DIAG_LOG_EVERY_N 10
+
+// Raw call-audio capture (2026-09-10): opt-in dump of the actual A-law
+// bytes flowing through a real call, in both directions, to disk --
+// added after an extended on-device investigation into a "noisy/voice-
+// cancelled" call-audio complaint that never reproduced in isolated
+// single-ended testing (a local mic recording sounded clean every time)
+// and was unaffected by toggling AEC/NS/gain settings, suggesting the
+// live audio itself needed to be inspected directly rather than judged
+// by ear or inferred from settings changes. Separate from
+// SYNCN_INTERCOM_AUDIO_DIAG (verbose per-buffer *logging*, rate-limited
+// and bounded) -- this instead writes the *actual bytes* so they can be
+// pulled off-device and inspected (played back, viewed in a
+// spectrogram, decoded from A-law and compared numerically) after a
+// real call. Gated behind its own env var so it never runs by default;
+// bounded to the same ~20s/1000-frame window as diag mode so it can't
+// grow unbounded on a long call. Files are raw A-law bytes with no
+// header (not a .wav) -- any tool decoding A-law (e.g. `sox -t al -r
+// 8000 -c 1 in.al out.wav`) can convert them for playback/analysis.
+static int g_raw_capture_enabled = -1;
+static bool raw_capture_enabled(void) {
+    if (g_raw_capture_enabled < 0) {
+        const char *v = getenv("SYNCN_INTERCOM_AUDIO_RAW_CAPTURE");
+        g_raw_capture_enabled = (v != NULL && strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    return g_raw_capture_enabled == 1;
+}
+
+#define SYNCN_RAW_CAPTURE_DIR "/var/log/syncn-panel"
+#define SYNCN_RAW_CAPTURE_UPLINK_PATH SYNCN_RAW_CAPTURE_DIR "/syncn_call_audio_uplink.al"
+#define SYNCN_RAW_CAPTURE_DOWNLINK_PATH SYNCN_RAW_CAPTURE_DIR "/syncn_call_audio_downlink.al"
+
+// Lazily opened on first write per pipeline start, truncating any
+// previous capture -- these are debug artifacts meant to be pulled
+// after ONE test call, not accumulated across calls/restarts.
+static FILE *g_raw_capture_uplink_file = NULL;
+static FILE *g_raw_capture_downlink_file = NULL;
+
+static void raw_capture_write(FILE **file_slot, const char *path, const uint8_t *data, size_t size) {
+    if (*file_slot == NULL) {
+        *file_slot = fopen(path, "wb");
+        if (*file_slot == NULL) {
+            return;
+        }
+    }
+    fwrite(data, 1, size, *file_slot);
+    fflush(*file_slot);
+}
+
+static void raw_capture_close_all(void) {
+    if (g_raw_capture_uplink_file != NULL) {
+        fclose(g_raw_capture_uplink_file);
+        g_raw_capture_uplink_file = NULL;
+    }
+    if (g_raw_capture_downlink_file != NULL) {
+        fclose(g_raw_capture_downlink_file);
+        g_raw_capture_downlink_file = NULL;
+    }
+}
 
 // Cheap, decode-free A-law-domain buffer summary: min/max byte value and
 // count of distinct byte values seen (capped at 256, obviously, but we
@@ -218,6 +277,10 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
     bool should_log = count <= 30;
     bool diag_log = !should_log && diag_mode_enabled() && count <= SYNCN_DIAG_MAX_BUFFERS &&
         (count % SYNCN_DIAG_LOG_EVERY_N == 0);
+
+    if (raw_capture_enabled() && count <= SYNCN_DIAG_MAX_BUFFERS && map.size > 0) {
+        raw_capture_write(&g_raw_capture_uplink_file, SYNCN_RAW_CAPTURE_UPLINK_PATH, map.data, map.size);
+    }
 
     if (should_log) {
         syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: listening=%d, size=%zu", count, listening, map.size);
@@ -442,6 +505,11 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     self->headset_mode = headset_mode;
     self->playback_count = 0;
     self->capture_count = 0;
+    if (raw_capture_enabled()) {
+        // Fresh files per pipeline start -- these are meant to capture ONE
+        // test call, not accumulate across repeated start/stop cycles.
+        raw_capture_close_all();
+    }
 
     if (!gst_is_initialized()) {
         GError *error = NULL;
@@ -750,6 +818,9 @@ static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_
     // change).
     bool diag_log = !should_log && diag_mode_enabled() && count <= SYNCN_DIAG_MAX_BUFFERS &&
         (count % SYNCN_DIAG_LOG_EVERY_N == 0);
+    if (raw_capture_enabled() && count <= SYNCN_DIAG_MAX_BUFFERS && size > 0) {
+        raw_capture_write(&g_raw_capture_downlink_file, SYNCN_RAW_CAPTURE_DOWNLINK_PATH, data, size);
+    }
     if (self->running && self->playback_appsrc != NULL && size > 0) {
         GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
         gst_buffer_fill(buffer, 0, data, size);
