@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..3f6947f
+index 0000000..32feb15
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1140 @@
+@@ -0,0 +1,1152 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -614,6 +614,18 @@ index 0000000..3f6947f
 +    //   real latency cost.
 +    //   max-size-time scaled to match, so the larger threshold has
 +    //   headroom within the queue's own cap.
++    // - alsasink buffer-time=500ms (2026-09-10, up from 200ms, unchanged
++    //   since this pipeline's early history): found a real mismatch while
++    //   investigating the persistent long-phrase cutoff -- the GStreamer
++    //   jitter queue above was raised to a 300ms min-threshold-time, but
++    //   the ALSA hardware ring buffer underneath it (buffer-time) was
++    //   still only 200ms, meaning the queue could be holding more audio
++    //   than the hardware sink even has room to buffer. Raised buffer-
++    //   time to comfortably exceed the queue's threshold so this isn't a
++    //   second, uncoordinated bottleneck. latency-time (ALSA period size)
++    //   left at 20ms -- that controls interrupt/wakeup granularity within
++    //   the buffer, not overall capacity, and hasn't been implicated by
++    //   anything found so far.
 +    // - volume=1.0: analog gain belongs to the ALSA mixer (see
 +    //   set_alsa_voice_routing / boot-time tuning); attenuating in software
 +    //   here just burned headroom and resolution.
@@ -621,13 +633,13 @@ index 0000000..3f6947f
 +        "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
 +        "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! tee name=t ! "
 +        "queue min-threshold-time=300000000 max-size-time=1200000000 ! "
-+        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000 "
++        "alsasink device=plughw:0,0 sync=true buffer-time=500000 latency-time=20000 "
 +        "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe name=syncn_echoprobe ! fakesink sync=false async=false";
 +    static const char *playback_desc_plain =
 +        "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
 +        "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! "
 +        "queue min-threshold-time=300000000 max-size-time=1200000000 ! "
-+        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
++        "alsasink device=plughw:0,0 sync=true buffer-time=500000 latency-time=20000";
 +
 +    GError *error = NULL;
 +    GstElement *playback = gst_parse_launch(aec_available ? playback_desc_aec : playback_desc_plain, &error);
