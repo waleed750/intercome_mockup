@@ -808,6 +808,25 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
                 if (dsp != NULL) {
                     g_object_set(dsp, "probe", "syncn_echoprobe", NULL);
                     syncn_intercom_debug_log("audio", "start_locked: set webrtcdsp probe -> syncn_echoprobe (AEC engaged)");
+                    // SYNCN_INTERCOM_AUDIO_ECHO_CANCEL_OVERRIDE (2026-09-10,
+                    // diagnostic): lets echo-cancel be flipped at runtime
+                    // without a rebuild, e.g. "0" to disable it. A prior
+                    // isolated AEC-off attempt was confirmed worse and
+                    // reverted, but that build predated this same day's
+                    // real fixes for the persistent mid-phrase cutoff (ALSA
+                    // buffer-time/jitter-queue mismatch, capture/playback
+                    // lock contention, audio/video frame-dispatch blocking
+                    // in Dart) -- this override lets AEC-off be retried
+                    // cleanly, isolated from those now-fixed confounds,
+                    // without another build/patch-regen cycle. Falls back
+                    // to the pipeline's own echo-cancel=true default (set
+                    // in the gst_parse_launch string above) if unset.
+                    const char *echo_cancel_override = getenv("SYNCN_INTERCOM_AUDIO_ECHO_CANCEL_OVERRIDE");
+                    if (echo_cancel_override != NULL) {
+                        gboolean echo_cancel = strcmp(echo_cancel_override, "0") != 0;
+                        g_object_set(dsp, "echo-cancel", echo_cancel, NULL);
+                        syncn_intercom_debug_log("audio", "start_locked: echo-cancel overridden to %d", echo_cancel);
+                    }
                     gst_object_unref(dsp);
                 } else {
                     LOG_ERROR("syncn_intercom_audio: webrtcdsp element not found in AEC capture pipeline\n");
