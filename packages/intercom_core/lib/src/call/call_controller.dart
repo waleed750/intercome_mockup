@@ -589,8 +589,30 @@ final class CallController extends ChangeNotifier {
             return;
           }
           _videoSubmitsInFlight++;
+          // Deferred via Future(...) / Timer.run (2026-09-10):
+          // MethodChannel.invokeMethod() synchronously encodes its
+          // payload into a binary platform message before it can even
+          // return a Future -- for a video NAL (several KB, much larger
+          // than a 160-byte audio frame), that encoding is real, non-
+          // trivial CPU work running to completion on this isolate
+          // before control returns to FrameParser._drain()'s loop. Since
+          // _drain() calls _onFrame synchronously for every complete
+          // frame already sitting in one TCP read's buffer, a video
+          // frame's encoding cost was still able to delay whichever
+          // frame -- audio included -- was queued right behind it in
+          // that same batch, even with submit() itself already
+          // unawaited (a Future being unawaited doesn't change when its
+          // synchronous prefix runs). Wrapping the call in Future(...)
+          // schedules it via Timer.run, which lets _drain()'s loop fully
+          // finish dispatching every already-buffered frame in the
+          // current batch (audio frames behind this one included) before
+          // this video frame's encode/send cost runs at all. Nothing
+          // about video's own submission logic, decoding, or
+          // backpressure accounting changes -- only when the encode/send
+          // happens relative to sibling frames in the same batch.
           unawaited(
-            _video.submit(payload).whenComplete(() => _videoSubmitsInFlight--),
+            Future(() => _video.submit(payload))
+                .whenComplete(() => _videoSubmitsInFlight--),
           );
           if (!_state.hasVideoFrames) {
             debugPrint(
