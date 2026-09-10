@@ -601,8 +601,31 @@ final class CallController extends ChangeNotifier {
         }
       case Channel.audio:
         _audioFramesReceived++;
+        // Fire-and-forget (2026-09-10), matching the video case above.
+        // _onFrame is invoked synchronously, in wire order, from the
+        // socket's single raw byte stream (see the class-level comment
+        // on _videoSubmitsInFlight for the full mechanism and its
+        // on-device-confirmed evidence: native-side latency stayed flat
+        // while user-visible delay grew, proving stalls happen in this
+        // Dart-side dispatch gap, before data ever reaches native).
+        // This was previously `await _audio.playDownlink(payload)`,
+        // making audio the only channel that still blocked the shared
+        // frame-dispatch loop on a platform-channel round trip -- a
+        // slow/backed-up native audio call, or simply queuing behind a
+        // video frame's own synchronous handling just before it, directly
+        // delayed every subsequent frame of every kind, video included.
+        // Root-caused this same day to a persistent long-phrase audio
+        // cutoff that survived extensive native-side tuning (jitter
+        // buffer, ALSA buffer-time, lock contention, AEC, gain, NS
+        // level) -- none of which could have fixed a stall happening
+        // before the data ever left Dart. No backpressure counter here
+        // (unlike video's _maxVideoSubmitsInFlight): audio frames arrive
+        // at a fixed 20ms cadence from the door and playDownlink() is a
+        // fast, non-blocking GStreamer push-buffer call on the native
+        // side, so unlike video decode there's no real risk of native
+        // calls piling up faster than they drain.
         if (_state.phase == CallPhase.connected) {
-          await _audio.playDownlink(payload);
+          unawaited(_audio.playDownlink(payload));
         }
     }
   }
