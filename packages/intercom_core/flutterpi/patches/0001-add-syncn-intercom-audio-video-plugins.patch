@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..1bbe013
+index 0000000..3f6947f
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1127 @@
+@@ -0,0 +1,1140 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -904,28 +904,42 @@ index 0000000..1bbe013
 +}
 +
 +static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_t *data, size_t size) {
++    // Narrowed lock scope (2026-09-10): this used to hold self->lock for
++    // the entire function body, including the GStreamer push-buffer call
++    // and all logging -- the SAME lock on_new_capture_sample (the mic
++    // callback) also takes on every single captured buffer. With a real
++    // two-way call (mic unmuted, both directions genuinely active),
++    // capture-side lock contention could directly delay downlink audio
++    // delivery here, since this function could not proceed until the
++    // capture callback released the lock. Confirmed on-device 2026-09-10:
++    // muting the mic (which does not stop capture, only silences its
++    // output -- see handle_set_muted -- so capture callbacks and this
++    // lock contention continued regardless) made playback audio
++    // consistently clear, while unmuting caused audible cuts on longer
++    // continuous speech -- consistent with lock contention scaling with
++    // how much real capture activity was happening. Only the shared
++    // self->running / self->playback_appsrc read needs the lock; the
++    // actual push-buffer call and all logging below do not touch shared
++    // state and are moved outside the critical section.
 +    pthread_mutex_lock(&self->lock);
 +    self->playback_count++;
 +    int count = self->playback_count;
++    bool running = self->running;
++    GstElement *playback_appsrc = self->playback_appsrc;
++    pthread_mutex_unlock(&self->lock);
++
 +    bool should_log = count <= 30;
-+    // See "Diagnostic mode" file header comment. Computed under the same
-+    // lock the original should_log logging already runs under (this
-+    // function already does real work -- push-buffer -- while holding
-+    // self->lock, so the diagnostic path adds CPU-only stat computation on
-+    // top of an existing pattern rather than a new kind of lock-held cost;
-+    // the actual blocking file I/O in syncn_intercom_debug_log was already
-+    // happening inside this lock for the first 30 buffers before this
-+    // change).
++    // See "Diagnostic mode" file header comment.
 +    bool diag_log = !should_log && diag_mode_enabled() && count <= SYNCN_DIAG_MAX_BUFFERS &&
 +        (count % SYNCN_DIAG_LOG_EVERY_N == 0);
 +    if (raw_capture_enabled() && count <= SYNCN_DIAG_MAX_BUFFERS && size > 0) {
 +        raw_capture_write(&g_raw_capture_downlink_file, SYNCN_RAW_CAPTURE_DOWNLINK_PATH, data, size);
 +    }
-+    if (self->running && self->playback_appsrc != NULL && size > 0) {
++    if (running && playback_appsrc != NULL && size > 0) {
 +        GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
 +        gst_buffer_fill(buffer, 0, data, size);
 +        GstFlowReturn ret;
-+        g_signal_emit_by_name(self->playback_appsrc, "push-buffer", buffer, &ret);
++        g_signal_emit_by_name(playback_appsrc, "push-buffer", buffer, &ret);
 +        gst_buffer_unref(buffer);
 +        if (should_log) {
 +            // Diagnostic only (2026-08-25): logs whether the raw A-law bytes
@@ -963,8 +977,8 @@ index 0000000..1bbe013
 +            "audio",
 +            "handle_play_downlink #%d: DROPPED (running=%d, playback_appsrc=%p, size=%zu)",
 +            count,
-+            self->running,
-+            (void *) self->playback_appsrc,
++            running,
++            (void *) playback_appsrc,
 +            size
 +        );
 +    } else if (diag_log) {
@@ -972,12 +986,11 @@ index 0000000..1bbe013
 +            "audio-diag",
 +            "handle_play_downlink #%d: DROPPED (running=%d, playback_appsrc=%p, size=%zu)",
 +            count,
-+            self->running,
-+            (void *) self->playback_appsrc,
++            running,
++            (void *) playback_appsrc,
 +            size
 +        );
 +    }
-+    pthread_mutex_unlock(&self->lock);
 +}
 +
 +static void handle_set_muted(struct syncn_intercom_audio *self, bool muted) {
