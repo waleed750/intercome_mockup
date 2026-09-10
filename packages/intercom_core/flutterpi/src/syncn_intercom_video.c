@@ -673,8 +673,23 @@ static bool teardown_pipeline_unlocked(struct syncn_intercom_video *self, GstEle
 // meaningful downscaling. Cap the target hard, independent of screen size,
 // so no panel can end up requesting a full-resolution decode+shader pass
 // for what is, in every real call UI on this app, a small preview tile.
-#define SYNCN_INTERCOM_VIDEO_MAX_DECODE_W 640
-#define SYNCN_INTERCOM_VIDEO_MAX_DECODE_H 480
+//
+// Lowered from 640x480 (2026-09-10): confirmed on-device that even at
+// 640x360 (this panel's actual clamped output at the old cap, per
+// compute_decode_target's aspect-preserving math), starting an intercom
+// preview drove RSS from ~150MB to 1.3GB+ within ~2 minutes, unbounded,
+// until the process was killed -- matches this same file's own prior
+// (2026-08-24) finding that "decode genuinely cannot sustain the
+// incoming rate in real time" on this hardware. Trying a meaningfully
+// smaller decode target as the first, cheapest mitigation before
+// touching queue-bounding or pipeline-ownership logic (see
+// docs/power-button-freeze-fix-plan.md and the intercom video leak plan
+// discussed the same night) -- if mppvideodec's leak is proportional to
+// decode load/backlog, less work per frame should directly reduce or
+// eliminate it. NOT YET VERIFIED at this new value -- needs the same
+// on-device RSS-climb test repeated against it.
+#define SYNCN_INTERCOM_VIDEO_MAX_DECODE_W 480
+#define SYNCN_INTERCOM_VIDEO_MAX_DECODE_H 360
 
 static void compute_decode_target(int screen_w, int screen_h, int *out_w, int *out_h) {
     const int src_w = 1280, src_h = 720;

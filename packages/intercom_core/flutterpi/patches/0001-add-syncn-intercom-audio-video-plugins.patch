@@ -1201,10 +1201,10 @@ index 0000000..5a502d7
 +#endif  // _SYNCN_INTERCOM_GST_UTIL_H
 diff --git a/src/plugins/syncn_intercom_video.c b/src/plugins/syncn_intercom_video.c
 new file mode 100644
-index 0000000..dc7ddeb
+index 0000000..1c24eea
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_video.c
-@@ -0,0 +1,1073 @@
+@@ -0,0 +1,1088 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of the "syncn_intercom/video" MethodChannel.
@@ -1880,8 +1880,23 @@ index 0000000..dc7ddeb
 +// meaningful downscaling. Cap the target hard, independent of screen size,
 +// so no panel can end up requesting a full-resolution decode+shader pass
 +// for what is, in every real call UI on this app, a small preview tile.
-+#define SYNCN_INTERCOM_VIDEO_MAX_DECODE_W 640
-+#define SYNCN_INTERCOM_VIDEO_MAX_DECODE_H 480
++//
++// Lowered from 640x480 (2026-09-10): confirmed on-device that even at
++// 640x360 (this panel's actual clamped output at the old cap, per
++// compute_decode_target's aspect-preserving math), starting an intercom
++// preview drove RSS from ~150MB to 1.3GB+ within ~2 minutes, unbounded,
++// until the process was killed -- matches this same file's own prior
++// (2026-08-24) finding that "decode genuinely cannot sustain the
++// incoming rate in real time" on this hardware. Trying a meaningfully
++// smaller decode target as the first, cheapest mitigation before
++// touching queue-bounding or pipeline-ownership logic (see
++// docs/power-button-freeze-fix-plan.md and the intercom video leak plan
++// discussed the same night) -- if mppvideodec's leak is proportional to
++// decode load/backlog, less work per frame should directly reduce or
++// eliminate it. NOT YET VERIFIED at this new value -- needs the same
++// on-device RSS-climb test repeated against it.
++#define SYNCN_INTERCOM_VIDEO_MAX_DECODE_W 480
++#define SYNCN_INTERCOM_VIDEO_MAX_DECODE_H 360
 +
 +static void compute_decode_target(int screen_w, int screen_h, int *out_w, int *out_h) {
 +    const int src_w = 1280, src_h = 720;
