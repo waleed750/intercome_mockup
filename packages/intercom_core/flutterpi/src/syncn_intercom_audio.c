@@ -784,6 +784,21 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
                 capture = NULL;
                 capture_appsink = NULL;
                 capture_volume = NULL;
+            } else {
+                // Explicit success confirmation, added 2026-09-10 alongside
+                // the raw-capture feature: the "AEC engaged" log above only
+                // means the probe property was SET, not that the pipeline
+                // actually reached PLAYING with it -- this line is the one
+                // to grep for to know for certain, from a single real call,
+                // whether AEC genuinely stayed active (aec=1 here) or this
+                // attempt silently fell through to attempt 2's plain
+                // capture (aec=0 here, from the retry loop's second pass).
+                syncn_intercom_debug_log(
+                    "audio",
+                    "start_locked: capture pipeline confirmed PLAYING (aec=%d)%s",
+                    use_aec,
+                    use_aec ? " -- AEC genuinely active for this call" : " -- AEC NOT active for this call"
+                );
             }
         }
         if (capture == NULL) {
