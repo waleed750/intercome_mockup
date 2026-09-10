@@ -30,6 +30,7 @@
 #include "syncn_intercom_video.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -921,7 +922,30 @@ static int64_t handle_start(struct syncn_intercom_video *self, int screen_w, int
     return id;
 }
 
+// Diagnostic-only CPU isolation test (2026-09-10): SYNCN_INTERCOM_VIDEO_DISABLE=1
+// drops every incoming NAL here before it reaches the decode pipeline, so
+// video decode/GL-render CPU cost is removed from flutter-pi entirely while
+// the call's control/audio/network path stays untouched. Added to test
+// whether flutter-pi's confirmed-sustained ~140% CPU usage during a real
+// call (video decode + Mali GPU render + Flutter UI + audio DSP all sharing
+// one process) is starving the audio pipeline's timing and causing the
+// intermittent mid-phrase cutoffs reported the same day. Off by default,
+// same opt-in pattern as SYNCN_INTERCOM_AUDIO_DIAG / _RAW_CAPTURE. This is a
+// blunt diagnostic tool, not a real fix -- a production build cannot ship
+// with video permanently disabled.
+static int g_video_disabled = -1;
+static bool video_disabled(void) {
+    if (g_video_disabled < 0) {
+        const char *v = getenv("SYNCN_INTERCOM_VIDEO_DISABLE");
+        g_video_disabled = (v != NULL && strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    return g_video_disabled == 1;
+}
+
 static void handle_submit(struct syncn_intercom_video *self, const uint8_t *data, size_t size) {
+    if (video_disabled()) {
+        return;
+    }
     pthread_mutex_lock(&self->lock);
     self->submit_count++;
     // See the same fix/rationale on frame_count's should_log in
