@@ -615,31 +615,8 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
             // 2.5 (confirmed on-device 2026-09-09) made call audio noisy --
             // amplifying an 8kHz A-law stream's quantization/noise floor
             // right along with the voice. 1.5 is a more moderate boost.
-            //
-            // SYNCN_INTERCOM_AUDIO_PLAYVOL_OVERRIDE (2026-09-10, diagnostic):
-            // lets an on-device test pass a different value without a
-            // rebuild, e.g. "1.0" to test whether this boost itself is the
-            // source of remaining audio quality complaints on this panel
-            // specifically -- every other tested variable (AEC, NS level,
-            // capture gain, CPU/video load, uplink traffic, ALSA hw
-            // underruns) has been ruled out as of this date, and this
-            // boost is the one confirmed software difference unique to
-            // PANEL_WIDTH=800 left untested. Falls back to the verified
-            // 1.5 default if unset or unparseable. Remove this override
-            // once a final value is confirmed and hardcode it instead --
-            // this is meant to unblock one round of on-device A/B, not to
-            // become a permanent runtime knob.
-            double playvol_gain = 1.5;
-            const char *playvol_override = getenv("SYNCN_INTERCOM_AUDIO_PLAYVOL_OVERRIDE");
-            if (playvol_override != NULL) {
-                char *endptr = NULL;
-                double parsed = strtod(playvol_override, &endptr);
-                if (endptr != playvol_override && parsed > 0.0) {
-                    playvol_gain = parsed;
-                }
-            }
-            g_object_set(playback_volume_elem, "volume", playvol_gain, NULL);
-            syncn_intercom_debug_log("audio", "start_locked: boosted playvol gain to %.2f for PANEL_WIDTH=800", playvol_gain);
+            g_object_set(playback_volume_elem, "volume", 1.5, NULL);
+            syncn_intercom_debug_log("audio", "start_locked: boosted playvol gain to 1.5 for PANEL_WIDTH=800");
         }
         gst_object_unref(playback_volume_elem);
     }
