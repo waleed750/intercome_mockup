@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..c841831
+index 0000000..d15a47f
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1171 @@
+@@ -0,0 +1,1203 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -776,17 +776,49 @@ index 0000000..c841831
 +    //   behavior. Do not re-attempt disabling AEC without isolating it
 +    //   from every other audio change in its own build AND testing on a
 +    //   real two-way call (not just a local recording) before shipping.
++    // - audiobuffersplit output-buffer-duration-fraction=1/50 (2026-09-10):
++    //   THE uplink frame-size fix. Without it, alawenc emits whatever
++    //   buffer size arrives from upstream -- and webrtcdsp internally
++    //   processes/emits 10ms chunks, so every uplink frame was 80 A-law
++    //   bytes (10ms) instead of the 160 bytes (20ms) the door's CC-channel
++    //   protocol expects. Confirmed on-device 2026-09-10 straight from the
++    //   debug log: "on_new_capture_sample #1: size=80" on our uplink
++    //   versus "handle_play_downlink #1: pushed 160 bytes" on the door's
++    //   downlink -- we were sending half-length frames at twice the rate
++    //   for this panel's entire history.
++    //
++    //   This exact element+property is lifted from the proven
++    //   packages/intercom/linux/audio_pipeline_handler.cc implementation on
++    //   `main`, whose own comment states it re-chunks into exact 20ms
++    //   buffers "so alawenc always emits exactly kAlawFrameBytes (160) per
++    //   buffer - matching the fixed-size reads AudioPipelineHandler.kt does
++    //   from AudioRecord, which the door's protocol (CC channel, 160
++    //   bytes/20ms) expects". That file's TODO(linux-aec) even specifies
++    //   webrtcdsp belongs "between audioresample and audiobuffersplit" --
++    //   which is exactly the ordering used here; the flutter-pi port added
++    //   webrtcdsp but never carried audiobuffersplit across, dropping the
++    //   framing guarantee.
++    //
++    //   Why this explains what nothing else could: every layer measured on
++    //   THIS panel tested clean (gap-free raw downlink capture, no ALSA
++    //   XRUN, steady 20ms native dispatch, and the cutoff surviving AEC
++    //   off, NS levels, capvol values, jitter-queue 80/160/300ms, ALSA
++    //   buffer-time 200/500ms, lock-scope narrowing and frame-dispatch
++    //   deferral). The defect was never in what we receive or render -- it
++    //   is in what we TRANSMIT, and the damage lands inside the door
++    //   station, which is why it only ever reproduces with the mic live and
++    //   why Tuya's own app is unaffected on this identical hardware.
 +    static const char *capture_desc_aec =
 +        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
 +        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
 +        "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=false "
 +        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
-+        "volume name=capvol ! alawenc ! "
++        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
 +        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 +    static const char *capture_desc_plain =
 +        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
 +        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-+        "volume name=capvol ! alawenc ! "
++        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
 +        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 +
 +    GstElement *capture = NULL;
