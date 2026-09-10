@@ -597,6 +597,30 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     //   artifact than either alone.
     // - extended-filter=true: longer echo tail coverage; speaker and mic sit
     //   centimeters apart in the same enclosure, so the echo path is strong.
+    // - echo-cancel (2026-09-10, PANEL_WIDTH=800 only): client A/B'd real
+    //   call audio on the 800x1280 panel against a plain arecord capture
+    //   (no webrtcdsp at all) and explicitly preferred the raw recording,
+    //   describing AEC-processed call audio as "unclean". Isolated
+    //   on-device tests confirmed this capture chain sounds clean with
+    //   noise-suppression=true and echo-cancel=false -- the complaint is
+    //   specific to real two-way AEC (i.e. with actual far-end audio for
+    //   webrtcdsp to act on), which no single-ended isolated test can
+    //   reproduce. Speaker and mic sit centimeters apart in the same
+    //   enclosure so some echo risk exists without AEC, but the client's
+    //   explicit preference for the cleaner, non-echo-cancelled sound
+    //   outweighs that here. Reported as specific to the 800x1280 panel,
+    //   so gated the same way as the playvol/capvol gain boosts below
+    //   rather than disabling AEC for every panel size -- other panels
+    //   keep AEC on until/unless the same complaint is confirmed there.
+    //   Do not flip this back to echo-cancel=true for PANEL_WIDTH=800
+    //   without a new real-call A/B confirming the client is fine with it.
+    static const char *capture_desc_aec_noecho =
+        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
+        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
+        "webrtcdsp name=dsp echo-cancel=false noise-suppression=true gain-control=false "
+        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
+        "volume name=capvol ! alawenc ! "
+        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
     static const char *capture_desc_aec =
         "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
@@ -610,6 +634,9 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         "volume name=capvol ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 
+    const char *panel_width_for_aec = getenv("PANEL_WIDTH");
+    bool disable_echo_cancel_800 = panel_width_for_aec != NULL && strcmp(panel_width_for_aec, "800") == 0;
+
     GstElement *capture = NULL;
     GstElement *capture_appsink = NULL;
     GstElement *capture_volume = NULL;
@@ -617,7 +644,10 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         for (int attempt = 0; attempt < 2 && capture == NULL; attempt++) {
             bool use_aec = aec_available && attempt == 0;
             error = NULL;
-            capture = gst_parse_launch(use_aec ? capture_desc_aec : capture_desc_plain, &error);
+            const char *capture_desc_to_use = !use_aec
+                ? capture_desc_plain
+                : (disable_echo_cancel_800 ? capture_desc_aec_noecho : capture_desc_aec);
+            capture = gst_parse_launch(capture_desc_to_use, &error);
             if (capture == NULL) {
                 LOG_ERROR(
                     "syncn_intercom_audio: failed to build capture pipeline (aec=%d): %s\n",
@@ -651,6 +681,21 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
             // hardware. Do not re-attempt a capvol gain boost without a
             // real on-device A/B of intermediate values (e.g. 1.2-1.4)
             // first.
+            //
+            // 2026-09-10: Attempting 1.2x gain (low end of the suggested
+            // range) for PANEL_WIDTH=800, same gating as playvol boost.
+            // The prior 1.8x attempt (2026-09-09) produced a loud whine/
+            // buzz -- amplifying the mic's electrical self-noise floor.
+            // 1.2x is a cautious first step; if whine/buzz reappears even
+            // at this level, revert to 1.0 immediately and update this
+            // comment with the new confirmed failure point.
+            if (capture_volume != NULL) {
+                const char *panel_width = getenv("PANEL_WIDTH");
+                if (panel_width != NULL && strcmp(panel_width, "800") == 0) {
+                    g_object_set(capture_volume, "volume", 1.2, NULL);
+                    syncn_intercom_debug_log("audio", "start_locked: boosted capvol gain to 1.2 for PANEL_WIDTH=800");
+                }
+            }
             // Hand the playback pipeline's echo probe to webrtcdsp via
             // g_object_set -- gst_parse_launch can't resolve cross-pipeline
             // element references (the `probe=` syntax only works within the
