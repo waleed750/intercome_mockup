@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..5aa207a
+index 0000000..8a781f5
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1087 @@
+@@ -0,0 +1,1102 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -844,6 +844,21 @@ index 0000000..5aa207a
 +                capture = NULL;
 +                capture_appsink = NULL;
 +                capture_volume = NULL;
++            } else {
++                // Explicit success confirmation, added 2026-09-10 alongside
++                // the raw-capture feature: the "AEC engaged" log above only
++                // means the probe property was SET, not that the pipeline
++                // actually reached PLAYING with it -- this line is the one
++                // to grep for to know for certain, from a single real call,
++                // whether AEC genuinely stayed active (aec=1 here) or this
++                // attempt silently fell through to attempt 2's plain
++                // capture (aec=0 here, from the retry loop's second pass).
++                syncn_intercom_debug_log(
++                    "audio",
++                    "start_locked: capture pipeline confirmed PLAYING (aec=%d)%s",
++                    use_aec,
++                    use_aec ? " -- AEC genuinely active for this call" : " -- AEC NOT active for this call"
++                );
 +            }
 +        }
 +        if (capture == NULL) {
