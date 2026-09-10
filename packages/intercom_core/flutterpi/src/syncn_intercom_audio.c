@@ -531,32 +531,42 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     // - sync=true + a jitter queue: with sync=false, network jitter went
     //   straight to the DAC as underruns (pops/crackle). The queue absorbs
     //   jitter at the cost of a little added latency.
-    // - min-threshold-time=160ms (2026-09-10, up from 80ms): root-caused
-    //   an intermittent mid-phrase audio cutoff complaint to network
-    //   contention -- confirmed on-device that a second device sharing
-    //   this panel's wired connection was degrading call audio, and the
-    //   cutoffs persisted even after removing that device, just less
-    //   often. 80ms of jitter buffer isn't enough headroom for this
-    //   panel's real-world network conditions; doubling it gives the
-    //   queue more room to absorb a stall before it underruns and audio
-    //   drops out, at the cost of ~80ms more one-way audio latency.
-    //   max-size-time doubled to match, so the larger threshold has
-    //   headroom within the queue's own cap. If cutoffs persist even at
-    //   160ms, that points more strongly at the network path itself
-    //   (switch/cabling) than at anything tunable in this pipeline.
+    // - min-threshold-time=300ms (2026-09-10, up from 160ms, originally
+    //   80ms): root-caused an intermittent mid-phrase audio cutoff
+    //   complaint to network contention -- confirmed on-device that a
+    //   second device sharing this panel's wired connection was
+    //   degrading call audio, and cutoffs on longer continuous phrases
+    //   persisted even after removing that device and after doubling the
+    //   buffer to 160ms, and after fixing a separate, more severe
+    //   mid-call TCP-reconnect bug (see
+    //   docs/opencode-intercom-call-drop-investigation.md in
+    //   syncn_smarthome_panel) that was NOT the cause of this specific
+    //   symptom. Pushed further to 300ms as a blunt trade of more
+    //   one-way audio latency (~300ms) for more absorption headroom
+    //   against whatever network stalls remain -- no new diagnostic
+    //   evidence pins down the exact stall duration causing this, so
+    //   this is a pragmatic step, not a measured fix. If cutoffs persist
+    //   even at 300ms, stop increasing this value further without first
+    //   measuring real per-packet arrival timing during a long phrase
+    //   (e.g. via SYNCN_INTERCOM_AUDIO_RAW_CAPTURE combined with network-
+    //   level packet capture) to find the actual stall duration --
+    //   guessing at ever-larger buffer sizes has diminishing returns and
+    //   real latency cost.
+    //   max-size-time scaled to match, so the larger threshold has
+    //   headroom within the queue's own cap.
     // - volume=1.0: analog gain belongs to the ALSA mixer (see
     //   set_alsa_voice_routing / boot-time tuning); attenuating in software
     //   here just burned headroom and resolution.
     static const char *playback_desc_aec =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! tee name=t ! "
-        "queue min-threshold-time=160000000 max-size-time=800000000 ! "
+        "queue min-threshold-time=300000000 max-size-time=1200000000 ! "
         "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000 "
         "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe name=syncn_echoprobe ! fakesink sync=false async=false";
     static const char *playback_desc_plain =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! "
-        "queue min-threshold-time=160000000 max-size-time=800000000 ! "
+        "queue min-threshold-time=300000000 max-size-time=1200000000 ! "
         "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
 
     GError *error = NULL;
