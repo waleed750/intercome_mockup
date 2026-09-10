@@ -105,6 +105,7 @@ final class CallConnection {
 
   void _notifyClosed() {
     if (_closed) return;
+    debugPrint('CallConnection: socket closed (remote=${socket.remoteAddress})');
     _closed = true;
     socket.destroy();
     onClosed();

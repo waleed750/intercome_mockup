@@ -121,6 +121,14 @@ final class CallController extends ChangeNotifier {
   int _videoSubmitsInFlight = 0;
   static const int _maxVideoSubmitsInFlight = 2;
 
+  // Grace period for transient TCP disconnects during an active call.
+  // When the socket drops while phase == connected, we wait this long for
+  // the door unit to reconnect before tearing down the call -- a brief
+  // network blip shouldn't instantly destroy call state.
+  static const Duration _reconnectTimeout = Duration(seconds: 5);
+  Timer? _reconnectDeadline;
+  bool _isReconnecting = false;
+
   // Remembered so _teardownCall can silently reconnect the preview after a
   // call ends, instead of leaving the screen fully idle. Only ever set by
   // startPreview() -- if a preview was never started (e.g. a cold incoming
@@ -222,6 +230,8 @@ final class CallController extends ChangeNotifier {
   }
 
   Future<void> shutdown() async {
+    _reconnectDeadline?.cancel();
+    _isReconnecting = false;
     await _teardownCall(
       showEnded: false,
       resumePreview: false,
@@ -510,20 +520,42 @@ final class CallController extends ChangeNotifier {
     _setState(_state.copyWith(headsetMode: headsetMode));
   }
 
+  void _onConnectionClosed() {
+    if (_state.phase == CallPhase.connected) {
+      debugPrint('Intercom: connection lost during call -- waiting ${_reconnectTimeout.inSeconds}s for reconnect');
+      _isReconnecting = true;
+      _reconnectDeadline?.cancel();
+      _reconnectDeadline = Timer(_reconnectTimeout, () {
+        if (!_isReconnecting) return;
+        debugPrint('Intercom: reconnect deadline expired -- tearing down call');
+        _isReconnecting = false;
+        _teardownCall(showEnded: true);
+      });
+      return;
+    }
+    _teardownCall(showEnded: _state.phase != CallPhase.previewing);
+  }
+
   void _onSocketAccepted(Socket socket) {
-    if (_connection != null &&
+    if (_isReconnecting) {
+      debugPrint('Intercom: reconnect accepted from ${socket.remoteAddress}');
+      _reconnectDeadline?.cancel();
+      _isReconnecting = false;
+    } else if (_connection != null &&
         _state.phase != CallPhase.idle &&
         _state.phase != CallPhase.ringing &&
         _state.phase != CallPhase.previewing) {
       socket.add(Commands.deviceBusy());
       socket.destroy();
       return;
+    } else {
+      _connection?.close();
     }
-    _connection?.close();
+
     final conn = CallConnection(
       socket: socket,
       onFrame: _onFrame,
-      onClosed: () => _teardownCall(showEnded: true),
+      onClosed: _onConnectionClosed,
     );
     _connection = conn;
     conn.start();
@@ -774,8 +806,11 @@ final class CallController extends ChangeNotifier {
     bool stopVideo = false,
     bool closeConnection = true,
   }) async {
+    if (_state.phase == CallPhase.idle) return;
     await incomingCallHandler.onCallDismissed();
     _stopUplinkFallbacks();
+    _reconnectDeadline?.cancel();
+    _isReconnecting = false;
     _statsTimer?.cancel();
     _statsTimer = null;
     _callStopwatch = null;
@@ -836,6 +871,7 @@ final class CallController extends ChangeNotifier {
   @override
   void dispose() {
     _transientTimer?.cancel();
+    _reconnectDeadline?.cancel();
     unawaited(shutdown());
     unawaited(incomingCallHandler.dispose());
     super.dispose();
