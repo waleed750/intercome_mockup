@@ -207,6 +207,109 @@ static struct syncn_alaw_buffer_stats syncn_alaw_stats(const uint8_t *data, size
     return stats;
 }
 
+// Half-duplex uplink suppression (2026-09-13).
+//
+// Why this exists: the far end hears themselves echoed whenever this panel's
+// mic is live, and that echo survives everything AEC can do to it. Confirmed
+// on-device across two builds -- toggling echo-cancel changed nothing, and
+// correcting the echo probe's placement (it had been on a dead-end tee stub,
+// so webrtcdsp was fed a ~0ms delay for an echo that returned hundreds of ms
+// later) did not stop it either.
+//
+// This codebase already recorded why, on a sibling panel sharing the same
+// rk809/rk817 codec (see _hardwareMicAvailable in call_controller.dart): the
+// capture path picks up "electrical crosstalk from the speaker/DAC on the
+// shared audio codec rather than real acoustic sound, which AEC (built for
+// acoustic echo) did not meaningfully cancel". That was only noticed there
+// because the unit had no microphone at all. On a panel that does have one,
+// the same crosstalk simply blends into real mic audio and looks like a badly
+// tuned echo canceller. This panel additionally drives playvol at 1.5x (gated
+// to PANEL_WIDTH=800), which scales the DAC output -- and any crosstalk
+// riding on it -- accordingly.
+//
+// So: stop trying to cancel it, and stop transmitting it. While the far end
+// is speaking, replace the uplink payload with A-law silence. Frames keep
+// flowing at the same 20ms cadence -- the door gates its downlink on seeing
+// continuous CC frames, so going quiet is not an option -- they just carry
+// nothing to echo back.
+//
+// Trade-off, stated plainly: this makes the call half-duplex. The panel user
+// cannot talk over the far end, and the first moments of their reply may be
+// clipped. That is how most door intercoms behave, and it is what this door
+// appears to expect.
+//
+// Tunables, all overridable at runtime so this can be A/B'd without a rebuild:
+//   SYNCN_INTERCOM_AUDIO_HALF_DUPLEX=0   disable entirely (default: enabled)
+//   SYNCN_INTERCOM_AUDIO_HD_THRESHOLD=N  mean |amplitude| that counts as
+//                                        far-end speech (default 800; A-law
+//                                        digital silence decodes to ~8)
+//   SYNCN_INTERCOM_AUDIO_HD_HANGOVER=N   ms to keep suppressing after the
+//                                        far end stops (default 300)
+#define SYNCN_HD_DEFAULT_THRESHOLD 800
+#define SYNCN_HD_DEFAULT_HANGOVER_MS 300
+
+static int g_half_duplex_enabled = -1;
+static int g_hd_threshold = -1;
+static int g_hd_hangover_ms = -1;
+
+static int syncn_env_int(const char *name, int fallback) {
+    const char *v = getenv(name);
+    if (v == NULL) return fallback;
+    char *end = NULL;
+    long parsed = strtol(v, &end, 10);
+    if (end == v || parsed < 0 || parsed > 100000) return fallback;
+    return (int) parsed;
+}
+
+static bool half_duplex_enabled(void) {
+    if (g_half_duplex_enabled < 0) {
+        const char *v = getenv("SYNCN_INTERCOM_AUDIO_HALF_DUPLEX");
+        g_half_duplex_enabled = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+        g_hd_threshold = syncn_env_int("SYNCN_INTERCOM_AUDIO_HD_THRESHOLD", SYNCN_HD_DEFAULT_THRESHOLD);
+        g_hd_hangover_ms = syncn_env_int("SYNCN_INTERCOM_AUDIO_HD_HANGOVER", SYNCN_HD_DEFAULT_HANGOVER_MS);
+    }
+    return g_half_duplex_enabled == 1;
+}
+
+// Standard ITU-T G.711 A-law expansion. Only used to measure level, never to
+// re-encode -- alawdec downstream remains the single decoder of record for
+// anything that actually gets played.
+static inline int syncn_alaw_expand(uint8_t a) {
+    a ^= 0x55;
+    int sign = a & 0x80;
+    int exponent = (a & 0x70) >> 4;
+    int mantissa = a & 0x0F;
+    int sample = (exponent == 0) ? ((mantissa << 4) + 8)
+                                 : (((mantissa << 4) + 0x108) << (exponent - 1));
+    return sign ? -sample : sample;
+}
+
+// Mean absolute amplitude of an A-law payload, in linear PCM units.
+static int syncn_alaw_mean_level(const uint8_t *data, size_t size) {
+    if (size == 0) return 0;
+    int64_t total = 0;
+    for (size_t i = 0; i < size; i++) {
+        int s = syncn_alaw_expand(data[i]);
+        total += (s < 0) ? -s : s;
+    }
+    return (int) (total / (int64_t) size);
+}
+
+// Pre-built A-law digital silence, substituted for the real uplink payload
+// while the far end is speaking. Static so the capture callback never
+// allocates on its hot path.
+#define SYNCN_HD_SILENCE_MAX 512
+static uint8_t g_alaw_silence[SYNCN_HD_SILENCE_MAX];
+static bool g_alaw_silence_ready = false;
+
+static const uint8_t *syncn_alaw_silence(size_t size) {
+    if (!g_alaw_silence_ready) {
+        memset(g_alaw_silence, 0xD5, sizeof(g_alaw_silence));
+        g_alaw_silence_ready = true;
+    }
+    return (size <= SYNCN_HD_SILENCE_MAX) ? g_alaw_silence : NULL;
+}
+
 struct syncn_intercom_audio {
     struct flutterpi *flutterpi;
 
@@ -225,6 +328,16 @@ struct syncn_intercom_audio {
 
     int playback_count;
     int capture_count;
+
+    // Half-duplex uplink suppression state (2026-09-13). Written by
+    // handle_play_downlink on the platform thread, read by
+    // on_new_capture_sample on the GStreamer capture thread. A naturally
+    // aligned 64-bit scalar, so plain load/store is atomic on this board's
+    // aarch64 -- no lock is taken for it, deliberately: the capture
+    // callback must never block on the playback path (see the narrowed
+    // lock scope in handle_play_downlink for why that mattered), and a
+    // torn read here would at worst mis-gate a single 20ms frame.
+    volatile gint64 last_downlink_voice_us;
 };
 
 // Split into a quick locked "detach" part and a separately-called unlocked
@@ -294,16 +407,37 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
     }
 
     if (listening && map.size > 0) {
+        // Half-duplex gate: while the far end is speaking, transmit A-law
+        // silence instead of whatever the mic picked up. See the comment
+        // block on half_duplex_enabled() -- what the mic picks up during
+        // far-end speech is dominated by speaker/DAC crosstalk that AEC has
+        // repeatedly proven unable to remove, and sending it back is what
+        // makes the far end hear themselves. Frame cadence and size are
+        // unchanged (the door gates its downlink on continuous CC frames),
+        // only the payload is replaced.
+        const uint8_t *payload = map.data;
+        bool suppressed = false;
+        if (half_duplex_enabled()) {
+            gint64 since_us = g_get_monotonic_time() - self->last_downlink_voice_us;
+            if (since_us < (gint64) g_hd_hangover_ms * 1000) {
+                const uint8_t *silence = syncn_alaw_silence(map.size);
+                if (silence != NULL) {
+                    payload = silence;
+                    suppressed = true;
+                }
+            }
+        }
+
         struct std_value event = {
             .type = kStdUInt8Array,
             .size = map.size,
-            .uint8array = map.data,
+            .uint8array = (uint8_t *) payload,
         };
         int send_ret = platch_send_success_event_std(SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, &event);
         if (should_log) {
-            syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: platch_send_success_event_std -> %d", count, send_ret);
+            syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: platch_send_success_event_std -> %d, half_duplex_suppressed=%d", count, send_ret, suppressed);
         } else if (diag_log) {
-            syncn_intercom_debug_log("audio-diag", "on_new_capture_sample #%d: platch_send_success_event_std -> %d", count, send_ret);
+            syncn_intercom_debug_log("audio-diag", "on_new_capture_sample #%d: platch_send_success_event_std -> %d, half_duplex_suppressed=%d", count, send_ret, suppressed);
         }
     }
 
@@ -505,6 +639,9 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     self->headset_mode = headset_mode;
     self->playback_count = 0;
     self->capture_count = 0;
+    // Clear half-duplex state so a previous call's far-end speech can never
+    // suppress the opening moments of a new one.
+    self->last_downlink_voice_us = 0;
     if (raw_capture_enabled()) {
         // Fresh files per pipeline start -- these are meant to capture ONE
         // test call, not accumulate across repeated start/stop cycles.
@@ -983,6 +1120,16 @@ static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_
         (count % SYNCN_DIAG_LOG_EVERY_N == 0);
     if (raw_capture_enabled() && count <= SYNCN_DIAG_MAX_BUFFERS && size > 0) {
         raw_capture_write(&g_raw_capture_downlink_file, SYNCN_RAW_CAPTURE_DOWNLINK_PATH, data, size);
+    }
+
+    // Mark far-end speech for the half-duplex gate (see its comment block
+    // above). Measured on the encoded A-law payload, before it reaches the
+    // pipeline, so this is unaffected by anything downstream -- jitter
+    // queue, resampling or the ALSA buffer. Cheap: one table-free expand per
+    // byte over a 160-byte frame, outside the lock.
+    if (half_duplex_enabled() && size > 0 &&
+        syncn_alaw_mean_level(data, size) > g_hd_threshold) {
+        self->last_downlink_voice_us = g_get_monotonic_time();
     }
     if (running && playback_appsrc != NULL && size > 0) {
         GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
