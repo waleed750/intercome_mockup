@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..d15a47f
+index 0000000..0ab946e
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1203 @@
+@@ -0,0 +1,1249 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -629,17 +629,61 @@ index 0000000..d15a47f
 +    // - volume=1.0: analog gain belongs to the ALSA mixer (see
 +    //   set_alsa_voice_routing / boot-time tuning); attenuating in software
 +    //   here just burned headroom and resolution.
++    // - echo probe placement (2026-09-13): THE AEC fix. The probe used to
++    //   hang off a `tee` as a dead-end branch ending in
++    //   `fakesink sync=false async=false`, with the real playback path
++    //   (jitter queue -> alsasink) on the OTHER branch. That silently
++    //   disabled echo cancellation entirely, for a mechanical reason
++    //   straight out of gstwebrtcechoprobe.cpp: the probe learns the echo
++    //   delay by querying the latency DOWNSTREAM OF ITS OWN SRCPAD --
++    //
++    //       if (gst_pad_query (btrans->srcpad, query)) {
++    //         gst_query_parse_latency (query, NULL, &upstream_latency, NULL);
++    //       }
++    //       self->delay = upstream_latency / GST_MSECOND;
++    //
++    //   and that value is handed to the APM via apm->set_stream_delay_ms().
++    //   On a tee stub, everything downstream of the probe is just a
++    //   fakesink, so the query returned ~0ms -- the AEC was told the echo
++    //   returns almost immediately, while the real speaker output sat
++    //   behind the jitter queue plus the ALSA ring buffer. The filter
++    //   searched the wrong time window and cancelled nothing, which is
++    //   exactly the "far end hears himself" echo reported on-device, and
++    //   why toggling echo-cancel on/off changed nothing: it was inert
++    //   either way.
++    //
++    //   Upstream documents the correct topology plainly -- the probe goes
++    //   IN-LINE in the real playback path, never on a side branch:
++    //     far-end-src ! audio/x-raw,rate=48000 ! webrtcechoprobe ! pulsesink
++    //   In-line placement is what makes the latency query traverse the
++    //   genuine chain (queue + alsasink) and report a true delay.
++    //
++    //   Probe sits at 8kHz immediately after alawdec because upstream
++    //   requires the probe and the DSP to run at the SAME sample rate, and
++    //   the capture-side webrtcdsp is pinned to 8kHz. playvol is applied
++    //   BEFORE the probe so the reference the AEC sees carries the same
++    //   gain the speaker actually reproduces; resampling afterwards is
++    //   amplitude-neutral.
++    //
++    // - jitter queue / ALSA buffer reverted to 80ms / 200ms (2026-09-13):
++    //   these were inflated to 160ms then 300ms, and buffer-time 200ms ->
++    //   500ms, while chasing this same cutoff. None of it helped, and it
++    //   actively widened the echo path the AEC has to span (~280ms -> ~800ms).
++    //   Back to the long-standing values now that the probe is positioned
++    //   to report that delay honestly.
 +    static const char *playback_desc_aec =
 +        "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-+        "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! tee name=t ! "
-+        "queue min-threshold-time=300000000 max-size-time=1200000000 ! "
-+        "alsasink device=plughw:0,0 sync=true buffer-time=500000 latency-time=20000 "
-+        "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe name=syncn_echoprobe ! fakesink sync=false async=false";
++        "alawdec ! audioconvert ! audio/x-raw,rate=8000,channels=1 ! "
++        "volume name=playvol volume=1.0 ! "
++        "webrtcechoprobe name=syncn_echoprobe ! "
++        "audioconvert ! audioresample quality=10 ! "
++        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
++        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
 +    static const char *playback_desc_plain =
 +        "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
 +        "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! "
-+        "queue min-threshold-time=300000000 max-size-time=1200000000 ! "
-+        "alsasink device=plughw:0,0 sync=true buffer-time=500000 latency-time=20000";
++        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
++        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
 +
 +    GError *error = NULL;
 +    GstElement *playback = gst_parse_launch(aec_available ? playback_desc_aec : playback_desc_plain, &error);
@@ -705,9 +749,11 @@ index 0000000..d15a47f
 +
 +    if (playback_appsrc == NULL || !start_pipeline_with_retry("syncn_intercom_audio playback", playback, 3, 150)) {
 +        if (aec_available) {
-+            // The echo probe/tee branch is the one new failure mode here (e.g.
-+            // fakesink negotiation); retry once without it before giving up
-+            // entirely -- a call with no echo cancellation beats no call.
++            // The in-line echo probe is the one extra failure mode here (e.g.
++            // the probe refusing the 8kHz caps it is pinned to, or not being
++            // present at all on a panel image without gst-plugins-bad);
++            // retry once without it before giving up entirely -- a call with
++            // no echo cancellation beats no call.
 +            LOG_ERROR("syncn_intercom_audio: AEC playback pipeline failed to start, retrying without AEC\n");
 +            if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
 +            syncn_gst_bounded_teardown("audio-playback", playback, 3);
