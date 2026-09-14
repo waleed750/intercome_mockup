@@ -236,6 +236,7 @@ final class CallController extends ChangeNotifier {
       showEnded: false,
       resumePreview: false,
       stopVideo: true,
+      closeReason: 'controller shutdown',
     );
     await _discovery.stop();
     await _connectionProvider.stop();
@@ -361,7 +362,11 @@ final class CallController extends ChangeNotifier {
   Future<void> stopPreview() async {
     if (_state.phase != CallPhase.previewing) return;
     debugPrint('Intercom: stopping preview');
-    await _teardownCall(showEnded: false, resumePreview: false);
+    await _teardownCall(
+      showEnded: false,
+      resumePreview: false,
+      closeReason: 'preview stopped',
+    );
   }
 
   /// Upgrades a running preview to a full call: starts audio and sends
@@ -460,7 +465,7 @@ final class CallController extends ChangeNotifier {
     if (_state.phase == CallPhase.idle) return;
     await incomingCallHandler.onCallDismissed();
     _connection?.enqueue(Commands.hangUp());
-    await _teardownCall(showEnded: false);
+    await _teardownCall(showEnded: false, closeReason: 'user ended call');
   }
 
   Future<void> endCall() => decline();
@@ -529,7 +534,10 @@ final class CallController extends ChangeNotifier {
         if (!_isReconnecting) return;
         debugPrint('Intercom: reconnect deadline expired -- tearing down call');
         _isReconnecting = false;
-        _teardownCall(showEnded: true);
+        _teardownCall(
+          showEnded: true,
+          closeReason: 'reconnect deadline expired',
+        );
       });
       return;
     }
@@ -549,7 +557,7 @@ final class CallController extends ChangeNotifier {
       socket.destroy();
       return;
     } else {
-      _connection?.close();
+      unawaited(_connection?.close(reason: 'replaced by accepted socket'));
     }
 
     final conn = CallConnection(
@@ -674,6 +682,7 @@ final class CallController extends ChangeNotifier {
             showEnded: false,
             resumePreview: false,
             closeConnection: false,
+            closeReason: 'preview replaced by incoming call',
           );
         }
         debugPrint('Intercom: incoming call from door');
@@ -710,7 +719,10 @@ final class CallController extends ChangeNotifier {
           }
         }
       case InboundCommand.hangUp:
-        await _teardownCall(showEnded: true);
+        await _teardownCall(
+          showEnded: true,
+          closeReason: 'door hang-up command',
+        );
       case InboundCommand.unknown:
         return;
     }
@@ -850,6 +862,7 @@ final class CallController extends ChangeNotifier {
     bool resumePreview = true,
     bool stopVideo = false,
     bool closeConnection = true,
+    String closeReason = 'call teardown',
   }) async {
     if (_state.phase == CallPhase.idle) return;
     await incomingCallHandler.onCallDismissed();
@@ -868,7 +881,7 @@ final class CallController extends ChangeNotifier {
     if (closeConnection) {
       final conn = _connection;
       _connection = null;
-      await conn?.close();
+      await conn?.close(reason: closeReason);
     }
     _setState(_state.copyWith(
       phase: CallPhase.idle,

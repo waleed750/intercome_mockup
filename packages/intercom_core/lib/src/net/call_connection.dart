@@ -54,8 +54,11 @@ final class CallConnection {
     return true;
   }
 
-  Future<void> close() async {
+  Future<void> close({String reason = 'unspecified'}) async {
     if (_closed) return;
+    debugPrint('CallConnection: local close requested '
+        '(reason=$reason remote=${socket.remoteAddress})');
+    debugPrintStack(stackTrace: StackTrace.current);
     _closed = true;
     await _subscription?.cancel();
     socket.destroy();
@@ -105,7 +108,9 @@ final class CallConnection {
 
   void _notifyClosed() {
     if (_closed) return;
-    debugPrint('CallConnection: socket closed (remote=${socket.remoteAddress})');
+    debugPrint('CallConnection: socket closed by peer/error '
+        '(remote=${socket.remoteAddress})');
+    debugPrintStack(stackTrace: StackTrace.current);
     _closed = true;
     socket.destroy();
     onClosed();
