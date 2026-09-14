@@ -817,9 +817,31 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         if (panel_width != NULL && strcmp(panel_width, "800") == 0) {
             // 2.5 (confirmed on-device 2026-09-09) made call audio noisy --
             // amplifying an 8kHz A-law stream's quantization/noise floor
-            // right along with the voice. 1.5 is a more moderate boost.
-            g_object_set(playback_volume_elem, "volume", 1.5, NULL);
-            syncn_intercom_debug_log("audio", "start_locked: boosted playvol gain to 1.5 for PANEL_WIDTH=800");
+            // right along with the voice. 1.5 held as the safe value since.
+            //
+            // Retested 2026-09-14 at 8kHz (matching this real call format,
+            // not the 16kHz bench format used for the bulk of that day's
+            // testing -- see docs/panel-audio-gain-final-findings.md in
+            // syncn_smarthome_panel): confirmed the same 8kHz noise-floor
+            // sensitivity as 2026-09-09, including at moderate playback
+            // boosts layered on an unchanged, previously-good mic
+            // recording, suggesting some of that session's later noisy/far
+            // verdicts may reflect ALSA/PulseAudio state drift from heavy
+            // manual PulseAudio experimentation earlier in that same
+            // session rather than the gain value itself -- unconfirmed,
+            // needs a clean-reboot retest before pushing past 2.0 here.
+            // 2.0 is a modest, real improvement over 1.5 that stays under
+            // GStreamer's single `volume` element hard cap of 10.0 (values
+            // above that are silently rejected, falling back to the
+            // element's previous value -- confirmed on-device 2026-09-14).
+            // A meaningfully louder boost (e.g. matching the 60x figure
+            // reached in 16kHz bench testing that same day) would need a
+            // SECOND chained `volume` element in the pipeline string above,
+            // since a single element cannot express it -- not done here;
+            // do that only after a clean, reboot-verified real-call test
+            // at 8kHz confirms a specific higher value is actually safe.
+            g_object_set(playback_volume_elem, "volume", 2.0, NULL);
+            syncn_intercom_debug_log("audio", "start_locked: boosted playvol gain to 2.0 for PANEL_WIDTH=800");
         }
         gst_object_unref(playback_volume_elem);
     }
