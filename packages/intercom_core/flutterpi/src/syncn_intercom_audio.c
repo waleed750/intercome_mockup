@@ -970,15 +970,29 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     // Measured A/B at the same distance, same session:
     //   capvol 2.5x alone (what shipped in 1.3.74): rms=725  (2.2%)
     //   compressor + 8.0x makeup:                   rms=3957 (12.1%)
-    //   compressor(harder) + 10.0x makeup:          rms=3304 (10.1%)  <- shipped
-    // The harder-compression variant measures slightly quieter than the
-    // 8.0x one but was preferred by ear on the panel: flattening the
-    // dynamics further lifts quiet syllables and word endings closer to
-    // the loud parts, which reads as more intelligible over an intercom
-    // even at a lower RMS. Pushing compression/makeup further than this
-    // was tested and is WORSE (rms falls and clipping rises -- classic
-    // over-compression), so this is a measured operating point, not a
-    // value to keep nudging upward.
+    //   compressor(harder) + 10.0x makeup:          rms=3304 (10.1%)
+    // Pushing compression/makeup past that point was tested and is WORSE
+    // (rms falls and clipping rises -- classic over-compression).
+    //
+    // 2026-09-15, SECOND real-call finding -- why the settings here are
+    // gentler than the loudest measured option: shipping the aggressive
+    // variant (ratio=0.15 threshold=0.03 + 10.0x) in panel-v1.3.75 made
+    // one-direction audio great but produced noise on BOTH ends during
+    // double-talk (both parties speaking at once). That is an echo-
+    // cancellation failure, not a gain problem: webrtcdsp's AEC models a
+    // LINEAR relationship between the playback reference it gets from
+    // webrtcechoprobe and the echo the mic actually picks up. A heavy
+    // compressor applies time-varying non-linear gain to that same mic
+    // path, so the echo stops matching the model and cancellation falls
+    // apart -- and double-talk is exactly the condition where AEC is
+    // most stressed and fails first. Backed off to a much gentler curve
+    // (ratio 0.4 / threshold 0.12, ~2.5:1 engaging only on real peaks
+    // instead of ~7:1 engaging on nearly everything) with 6.0x makeup:
+    // still clearly louder than 1.3.74's 2.5x, but close enough to
+    // linear for AEC to track. If double-talk noise persists, soften
+    // further (raise threshold / raise ratio toward 1.0 = no
+    // compression) before touching capvol -- the compressor's
+    // non-linearity is the AEC-hostile part, not the gain itself.
     //
     // Placement matters: audiodynamic goes AFTER webrtcdsp (so AEC/NS see
     // the original dynamics they were tuned against) and BEFORE capvol
@@ -991,13 +1005,13 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
         "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=false "
         "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
-        "audiodynamic name=capcomp mode=compressor characteristics=soft-knee ratio=0.15 threshold=0.03 ! "
+        "audiodynamic name=capcomp mode=compressor characteristics=soft-knee ratio=0.4 threshold=0.12 ! "
         "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
     static const char *capture_desc_plain =
         "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-        "audiodynamic name=capcomp mode=compressor characteristics=soft-knee ratio=0.15 threshold=0.03 ! "
+        "audiodynamic name=capcomp mode=compressor characteristics=soft-knee ratio=0.4 threshold=0.12 ! "
         "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 
@@ -1047,32 +1061,27 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
             // electrical noise floor any better than a plain volume
             // element can.
             //
-            // Porting 2.5x here based on that finding. UNTESTED IN COMBINATION
-            // WITH AEC (capture_desc_aec, above) -- the two prior in-app
-            // failures (1.8x, 1.2x) were both real-call tests where AEC was
-            // active or partially active, while the 2.5x bench test had no
-            // AEC at all. If this reproduces the same "whine/buzz" character
-            // once AEC is in the loop, revert to 1.0 immediately and do not
-            // re-attempt without an isolated on-device A/B through the real
-            // call pipeline (not a standalone bench pipeline) confirming the
-            // specific value first.
-            // 10.0 is makeup gain for the audiodynamic compressor added to
-            // the pipeline description above -- the two are a matched pair,
-            // measured together on real hardware (see the long comment at
-            // capture_desc_aec). Do NOT raise capvol without the compressor
-            // in front of it: every past attempt to do that (1.2x, 1.8x,
-            // 2.5x) either made no audible difference or clipped the
-            // signal's sharp transients into a buzz, because this mic's
-            // peak-to-RMS ratio is ~27x. 10.0 is also GStreamer's hard cap
-            // for a single `volume` element (higher values are silently
-            // rejected and the element keeps its previous value), so any
-            // future increase needs a second chained element -- but the
-            // on-device A/B says more is worse here, not better.
+            // 6.0 is makeup gain for the audiodynamic compressor in the
+            // pipeline description above -- the two are a matched pair, and
+            // the pair was deliberately softened from the loudest measured
+            // option (10.0x + hard compression) after that combination broke
+            // echo cancellation during double-talk on a real call. See the
+            // long comment at capture_desc_aec for that finding.
+            //
+            // Do NOT raise capvol without the compressor in front of it:
+            // every past attempt to do that (1.2x, 1.8x, 2.5x) either made
+            // no audible difference or clipped the signal's sharp transients
+            // into a buzz, because this mic's peak-to-RMS ratio is ~27x.
+            // Equally, do not raise it back toward 10.0 to chase loudness --
+            // that was tried and the cost was double-talk noise, not
+            // clipping. 10.0 is also GStreamer's hard cap for a single
+            // `volume` element (higher values are silently rejected and the
+            // element keeps its previous value).
             if (capture_volume != NULL) {
                 const char *panel_width_cap = getenv("PANEL_WIDTH");
                 if (panel_width_cap != NULL && strcmp(panel_width_cap, "800") == 0) {
-                    g_object_set(capture_volume, "volume", 10.0, NULL);
-                    syncn_intercom_debug_log("audio", "start_locked: capvol=10.0 makeup gain for capcomp compressor (PANEL_WIDTH=800)");
+                    g_object_set(capture_volume, "volume", 6.0, NULL);
+                    syncn_intercom_debug_log("audio", "start_locked: capvol=6.0 makeup gain for capcomp compressor (PANEL_WIDTH=800)");
                 }
             }
             // Hand the playback pipeline's echo probe to webrtcdsp via
