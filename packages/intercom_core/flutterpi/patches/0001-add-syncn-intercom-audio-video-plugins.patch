@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..8f74247
+index 0000000..6e8ea5b
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1431 @@
+@@ -0,0 +1,1461 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -1013,15 +1013,45 @@ index 0000000..8f74247
 +    //   is in what we TRANSMIT, and the damage lands inside the door
 +    //   station, which is why it only ever reproduces with the mic live and
 +    //   why Tuya's own app is unaffected on this identical hardware.
++    // Capture channel 0 explicitly instead of letting audioconvert average
++    // the codec's two channels down to mono. Measured on real hardware
++    // (192.168.100.203, 2026-09-15, same phrase and distance for each):
++    //
++    //   channel 0 alone:                     rms=1423
++    //   channel 1 alone:                     rms= 178   <- dead, noise floor only
++    //   both averaged (what we shipped):     rms= 662
++    //
++    // This board has ONE physical mic, wired to channel 0; channel 1 carries
++    // nothing. `audioconvert`'s stereo->mono downmix averages the two, so
++    // every call was mixing a live mic with silence and throwing away ~6 dB
++    // of signal for free. Taking channel 0 alone roughly doubles the level
++    // with no gain applied anywhere -- this is not a boost, it is the
++    // removal of a loss, which is why it costs nothing in AEC terms (unlike
++    // the compressor experiment reverted in a89abe0, which broke echo
++    // cancellation during double-talk).
++    //
++    // The codec natively opens at 44100 Hz stereo S16LE (confirmed via
++    // /proc/asound/card0/pcm0c/sub0/hw_params while a capture was live), so
++    // the caps below ask for exactly that and let audioresample quality=10
++    // do the 44.1k->8k conversion after the channel is selected. Keeping
++    // plughw (rather than raw hw) means a panel whose codec reports a
++    // different native format still negotiates instead of failing outright.
++    //
++    // Do not replace the deinterleave with `audioconvert ! audio/x-raw,
++    // channels=1` -- that is precisely the averaging path this fixes.
 +    static const char *capture_desc_aec =
-+        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
++        "alsasrc device=plughw:0,0 ! audio/x-raw,rate=44100,channels=2,format=S16LE ! "
++        "deinterleave name=capdi  capdi.src_0 ! queue ! "
++        "audioconvert ! audioresample quality=10 ! "
 +        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
 +        "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=false "
 +        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
 +        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
 +        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 +    static const char *capture_desc_plain =
-+        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
++        "alsasrc device=plughw:0,0 ! audio/x-raw,rate=44100,channels=2,format=S16LE ! "
++        "deinterleave name=capdi  capdi.src_0 ! queue ! "
++        "audioconvert ! audioresample quality=10 ! "
 +        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
 +        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
 +        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
