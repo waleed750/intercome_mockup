@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..1336944
+index 0000000..919cd37
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1478 @@
+@@ -0,0 +1,1493 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -1044,8 +1044,23 @@ index 0000000..1336944
 +        "deinterleave name=capdi  capdi.src_0 ! queue ! "
 +        "audioconvert ! audioresample quality=10 ! "
 +        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-+        "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=false "
-+        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
++        // noise-suppression=false (2026-09-15): measured on real hardware,
++        // isolated stage-by-stage, same phrase/distance for each --
++        //   raw mic:                                    rms=186
++        //   +webrtcdsp, noise-suppression-level=moderate: rms=34  (-82%)
++        //   +webrtcdsp, noise-suppression=false:          rms=145 (-22%)
++        // This is the actual root cause of "clear in a raw bench
++        // recording, too quiet in a real call" -- NS at `moderate` was
++        // stripping ~80% of an already-quiet signal, far more
++        // aggressively than intended. echo-cancel is untouched and
++        // stays on; NS and AEC are independent features of webrtcdsp,
++        // disabling one does not affect the other. If background noise
++        // becomes a real problem without NS, prefer capping
++        // noise-suppression-level at `low` over reintroducing
++        // `moderate`/`high` -- both measured as too aggressive for this
++        // mic's naturally low signal level.
++        "webrtcdsp name=dsp echo-cancel=true noise-suppression=false gain-control=false "
++        "high-pass-filter=true extended-filter=true ! "
 +        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
 +        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 +    static const char *capture_desc_plain =
