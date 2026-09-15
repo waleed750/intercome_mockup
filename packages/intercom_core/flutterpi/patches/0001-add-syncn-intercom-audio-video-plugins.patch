@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..8f4f69e
+index 0000000..8f74247
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1418 @@
+@@ -0,0 +1,1431 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -1051,30 +1051,43 @@ index 0000000..8f4f69e
 +                continue;
 +            }
 +            g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
-+            // Tried boosting capvol's gain to 1.8 on this panel (same
-+            // PANEL_WIDTH=800 rationale as playvol) to compensate for this
-+            // codec having no ALSA-side capture gain control -- confirmed
-+            // on-device 2026-09-09 that 1.8 made call audio a loud
-+            // whine/buzz (mechanical-sounding, not voice-shaped) that
-+            // drowned out speech entirely, worse than the original quiet-
-+            // but-clean mic. This is consistent with amplifying the mic's
-+            // own electrical/self-noise floor rather than the voice signal
-+            // -- there's no real gain-control silicon here to separate the
-+            // two, unlike a proper mic preamp. Reverted to the unmodified
-+            // 1.0 default (capture_volume kept only for the mute toggle
-+            // below); quiet-but-intelligible beats loud-but-unusable, and
-+            // there's no ALSA-side alternative to fall back to on this
-+            // hardware. Do not re-attempt a capvol gain boost without a
-+            // real on-device A/B of intermediate values (e.g. 1.2-1.4)
-+            // first.
++            // History of capvol boost attempts on this panel (PANEL_WIDTH=800):
++            // 2026-09-09: 1.8x -> loud whine/buzz, drowned out speech, reverted
++            // to 1.0. 2026-09-10: 1.2x, not isolated from an unrelated AEC
++            // change in the same build, client wanted back to 1.0. Both were
++            // real in-app call tests, but both also predate the standalone
++            // bench-test investigation below.
 +            //
-+            // 2026-09-10: Tried 1.2x gain (low end of the suggested range)
-+            // for PANEL_WIDTH=800. Confirmed on-device this build (with
-+            // echo-cancel also disabled the same build, so not fully
-+            // isolated) that the client wanted back to 1.0 -- reverted.
-+            // Do not re-attempt a capvol gain boost without a real
-+            // on-device A/B, isolated from any other audio change in the
-+            // same build, confirming the client is fine with it.
++            // 2026-09-14 (docs/panel-audio-gain-final-findings.md in
++            // syncn_smarthome_panel): a clean, isolated GStreamer bench
++            // pipeline (alsasrc -> volume -> wavenc, no AEC, no app) at the
++            // real 8kHz call format found 2.5x "clear, if distant-sounding"
++            // -- explicitly confirmed by the client as a real improvement,
++            // with values above (2.7-3.2x) tried and rejected as worse.
++            // webrtcdsp's own AGC (gain-control=true) was ALSO tried
++            // separately that session, multiple configurations, every one
++            // worse than plain gain -- expected, since `amixer -c 0
++            // contents` confirms this codec has zero real preamp/PGA
++            // silicon, so AGC can't distinguish voice from the mic's
++            // electrical noise floor any better than a plain volume
++            // element can.
++            //
++            // Porting 2.5x here based on that finding. UNTESTED IN COMBINATION
++            // WITH AEC (capture_desc_aec, above) -- the two prior in-app
++            // failures (1.8x, 1.2x) were both real-call tests where AEC was
++            // active or partially active, while the 2.5x bench test had no
++            // AEC at all. If this reproduces the same "whine/buzz" character
++            // once AEC is in the loop, revert to 1.0 immediately and do not
++            // re-attempt without an isolated on-device A/B through the real
++            // call pipeline (not a standalone bench pipeline) confirming the
++            // specific value first.
++            if (capture_volume != NULL) {
++                const char *panel_width_cap = getenv("PANEL_WIDTH");
++                if (panel_width_cap != NULL && strcmp(panel_width_cap, "800") == 0) {
++                    g_object_set(capture_volume, "volume", 2.5, NULL);
++                    syncn_intercom_debug_log("audio", "start_locked: boosted capvol gain to 2.5 for PANEL_WIDTH=800 (untested with AEC -- revert to 1.0 if noisy)");
++                }
++            }
 +            // Hand the playback pipeline's echo probe to webrtcdsp via
 +            // g_object_set -- gst_parse_launch can't resolve cross-pipeline
 +            // element references (the `probe=` syntax only works within the
