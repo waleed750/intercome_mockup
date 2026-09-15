@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..8f74247
+index 0000000..2d1ffa0
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1431 @@
+@@ -0,0 +1,1478 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -1013,16 +1013,51 @@ index 0000000..8f74247
 +    //   is in what we TRANSMIT, and the damage lands inside the door
 +    //   station, which is why it only ever reproduces with the mic live and
 +    //   why Tuya's own app is unaffected on this identical hardware.
++    // The `audiodynamic` compressor ahead of capvol is what actually makes
++    // this mic usable at conversational distance, and it is NOT
++    // interchangeable with more gain. Measured on real hardware
++    // (192.168.100.203, 2026-09-15, speaking at normal standing distance,
++    // 8kHz mono, raw capture with no DSP): peak=13056 (40% of full scale)
++    // but rms=483 (1.5%) -- a peak-to-RMS ratio of ~27x, where normal
++    // speech sits around 4-8x. The voice IS the 1.5%; the 40% peak is a
++    // lone transient. That is why every previous attempt to fix this with
++    // a bigger `volume` multiplier failed: flat gain hits the transient
++    // ceiling and clips long before the body of the speech gets loud
++    // enough, which is also the most likely real explanation for the
++    // "loud whine/buzz" reported at capvol=1.8x back on 2026-09-09
++    // (clipped transients, not an AEC interaction).
++    //
++    // Measured A/B at the same distance, same session:
++    //   capvol 2.5x alone (what shipped in 1.3.74): rms=725  (2.2%)
++    //   compressor + 8.0x makeup:                   rms=3957 (12.1%)
++    //   compressor(harder) + 10.0x makeup:          rms=3304 (10.1%)  <- shipped
++    // The harder-compression variant measures slightly quieter than the
++    // 8.0x one but was preferred by ear on the panel: flattening the
++    // dynamics further lifts quiet syllables and word endings closer to
++    // the loud parts, which reads as more intelligible over an intercom
++    // even at a lower RMS. Pushing compression/makeup further than this
++    // was tested and is WORSE (rms falls and clipping rises -- classic
++    // over-compression), so this is a measured operating point, not a
++    // value to keep nudging upward.
++    //
++    // Placement matters: audiodynamic goes AFTER webrtcdsp (so AEC/NS see
++    // the original dynamics they were tuned against) and BEFORE capvol
++    // (so the makeup gain applies to already-tamed peaks). Do not move it
++    // past audiobuffersplit -- that element's position is what guarantees
++    // the door's required 160 bytes/20ms uplink framing, see the long
++    // comment above.
 +    static const char *capture_desc_aec =
 +        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
 +        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
 +        "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=false "
 +        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
++        "audiodynamic name=capcomp mode=compressor characteristics=soft-knee ratio=0.15 threshold=0.03 ! "
 +        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
 +        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 +    static const char *capture_desc_plain =
 +        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
 +        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
++        "audiodynamic name=capcomp mode=compressor characteristics=soft-knee ratio=0.15 threshold=0.03 ! "
 +        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
 +        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 +
@@ -1081,11 +1116,23 @@ index 0000000..8f74247
 +            // re-attempt without an isolated on-device A/B through the real
 +            // call pipeline (not a standalone bench pipeline) confirming the
 +            // specific value first.
++            // 10.0 is makeup gain for the audiodynamic compressor added to
++            // the pipeline description above -- the two are a matched pair,
++            // measured together on real hardware (see the long comment at
++            // capture_desc_aec). Do NOT raise capvol without the compressor
++            // in front of it: every past attempt to do that (1.2x, 1.8x,
++            // 2.5x) either made no audible difference or clipped the
++            // signal's sharp transients into a buzz, because this mic's
++            // peak-to-RMS ratio is ~27x. 10.0 is also GStreamer's hard cap
++            // for a single `volume` element (higher values are silently
++            // rejected and the element keeps its previous value), so any
++            // future increase needs a second chained element -- but the
++            // on-device A/B says more is worse here, not better.
 +            if (capture_volume != NULL) {
 +                const char *panel_width_cap = getenv("PANEL_WIDTH");
 +                if (panel_width_cap != NULL && strcmp(panel_width_cap, "800") == 0) {
-+                    g_object_set(capture_volume, "volume", 2.5, NULL);
-+                    syncn_intercom_debug_log("audio", "start_locked: boosted capvol gain to 2.5 for PANEL_WIDTH=800 (untested with AEC -- revert to 1.0 if noisy)");
++                    g_object_set(capture_volume, "volume", 10.0, NULL);
++                    syncn_intercom_debug_log("audio", "start_locked: capvol=10.0 makeup gain for capcomp compressor (PANEL_WIDTH=800)");
 +                }
 +            }
 +            // Hand the playback pipeline's echo probe to webrtcdsp via
