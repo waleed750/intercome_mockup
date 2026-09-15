@@ -1042,33 +1042,37 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
             // electrical noise floor any better than a plain volume
             // element can.
             //
-            // 2026-09-15: two things changed the picture above. First, the
-            // "1.8x whined" data point is not trustworthy -- that build
-            // predates BOTH the echo-probe fix and the 160-byte/20ms uplink
-            // framing fix, so it was never a like-for-like comparison and
-            // should not be read as a gain ceiling. Second, and more
-            // importantly, the capture pipeline was averaging the live mic
-            // (channel 0) with a dead channel 1, discarding ~6 dB before
-            // capvol ever saw the signal -- fixed in the pipeline
-            // description above.
+            // 2026-09-15 findings, CONFIRMED ON A REAL CALL with the
+            // channel-0 capture fix (see capture_desc_aec comment above) in
+            // place -- read this before touching capvol again:
             //
-            // With that loss removed, a real call was reported CLEAR but
-            // still too quiet at 2.5x. Clear-but-quiet is exactly what plain
-            // linear gain is for, so this raises capvol to 5.0 as a single
-            // isolated change. Linear gain is also what AEC tolerates: the
-            // compressor experiment that broke double-talk (reverted in
-            // a89abe0) failed because it was NON-LINEAR, not because it was
-            // loud.
+            // At 2.5x: one direction at a time is clear (far end hears you
+            // fine when only you are talking, and vice versa), but you still
+            // have to stand close to the mic for a comfortable volume.
             //
-            // Ceiling note: a single `volume` element silently caps at 10.0
-            // (higher values are rejected and it keeps its previous value),
-            // so there is headroom left above this if 5.0 is still short.
-            // Raise it one step at a time and re-test double-talk each time.
+            // At 5.0x (tried and REVERTED): loudness at a distance did not
+            // meaingfully improve, AND double-talk (both parties speaking at
+            // once) became noisy/unclear on BOTH ends -- the same double-
+            // talk-breaks-first signature as the compressor experiment
+            // reverted in a89abe0, except this time triggered by PLAIN
+            // LINEAR GAIN ALONE, no compressor, no non-linearity anywhere in
+            // the chain. This disproves the earlier working theory that
+            // "linear gain is AEC-safe, only non-linear processing isn't" --
+            // on this hardware/AEC combination, pushing capvol too high is
+            // ALSO enough to degrade double-talk cancellation by itself.
+            //
+            // Conclusion: 2.5x is the ceiling that keeps double-talk clean.
+            // The remaining "quiet, have to stand close" complaint is NOT
+            // fixed by more capvol gain -- that avenue is closed. If
+            // revisited, look at the call pipeline stage-by-stage (does
+            // webrtcdsp's own internal processing attenuate the signal
+            // somewhere the raw-capture bench tests never exercised?) rather
+            // than raising this value again.
             if (capture_volume != NULL) {
                 const char *panel_width_cap = getenv("PANEL_WIDTH");
                 if (panel_width_cap != NULL && strcmp(panel_width_cap, "800") == 0) {
-                    g_object_set(capture_volume, "volume", 5.0, NULL);
-                    syncn_intercom_debug_log("audio", "start_locked: capvol=5.0 for PANEL_WIDTH=800 (channel-0 capture, no compressor)");
+                    g_object_set(capture_volume, "volume", 2.5, NULL);
+                    syncn_intercom_debug_log("audio", "start_locked: capvol=2.5 for PANEL_WIDTH=800 (5.0 tried and reverted -- broke double-talk, see comment above)");
                 }
             }
             // Hand the playback pipeline's echo probe to webrtcdsp via
