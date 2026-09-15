@@ -1425,6 +1425,24 @@ static void on_method_channel_message(void *userdata, const FlutterPlatformMessa
     } else if (strcmp(object.method, "playDownlink") == 0) {
         if (object.std_arg.type == kStdUInt8Array) {
             handle_play_downlink(self, object.std_arg.uint8array, object.std_arg.size);
+        } else {
+            // 2026-09-15: unconditional (no DIAG gate, no per-call cap) --
+            // if the arg type check above is ever false, handle_play_downlink
+            // is silently never called and NOTHING is logged anywhere,
+            // including the unconditional DROPPED line inside that function
+            // (which never runs either, since this branch is what skips
+            // calling it). Confirmed on real hardware 2026-09-15: a call
+            // with rxAudio climbing healthily produced ZERO
+            // handle_play_downlink log lines of any kind, not even DROPPED
+            // -- consistent with this branch being the one actually hit,
+            // not a failure inside handle_play_downlink itself. This log
+            // line is the one piece of visibility that was missing to tell
+            // those two cases apart.
+            LOG_ERROR(
+                "syncn_intercom_audio: playDownlink called with wrong arg type (got %d, want kStdUInt8Array=%d) -- frame silently dropped, playback pipeline never receives it\n",
+                object.std_arg.type,
+                kStdUInt8Array
+            );
         }
         platch_respond_success_std(message->response_handle, NULL);
     } else if (strcmp(object.method, "setMuted") == 0) {
