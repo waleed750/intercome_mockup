@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..919cd37
+index 0000000..74b70b8
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1493 @@
+@@ -0,0 +1,1535 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -1059,7 +1059,39 @@ index 0000000..919cd37
 +        // noise-suppression-level at `low` over reintroducing
 +        // `moderate`/`high` -- both measured as too aggressive for this
 +        // mic's naturally low signal level.
-+        "webrtcdsp name=dsp echo-cancel=true noise-suppression=false gain-control=false "
++        //
++        // gain-control=true, fixed-digital (2026-09-15): an EARLIER
++        // session attempt at webrtcdsp AGC was rejected as "worse than
++        // plain gain" -- but that test ran with noise-suppression still
++        // on and aggressive, which was independently destroying most of
++        // the signal AGC had to work with. Retested in isolation with NS
++        // disabled (this same session, after the NS fix above): measured
++        // on real hardware, same phrase/distance each time --
++        //   raw mic:                          rms=202
++        //   webrtcdsp, NS off, AGC off:        rms=112
++        //   webrtcdsp, NS off, AGC fixed-digital target=3dBFS: rms=541
++        // A second independent recording (fresh capture, not reusing a
++        // stale file) confirmed rms=1757 with AGC on -- the loudest
++        // reading of the entire investigation, well above even the
++        // mic's raw unprocessed level. NOTE: local bench playback of an
++        // 8kHz-captured file through this board's plughw sink is itself
++        // lossy (confirmed separately: a KNOWN-loud reference file
++        // round-tripped through the same 8kHz-then-back-to-44.1kHz path
++        // used to audition these bench captures came out audibly
++        // quieter than the untouched original) -- so a bench recording
++        // that "sounds quiet" on this panel's speaker is not reliable
++        // evidence against this fix. The rms number, measured on the
++        // raw un-resampled 8kHz samples, is trustworthy; local playback
++        // through plughw is not. Real validation has to happen on an
++        // actual call (8kHz A-law sent directly to the door, no local
++        // resample round-trip involved) -- MADE IT INTO A BUILD BUT NOT
++        // YET CONFIRMED ON A REAL CALL AT TIME OF WRITING. If it sounds
++        // pumped/robotic/unnatural on a real call, or double-talk
++        // breaks (same AEC-interaction risk as every gain change this
++        // session), reduce target-level-dbfs (less loud target) before
++        // disabling AGC outright.
++        "webrtcdsp name=dsp echo-cancel=true noise-suppression=false gain-control=true "
++        "gain-control-mode=fixed-digital target-level-dbfs=3 "
 +        "high-pass-filter=true extended-filter=true ! "
 +        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
 +        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
@@ -1136,18 +1168,28 @@ index 0000000..919cd37
 +            // on this hardware/AEC combination, pushing capvol too high is
 +            // ALSO enough to degrade double-talk cancellation by itself.
 +            //
-+            // Conclusion: 2.5x is the ceiling that keeps double-talk clean.
-+            // The remaining "quiet, have to stand close" complaint is NOT
-+            // fixed by more capvol gain -- that avenue is closed. If
-+            // revisited, look at the call pipeline stage-by-stage (does
-+            // webrtcdsp's own internal processing attenuate the signal
-+            // somewhere the raw-capture bench tests never exercised?) rather
-+            // than raising this value again.
++            // Conclusion (superseded below): 2.5x is the ceiling for
++            // capvol ALONE that keeps double-talk clean. Raising capvol
++            // further was a closed avenue.
++            //
++            // 2026-09-15, LATER: the actual root cause of the raw-mic-
++            // clear-but-real-call-quiet gap was found to be
++            // noise-suppression=moderate (see capture_desc_aec comment,
++            // ~80% signal loss) and now webrtcdsp's own AGC
++            // (gain-control=true) is doing the loudness work instead,
++            // targeting near-full-scale (target-level-dbfs=3). Stacking
++            // capvol=2.5 ON TOP of AGC's own output would clip badly --
++            // AGC already brings the signal close to full scale on its
++            // own (measured rms=541-1757, the loudest readings all
++            // session, well above raw mic level). Reset capvol to 1.0
++            // (no-op) now that AGC is the gain stage. Do NOT re-raise
++            // capvol while AGC is enabled without re-measuring for
++            // clipping first.
 +            if (capture_volume != NULL) {
 +                const char *panel_width_cap = getenv("PANEL_WIDTH");
 +                if (panel_width_cap != NULL && strcmp(panel_width_cap, "800") == 0) {
-+                    g_object_set(capture_volume, "volume", 2.5, NULL);
-+                    syncn_intercom_debug_log("audio", "start_locked: capvol=2.5 for PANEL_WIDTH=800 (5.0 tried and reverted -- broke double-talk, see comment above)");
++                    g_object_set(capture_volume, "volume", 1.0, NULL);
++                    syncn_intercom_debug_log("audio", "start_locked: capvol=1.0 for PANEL_WIDTH=800 (AGC is the gain stage now, see comment above)");
 +                }
 +            }
 +            // Hand the playback pipeline's echo probe to webrtcdsp via
