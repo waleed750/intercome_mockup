@@ -781,15 +781,40 @@ final class CallController extends ChangeNotifier {
   // mic from Dart. Door stations gate their downlink on seeing continuous
   // uplink audio, so fall back to synthetic A-law silence frames -- exactly
   // what the known-good wire capture shows flowing right after the handshake.
+  //
+  // 2026-09-15: this watchdog originally only ran ONCE, 2s after call start,
+  // and never checked again once a single real mic frame had been seen. On
+  // real hardware this let a MID-CALL gap in uplink frames go completely
+  // undetected -- confirmed live via tcpdump + journal correlation: calls
+  // were dropping every 10-40s with the door itself sending the FIN, and
+  // `Intercom: no uplink mic frames within 2s` / `[SILENCE FALLBACK ACTIVE]`
+  // never appeared in the logs even though `sent` later froze near-zero.
+  // Matches the code comment above almost exactly -- "door stations gate
+  // downlink on seeing continuous uplink audio" -- if our own uplink
+  // silently stalls mid-call (native pipeline hiccup, GStreamer state
+  // change, anything), the door has no reason to think the call is still
+  // alive and hangs up. Made this periodic instead of one-shot, and reset
+  // `_uplinkFrameSeen` each cycle so it detects a NEW gap, not just
+  // whether any frame was EVER seen since call start.
   void _armUplinkWatchdog() {
     _uplinkWatchdogTimer?.cancel();
-    _uplinkWatchdogTimer = Timer(const Duration(seconds: 2), () {
-      if (_uplinkFrameSeen || _state.phase == CallPhase.idle) return;
+    _uplinkWatchdogTimer =
+        Timer.periodic(const Duration(seconds: 2), (_) {
+      if (_state.phase == CallPhase.idle) {
+        _uplinkWatchdogTimer?.cancel();
+        _uplinkWatchdogTimer = null;
+        return;
+      }
+      if (_uplinkFrameSeen) {
+        // Real mic frames arrived in this window -- healthy, nothing to
+        // do. Reset for the next window so a LATER stall is still caught.
+        _uplinkFrameSeen = false;
+        return;
+      }
       debugPrint(
-          'Intercom: no uplink mic frames within 2s -- sending silence '
-          'frames so the door starts streaming');
-      _silenceTimer?.cancel();
-      _silenceTimer = Timer.periodic(const Duration(milliseconds: 20), (_) {
+          'Intercom: no uplink mic frames in the last 2s -- sending '
+          'silence frames so the door keeps seeing continuous uplink');
+      _silenceTimer ??= Timer.periodic(const Duration(milliseconds: 20), (_) {
         if (!_send(Frame.encode(Channel.audio, _alawSilenceFrame))) {
           _silenceTimer?.cancel();
           _silenceTimer = null;
