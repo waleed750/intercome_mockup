@@ -1042,20 +1042,33 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
             // electrical noise floor any better than a plain volume
             // element can.
             //
-            // Porting 2.5x here based on that finding. UNTESTED IN COMBINATION
-            // WITH AEC (capture_desc_aec, above) -- the two prior in-app
-            // failures (1.8x, 1.2x) were both real-call tests where AEC was
-            // active or partially active, while the 2.5x bench test had no
-            // AEC at all. If this reproduces the same "whine/buzz" character
-            // once AEC is in the loop, revert to 1.0 immediately and do not
-            // re-attempt without an isolated on-device A/B through the real
-            // call pipeline (not a standalone bench pipeline) confirming the
-            // specific value first.
+            // 2026-09-15: two things changed the picture above. First, the
+            // "1.8x whined" data point is not trustworthy -- that build
+            // predates BOTH the echo-probe fix and the 160-byte/20ms uplink
+            // framing fix, so it was never a like-for-like comparison and
+            // should not be read as a gain ceiling. Second, and more
+            // importantly, the capture pipeline was averaging the live mic
+            // (channel 0) with a dead channel 1, discarding ~6 dB before
+            // capvol ever saw the signal -- fixed in the pipeline
+            // description above.
+            //
+            // With that loss removed, a real call was reported CLEAR but
+            // still too quiet at 2.5x. Clear-but-quiet is exactly what plain
+            // linear gain is for, so this raises capvol to 5.0 as a single
+            // isolated change. Linear gain is also what AEC tolerates: the
+            // compressor experiment that broke double-talk (reverted in
+            // a89abe0) failed because it was NON-LINEAR, not because it was
+            // loud.
+            //
+            // Ceiling note: a single `volume` element silently caps at 10.0
+            // (higher values are rejected and it keeps its previous value),
+            // so there is headroom left above this if 5.0 is still short.
+            // Raise it one step at a time and re-test double-talk each time.
             if (capture_volume != NULL) {
                 const char *panel_width_cap = getenv("PANEL_WIDTH");
                 if (panel_width_cap != NULL && strcmp(panel_width_cap, "800") == 0) {
-                    g_object_set(capture_volume, "volume", 2.5, NULL);
-                    syncn_intercom_debug_log("audio", "start_locked: boosted capvol gain to 2.5 for PANEL_WIDTH=800 (untested with AEC -- revert to 1.0 if noisy)");
+                    g_object_set(capture_volume, "volume", 5.0, NULL);
+                    syncn_intercom_debug_log("audio", "start_locked: capvol=5.0 for PANEL_WIDTH=800 (channel-0 capture, no compressor)");
                 }
             }
             // Hand the playback pipeline's echo probe to webrtcdsp via
