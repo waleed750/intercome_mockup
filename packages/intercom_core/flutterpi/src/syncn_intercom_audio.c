@@ -987,32 +987,8 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         // ~2x mic level (rms 662 -> 1423) by selecting the live channel
         // instead of averaging with a dead one, so it is worth re-testing
         // LATER, on its own, once downlink is confirmed still working here.
-        // delay-agnostic=true (2026-09-16): THE double-talk fix. WebRTC's AEC
-        // must know how long audio takes to travel probe -> queue -> ALSA
-        // buffer -> speaker -> back into the mic. Our playback chain has an
-        // 80ms jitter queue plus a 200ms ALSA buffer, so that delay is both
-        // large and variable. Without delay-agnostic mode (default FALSE,
-        // and never set here before today) the canceller assumes a fixed
-        // delay, subtracts the wrong slice of time, and destroys real
-        // speech instead of the echo -- exactly the reported symptom:
-        // either side alone sounds excellent, both together is destroyed.
-        // Delay-agnostic makes the AEC estimate the delay continuously.
-        //
-        // echo-suppression-level=moderate: the GStreamer docs state that a
-        // higher level "trades off double-talk performance for increased
-        // echo suppression". We were on the default and never tuned it.
-        //
-        // Why this is worth trying before accepting half-duplex: Tuya's own
-        // Android app works fine on this same door hardware. Android gets
-        // proper delay handling from its platform AEC
-        // (VOICE_COMMUNICATION / AcousticEchoCanceler); we use software
-        // webrtcdsp and never enabled the equivalent. The "electrical
-        // crosstalk is unfixable" conclusion from 2026-09-13 predates this
-        // finding and may have been premature. The half-duplex uplink gate
-        // stays in place as a safety net regardless.
         "webrtcdsp name=dsp echo-cancel=true noise-suppression=false gain-control=true "
         "gain-control-mode=fixed-digital target-level-dbfs=3 "
-        "delay-agnostic=true echo-suppression-level=moderate "
         "high-pass-filter=true extended-filter=true ! "
         "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
