@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..e7d13ce
+index 0000000..b8f3d84
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1474 @@
+@@ -0,0 +1,1450 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -1014,26 +1014,7 @@ index 0000000..e7d13ce
 +    //   station, which is why it only ever reproduces with the mic live and
 +    //   why Tuya's own app is unaffected on this identical hardware.
 +    static const char *capture_desc_aec =
-+        // Channel-0 selection (2026-09-16): this panel's mic captures stereo
-+        // with channel 1 DEAD, so plain `audioconvert` averages a live
-+        // channel with silence and halves the signal before AGC ever sees
-+        // it. Measured on .203: rms 662 -> 1423 selecting channel 0 alone.
-+        // That is why AGC at target-level-dbfs=3 alone did not make the mic
-+        // audibly louder -- it cannot manufacture level from a signal that
-+        // was already halved upstream.
-+        //
-+        // Constrains ONLY channels=2, deliberately NOT the rate. v1.3.83's
-+        // version of this fix (c844ecd) pinned the full
-+        // rate=44100,channels=2 on plughw:0,0, and that full pinning is the
-+        // leading suspect for the silent-downlink regression on this
-+        // board's single shared PCM (capture claiming the device at a fixed
-+        // rate can stop the playback direction configuring it). Leaving the
-+        // rate free lets plughw negotiate as it does on the working
-+        // v1.3.73 base, so this takes the ~2x gain without the suspected
-+        // risk. If downlink goes silent again, THIS is the line to revert.
-+        "alsasrc device=plughw:0,0 ! audio/x-raw,channels=2 ! "
-+        "deinterleave name=capdi  capdi.src_0 ! queue ! "
-+        "audioconvert ! audioresample quality=10 ! "
++        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
 +        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
 +        // NS off + AGC on, taken verbatim from panel-v1.3.83 (0a26269) --
 +        // the build the client confirmed did NOT cut off speech from the
@@ -1072,12 +1053,7 @@ index 0000000..e7d13ce
 +        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
 +        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 +    static const char *capture_desc_plain =
-+        // Same channel-0 selection as the AEC variant above (dead channel 1
-+        // would otherwise halve the signal); rate left free for the same
-+        // downlink-safety reason.
-+        "alsasrc device=plughw:0,0 ! audio/x-raw,channels=2 ! "
-+        "deinterleave name=capdi  capdi.src_0 ! queue ! "
-+        "audioconvert ! audioresample quality=10 ! "
++        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
 +        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
 +        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
 +        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
