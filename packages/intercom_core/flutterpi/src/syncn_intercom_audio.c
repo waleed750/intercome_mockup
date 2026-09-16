@@ -763,18 +763,45 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     //   Back to the long-standing values now that the probe is positioned
     //   to report that delay honestly.
     static const char *playback_desc_aec =
+        // REGRESSION LOCALIZATION TEST (2026-09-16, panel-v1.3.88): this is
+        // the exact pre-abf42f2 topology, restored verbatim. abf42f2 ("put
+        // echo probe in-line so AEC gets a real delay") moved
+        // webrtcechoprobe OFF this tee side-branch and INTO the only path to
+        // alsasink, and simultaneously changed the queue threshold
+        // (300ms -> 80ms) and ALSA buffer-time (500ms -> 200ms). Downlink
+        // audio has been dead since, with the sink never prerolling:
+        // measured on .203 during a live call with real speech arriving and
+        // every gst_app_src_push_buffer returning GST_FLOW_OK --
+        // state: OPEN, hw_ptr: 0, appl_ptr: 0, hw_params: no setup. appl_ptr
+        // at 0 means alsasink never wrote a single sample, i.e. nothing ever
+        // reached it. With the probe in-line, anything that stalls it stalls
+        // all downlink; on this side-branch it cannot.
+        //
+        // Both tee branches have their own queue, which GStreamer's tee
+        // documentation requires -- without that, one blocked branch stalls
+        // the other, which would recreate the very failure being removed.
+        //
+        // This restores AEC's probe feed (same top-level pipeline as
+        // webrtcdsp, same rate) but gives up abf42f2's echo-delay
+        // improvement, so some echo may return. That is the accepted
+        // trade for having any downlink audio at all, and is expected to be
+        // revisited once the mechanism is isolated (inline probe vs. the
+        // 80ms queue threshold vs. their interaction -- all three were
+        // introduced by the same commit and are not yet distinguished).
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-        "alawdec ! audioconvert ! audio/x-raw,rate=8000,channels=1 ! "
-        "volume name=playvol volume=1.0 ! "
-        "webrtcechoprobe name=syncn_echoprobe ! "
-        "audioconvert ! audioresample quality=10 ! "
-        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
-        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
+        "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! tee name=t ! "
+        "queue min-threshold-time=300000000 max-size-time=1200000000 ! "
+        "alsasink device=plughw:0,0 sync=true buffer-time=500000 latency-time=20000 "
+        "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe name=syncn_echoprobe ! fakesink sync=false async=false";
     static const char *playback_desc_plain =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
+        // Restored to pre-abf42f2 values alongside the AEC variant above --
+        // this path has no probe and never did, so it doubles as a control:
+        // if downlink still fails here, the inline probe is exonerated and
+        // the queue threshold / buffer-time change is implicated instead.
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! "
-        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
-        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
+        "queue min-threshold-time=300000000 max-size-time=1200000000 ! "
+        "alsasink device=plughw:0,0 sync=true buffer-time=500000 latency-time=20000";
 
     GError *error = NULL;
     GstElement *playback = gst_parse_launch(aec_available ? playback_desc_aec : playback_desc_plain, &error);
