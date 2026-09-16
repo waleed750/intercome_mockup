@@ -1025,13 +1025,28 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         // through plughw is not. Real validation has to happen on an
         // actual call (8kHz A-law sent directly to the door, no local
         // resample round-trip involved) -- MADE IT INTO A BUILD BUT NOT
-        // YET CONFIRMED ON A REAL CALL AT TIME OF WRITING. If it sounds
-        // pumped/robotic/unnatural on a real call, or double-talk
-        // breaks (same AEC-interaction risk as every gain change this
-        // session), reduce target-level-dbfs (less loud target) before
-        // disabling AGC outright.
+        // 2026-09-16: confirmed on a REAL CALL -- with target-level-dbfs=3
+        // (near full scale), uplink to the door was excellent, but the
+        // door's OWN downlink to us degraded from real audio to constant
+        // A-law silence (0xd5) after ~15-20s, while our uplink kept
+        // climbing normally (confirmed via /tmp/syncn_intercom_debug.log,
+        // not journald -- see that file's header comment). Working theory,
+        // sanity-checked externally: cheap Tuya-family door stations often
+        // implement half-duplex arbitration via a crude energy/VAD
+        // detector rather than real AEC -- a continuously loud/near-full-
+        // scale uplink can read as "far end talking non-stop", causing the
+        // door's firmware to suppress its OWN downlink to avoid feedback.
+        // The gradual real-audio-to-silence degradation (not an abrupt
+        // cutoff) is consistent with an energy threshold being crossed
+        // and the door settling into a suppressed state, not a connection
+        // failure. Backed target-level-dbfs off from 3 to 15 (quieter
+        // target, well below the door's likely suppression threshold) to
+        // test this directly. If downlink stays alive for a full call at
+        // this level, that confirms the theory -- do not push
+        // target-level-dbfs back toward 0 without re-verifying downlink
+        // survives the WHOLE call, not just checking uplink loudness.
         "webrtcdsp name=dsp echo-cancel=true noise-suppression=false gain-control=true "
-        "gain-control-mode=fixed-digital target-level-dbfs=3 "
+        "gain-control-mode=fixed-digital target-level-dbfs=15 "
         "high-pass-filter=true extended-filter=true ! "
         "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
