@@ -54,10 +54,10 @@ index 734aba5..d021263 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..82b650a
+index 0000000..8df0cef
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1577 @@
+@@ -0,0 +1,1585 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -533,25 +533,43 @@ index 0000000..82b650a
 +    gst_object_unref(bus);
 +}
 +
-+// Blocking start: set_state(PLAYING) then confirms via gst_element_get_state()
-+// with a 3s timeout. Originally added for capture only; a blocking
-+// get_state() called directly from the platform thread had once deadlocked
-+// it (submit()/playDownlink() method calls couldn't reach appsrc while
-+// blocked -- see syncn_intercom_video.c's identical historical fix), so
-+// playback used to use a fire-and-forget non-blocking start instead.
++// Non-blocking start for playback pipelines: set_state + failure check only,
++// no blocking gst_element_get_state() wait. The playback pipeline uses
++// appsrc is-live=true, which reaches PLAYING without needing buffers, and
++// real failures surface asynchronously via the bus log.
 +//
-+// UPDATE (2026-09-16): that justification no longer applies to playback.
-+// start_locked() (which calls this) always runs on its own detached pthread
-+// (start_thread_main(), spawned via pthread_create() from the "start"
-+// method-channel handler), never on flutter-pi's platform thread -- so
-+// blocking here is safe from this call site, exactly as it already is for
-+// capture. The old non-blocking playback path silently treated
-+// GST_STATE_CHANGE_ASYNC as success without ever confirming the pipeline
-+// actually reached PLAYING, which let alsasink get stuck at ALSA state
-+// OPEN/hw_ptr=0 forever during real calls -- no bus error, no failure
-+// return, just permanent silence on the downlink. See
-+// docs/intercom-alsink-never-playing-2026-09-16.md for the live /proc/asound
-+// evidence. Now used for both capture and playback.
++// DO NOT make this blocking for playback. Tried and reverted 2026-09-16
++// (shipped as panel-v1.3.86, immediately regressed real calls): the theory
++// was that treating GST_STATE_CHANGE_ASYNC as success without re-polling
++// let alsasink sit at ALSA state OPEN/hw_ptr=0 forever. Switching playback
++// to the blocking start_and_confirm_playing() below made it WORSE -- two
++// real 55s calls produced ZERO native audio log lines at all, because
++// start_locked() runs under self->lock and blocking there for up to 3s
++// starves handle_play_downlink(), which takes that same lock and is called
++// synchronously on flutter-pi's platform thread for every single downlink
++// frame. Capture's own blocking start already holds the lock up to 3s;
++// adding playback's on top pushed total lock-hold past what the downlink
++// path tolerates. The hw_ptr=0 observation was itself most likely a
++// SYMPTOM of that starvation (appsrc never fed -> alsasink never starts),
++// not the cause. See handle_play_downlink's own 2026-09-10 comment: this
++// codebase already learned once that holding self->lock across slow work
++// cuts downlink audio. Any future confirmation of the playback transition
++// must happen OUTSIDE self->lock.
++static bool start_pipeline_non_blocking(const char *tag, GstElement *pipeline) {
++    GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
++    syncn_intercom_debug_log("audio", "%s: gst_element_set_state(PLAYING) -> %d (non-blocking)", tag, state_ret);
++    if (state_ret == GST_STATE_CHANGE_FAILURE) {
++        log_pipeline_bus_errors(tag, pipeline);
++        return false;
++    }
++    log_pipeline_bus_errors(tag, pipeline);
++    return true;
++}
++
++// Blocking start for capture pipelines: confirms PLAYING via get_state().
++// Kept for capture only -- it's a separate, already-fast path (31ms in the
++// measured log) and captures need the pipeline confirmed running before
++// on_new_capture_sample can deliver useful uplink frames.
 +static bool start_and_confirm_playing(const char *tag, GstElement *pipeline) {
 +    GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
 +    syncn_intercom_debug_log("audio", "%s: gst_element_set_state(PLAYING) -> %d", tag, state_ret);
@@ -570,8 +588,8 @@ index 0000000..82b650a
 +    return true;
 +}
 +
-+// Retries a blocking, confirmed pipeline start on failure, resetting to NULL
-+// and backing off briefly between attempts. Added after an on-device failure
++// Retries a non-blocking pipeline start on failure, resetting to NULL and
++// backing off briefly between attempts. Added after an on-device failure
 +// (2026-08-25): alsasink's exclusive `plughw:0,0` device open failed with
 +// "Device is being used by another application" on BOTH the AEC and no-AEC
 +// attempts back to back -- almost certainly the doorbell ringtone
@@ -586,7 +604,7 @@ index 0000000..82b650a
 +// in the failure path only, which beats a permanently silent call.
 +static bool start_pipeline_with_retry(const char *tag, GstElement *pipeline, int max_attempts, guint retry_delay_ms) {
 +    for (int attempt = 1; attempt <= max_attempts; attempt++) {
-+        if (start_and_confirm_playing(tag, pipeline)) {
++        if (start_pipeline_non_blocking(tag, pipeline)) {
 +            if (attempt > 1) {
 +                syncn_intercom_debug_log("audio", "%s: succeeded on retry attempt %d/%d", tag, attempt, max_attempts);
 +            }
@@ -902,19 +920,9 @@ index 0000000..82b650a
 +        gst_object_unref(playback_volume_elem);
 +    }
 +
-+    // start_pipeline_with_retry() now blocks and confirms PLAYING on every
-+    // attempt (see its definition above) instead of firing-and-forgetting --
-+    // start_locked() runs on its own detached pthread (start_thread_main(),
-+    // spawned via pthread_create() in the "start" method-channel handler
-+    // below), never on flutter-pi's platform thread, so the old
-+    // platform-thread-deadlock risk that motivated a non-blocking start does
-+    // not apply from this call site. Capture already blocked safely the same
-+    // way. Confirmed root cause (2026-09-16): the old non-blocking start
-+    // treated GST_STATE_CHANGE_ASYNC as unconditional success and never
-+    // polled again, so alsasink could silently stay stuck at ALSA state
-+    // OPEN/hw_ptr=0 forever during a real call -- no bus error, no failure
-+    // return, just dead silence. See
-+    // docs/intercom-alsink-never-playing-2026-09-16.md.
++    // Non-blocking by design -- see start_pipeline_non_blocking()'s comment
++    // for why making this blocking regressed real calls (panel-v1.3.86) and
++    // must not be retried without moving the confirmation outside self->lock.
 +    if (playback_appsrc == NULL || !start_pipeline_with_retry("syncn_intercom_audio playback", playback, 3, 150)) {
 +        if (aec_available) {
 +            // The in-line echo probe is the one extra failure mode here (e.g.
