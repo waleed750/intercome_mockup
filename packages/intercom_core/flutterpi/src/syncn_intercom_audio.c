@@ -956,8 +956,40 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     static const char *capture_desc_aec =
         "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-        "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=false "
-        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
+        // NS off + AGC on, taken verbatim from panel-v1.3.83 (0a26269) --
+        // the build the client confirmed did NOT cut off speech from the
+        // panel side. Applied on top of the working v1.3.73 base to fix a
+        // mic that is both too quiet AND drops syllables mid-sentence:
+        // measured on .203 that noise-suppression=moderate destroyed ~80%
+        // of an already-weak signal (isolated stage-by-stage rms: 186 -> 34
+        // with NS on, 145 with it off), which is what makes quiet syllables
+        // fall below what survives 8kHz A-law encoding and vanish entirely.
+        //
+        // target-level-dbfs=3, not 15: 15 came from 9fa5703, which was
+        // testing a door-half-duplex-suppression theory that did not pan
+        // out. 3 is what v1.3.83 shipped.
+        //
+        // The dropouts were NOT the half-duplex uplink gate -- ruled out
+        // first on 2026-09-16 by raising HD_THRESHOLD to 3000 and
+        // HD_HANGOVER to 120 via a systemd drop-in (a drop-in is required;
+        // `systemctl set-environment` does NOT reach the service, verified
+        // via /proc/PID/environ). Suppression went 58/966 -> 0/126 while the
+        // dropouts continued unchanged.
+        //
+        // AGC is the gain stage, so capvol stays at its 1.0 default -- do
+        // not stack a software boost on top (capvol=5.0 broke double-talk,
+        // see be5bbc3).
+        //
+        // NOT copied from v1.3.83: its alsasrc caps pinning
+        // (rate=44100,channels=2 + deinterleave, c844ecd). That is the
+        // leading suspect for the silent-downlink regression on this
+        // board's single shared PCM, and v1.3.73 works without it. It cost
+        // ~2x mic level (rms 662 -> 1423) by selecting the live channel
+        // instead of averaging with a dead one, so it is worth re-testing
+        // LATER, on its own, once downlink is confirmed still working here.
+        "webrtcdsp name=dsp echo-cancel=true noise-suppression=false gain-control=true "
+        "gain-control-mode=fixed-digital target-level-dbfs=3 "
+        "high-pass-filter=true extended-filter=true ! "
         "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
     static const char *capture_desc_plain =
