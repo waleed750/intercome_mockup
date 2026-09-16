@@ -447,6 +447,26 @@ final class CallController extends ChangeNotifier {
       if (_send(frame)) handshakeSent++;
     }
     debugPrint('Intercom: Answer handshake sent ($handshakeSent frames)');
+    // 2026-09-16: StartTalk moved from a 1s-delayed Timer to immediately
+    // after the Answer handshake -- testing a race-condition theory for
+    // the downlink-goes-silent-mid-call bug. Real evidence: two calls today
+    // showed the door's downlink freezing/degrading shortly after the
+    // OLD delayed StartTalk fired, while Android's reference client never
+    // sends StartTalk here at all and has no such issue. Working theory
+    // (not yet confirmed): if StartTalk arrives AFTER the door has already
+    // started its own downlink stream on its own initiative (which an
+    // incoming call implies -- the door called US), the door's firmware
+    // may treat it as an unexpected state transition and disrupt its own
+    // output. Sending it immediately, before the door's stream has had a
+    // full second to establish, tests whether TIMING relative to the
+    // door's own stream-start is what matters, rather than the command
+    // itself being categorically wrong for this path. If downlink still
+    // fails with this change, remove the call entirely to match Android
+    // (do NOT touch connectToDoor()'s StartTalk -- confirmed genuinely
+    // required there via wire capture, different scenario: panel calls
+    // door proactively, so the door has no stream to have already started).
+    _send(Commands.startTalk());
+    debugPrint('Intercom: StartTalk sent (immediately after Answer)');
     try {
       await _startAudio();
     } catch (e) {
@@ -454,11 +474,6 @@ final class CallController extends ChangeNotifier {
     }
     _setState(_state.copyWith(phase: CallPhase.connected));
     _startStatsLogging();
-    Timer(const Duration(seconds: 1), () {
-      if (_state.phase == CallPhase.connected && _send(Commands.startTalk())) {
-        debugPrint('Intercom: StartTalk sent');
-      }
-    });
   }
 
   Future<void> decline() async {
