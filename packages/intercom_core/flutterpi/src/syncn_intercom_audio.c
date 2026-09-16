@@ -476,25 +476,11 @@ static void log_pipeline_bus_errors(const char *tag, GstElement *pipeline) {
 // Non-blocking start for playback pipelines: set_state + failure check only,
 // no blocking gst_element_get_state() wait. The playback pipeline uses
 // appsrc is-live=true, which reaches PLAYING without needing buffers, and
-// real failures surface asynchronously via the bus log.
-//
-// DO NOT make this blocking for playback. Tried and reverted 2026-09-16
-// (shipped as panel-v1.3.86, immediately regressed real calls): the theory
-// was that treating GST_STATE_CHANGE_ASYNC as success without re-polling
-// let alsasink sit at ALSA state OPEN/hw_ptr=0 forever. Switching playback
-// to the blocking start_and_confirm_playing() below made it WORSE -- two
-// real 55s calls produced ZERO native audio log lines at all, because
-// start_locked() runs under self->lock and blocking there for up to 3s
-// starves handle_play_downlink(), which takes that same lock and is called
-// synchronously on flutter-pi's platform thread for every single downlink
-// frame. Capture's own blocking start already holds the lock up to 3s;
-// adding playback's on top pushed total lock-hold past what the downlink
-// path tolerates. The hw_ptr=0 observation was itself most likely a
-// SYMPTOM of that starvation (appsrc never fed -> alsasink never starts),
-// not the cause. See handle_play_downlink's own 2026-09-10 comment: this
-// codebase already learned once that holding self->lock across slow work
-// cuts downlink audio. Any future confirmation of the playback transition
-// must happen OUTSIDE self->lock.
+// real failures surface asynchronously via the bus log. The blocking 3s
+// get_state() was deadlocking the flutter-pi platform thread -- while it
+// blocked, no submit() method-channel calls could reach appsrc, creating a
+// chicken-and-egg deadlock that added exactly 3s to every call setup (see
+// syncn_intercom_video.c's identical fix).
 static bool start_pipeline_non_blocking(const char *tag, GstElement *pipeline) {
     GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     syncn_intercom_debug_log("audio", "%s: gst_element_set_state(PLAYING) -> %d (non-blocking)", tag, state_ret);
@@ -503,28 +489,6 @@ static bool start_pipeline_non_blocking(const char *tag, GstElement *pipeline) {
         return false;
     }
     log_pipeline_bus_errors(tag, pipeline);
-    return true;
-}
-
-// Blocking start for capture pipelines: confirms PLAYING via get_state().
-// Kept for capture only -- it's a separate, already-fast path (31ms in the
-// measured log) and captures need the pipeline confirmed running before
-// on_new_capture_sample can deliver useful uplink frames.
-static bool start_and_confirm_playing(const char *tag, GstElement *pipeline) {
-    GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-    syncn_intercom_debug_log("audio", "%s: gst_element_set_state(PLAYING) -> %d", tag, state_ret);
-    if (state_ret == GST_STATE_CHANGE_FAILURE) {
-        log_pipeline_bus_errors(tag, pipeline);
-        return false;
-    }
-    GstState final_state;
-    GstStateChangeReturn wait_ret = gst_element_get_state(pipeline, &final_state, NULL, 3 * GST_SECOND);
-    syncn_intercom_debug_log("audio", "%s: gst_element_get_state -> wait_ret=%d, final_state=%d", tag, wait_ret, final_state);
-    log_pipeline_bus_errors(tag, pipeline);
-    if (wait_ret == GST_STATE_CHANGE_FAILURE || (final_state != GST_STATE_PLAYING && wait_ret != GST_STATE_CHANGE_ASYNC)) {
-        LOG_ERROR("%s: pipeline did not reach PLAYING (wait_ret=%d, final_state=%d)\n", tag, wait_ret, final_state);
-        return false;
-    }
     return true;
 }
 
@@ -563,6 +527,28 @@ static bool start_pipeline_with_retry(const char *tag, GstElement *pipeline, int
         g_usleep(retry_delay_ms * 1000);
     }
     return false;
+}
+
+// Blocking start for capture pipelines: confirms PLAYING via get_state().
+// Kept for capture only -- it's a separate, already-fast path (31ms in the
+// measured log) and captures need the pipeline confirmed running before
+// on_new_capture_sample can deliver useful uplink frames.
+static bool start_and_confirm_playing(const char *tag, GstElement *pipeline) {
+    GstStateChangeReturn state_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    syncn_intercom_debug_log("audio", "%s: gst_element_set_state(PLAYING) -> %d", tag, state_ret);
+    if (state_ret == GST_STATE_CHANGE_FAILURE) {
+        log_pipeline_bus_errors(tag, pipeline);
+        return false;
+    }
+    GstState final_state;
+    GstStateChangeReturn wait_ret = gst_element_get_state(pipeline, &final_state, NULL, 3 * GST_SECOND);
+    syncn_intercom_debug_log("audio", "%s: gst_element_get_state -> wait_ret=%d, final_state=%d", tag, wait_ret, final_state);
+    log_pipeline_bus_errors(tag, pipeline);
+    if (wait_ret == GST_STATE_CHANGE_FAILURE || (final_state != GST_STATE_PLAYING && wait_ret != GST_STATE_CHANGE_ASYNC)) {
+        LOG_ERROR("%s: pipeline did not reach PLAYING (wait_ret=%d, final_state=%d)\n", tag, wait_ret, final_state);
+        return false;
+    }
+    return true;
 }
 
 // `headset_mode` picks between the panel's built-in speaker+mic (default,
@@ -763,45 +749,18 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     //   Back to the long-standing values now that the probe is positioned
     //   to report that delay honestly.
     static const char *playback_desc_aec =
-        // REGRESSION LOCALIZATION TEST (2026-09-16, panel-v1.3.88): this is
-        // the exact pre-abf42f2 topology, restored verbatim. abf42f2 ("put
-        // echo probe in-line so AEC gets a real delay") moved
-        // webrtcechoprobe OFF this tee side-branch and INTO the only path to
-        // alsasink, and simultaneously changed the queue threshold
-        // (300ms -> 80ms) and ALSA buffer-time (500ms -> 200ms). Downlink
-        // audio has been dead since, with the sink never prerolling:
-        // measured on .203 during a live call with real speech arriving and
-        // every gst_app_src_push_buffer returning GST_FLOW_OK --
-        // state: OPEN, hw_ptr: 0, appl_ptr: 0, hw_params: no setup. appl_ptr
-        // at 0 means alsasink never wrote a single sample, i.e. nothing ever
-        // reached it. With the probe in-line, anything that stalls it stalls
-        // all downlink; on this side-branch it cannot.
-        //
-        // Both tee branches have their own queue, which GStreamer's tee
-        // documentation requires -- without that, one blocked branch stalls
-        // the other, which would recreate the very failure being removed.
-        //
-        // This restores AEC's probe feed (same top-level pipeline as
-        // webrtcdsp, same rate) but gives up abf42f2's echo-delay
-        // improvement, so some echo may return. That is the accepted
-        // trade for having any downlink audio at all, and is expected to be
-        // revisited once the mechanism is isolated (inline probe vs. the
-        // 80ms queue threshold vs. their interaction -- all three were
-        // introduced by the same commit and are not yet distinguished).
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-        "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! tee name=t ! "
-        "queue min-threshold-time=300000000 max-size-time=1200000000 ! "
-        "alsasink device=plughw:0,0 sync=true buffer-time=500000 latency-time=20000 "
-        "t. ! queue leaky=downstream max-size-buffers=1 ! webrtcechoprobe name=syncn_echoprobe ! fakesink sync=false async=false";
+        "alawdec ! audioconvert ! audio/x-raw,rate=8000,channels=1 ! "
+        "volume name=playvol volume=1.0 ! "
+        "webrtcechoprobe name=syncn_echoprobe ! "
+        "audioconvert ! audioresample quality=10 ! "
+        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
+        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
     static const char *playback_desc_plain =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-        // Restored to pre-abf42f2 values alongside the AEC variant above --
-        // this path has no probe and never did, so it doubles as a control:
-        // if downlink still fails here, the inline probe is exonerated and
-        // the queue threshold / buffer-time change is implicated instead.
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! "
-        "queue min-threshold-time=300000000 max-size-time=1200000000 ! "
-        "alsasink device=plughw:0,0 sync=true buffer-time=500000 latency-time=20000";
+        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
+        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
 
     GError *error = NULL;
     GstElement *playback = gst_parse_launch(aec_available ? playback_desc_aec : playback_desc_plain, &error);
@@ -887,9 +846,6 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         gst_object_unref(playback_volume_elem);
     }
 
-    // Non-blocking by design -- see start_pipeline_non_blocking()'s comment
-    // for why making this blocking regressed real calls (panel-v1.3.86) and
-    // must not be retried without moving the confirmation outside self->lock.
     if (playback_appsrc == NULL || !start_pipeline_with_retry("syncn_intercom_audio playback", playback, 3, 150)) {
         if (aec_available) {
             // The in-line echo probe is the one extra failure mode here (e.g.
@@ -997,107 +953,15 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     //   is in what we TRANSMIT, and the damage lands inside the door
     //   station, which is why it only ever reproduces with the mic live and
     //   why Tuya's own app is unaffected on this identical hardware.
-    // Capture channel 0 explicitly instead of letting audioconvert average
-    // the codec's two channels down to mono. Measured on real hardware
-    // (192.168.100.203, 2026-09-15, same phrase and distance for each):
-    //
-    //   channel 0 alone:                     rms=1423
-    //   channel 1 alone:                     rms= 178   <- dead, noise floor only
-    //   both averaged (what we shipped):     rms= 662
-    //
-    // This board has ONE physical mic, wired to channel 0; channel 1 carries
-    // nothing. `audioconvert`'s stereo->mono downmix averages the two, so
-    // every call was mixing a live mic with silence and throwing away ~6 dB
-    // of signal for free. Taking channel 0 alone roughly doubles the level
-    // with no gain applied anywhere -- this is not a boost, it is the
-    // removal of a loss, which is why it costs nothing in AEC terms (unlike
-    // the compressor experiment reverted in a89abe0, which broke echo
-    // cancellation during double-talk).
-    //
-    // The codec natively opens at 44100 Hz stereo S16LE (confirmed via
-    // /proc/asound/card0/pcm0c/sub0/hw_params while a capture was live), so
-    // the caps below ask for exactly that and let audioresample quality=10
-    // do the 44.1k->8k conversion after the channel is selected. Keeping
-    // plughw (rather than raw hw) means a panel whose codec reports a
-    // different native format still negotiates instead of failing outright.
-    //
-    // Do not replace the deinterleave with `audioconvert ! audio/x-raw,
-    // channels=1` -- that is precisely the averaging path this fixes.
     static const char *capture_desc_aec =
-        "alsasrc device=plughw:0,0 ! audio/x-raw,rate=44100,channels=2,format=S16LE ! "
-        "deinterleave name=capdi  capdi.src_0 ! queue ! "
-        "audioconvert ! audioresample quality=10 ! "
+        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-        // noise-suppression=false (2026-09-15): measured on real hardware,
-        // isolated stage-by-stage, same phrase/distance for each --
-        //   raw mic:                                    rms=186
-        //   +webrtcdsp, noise-suppression-level=moderate: rms=34  (-82%)
-        //   +webrtcdsp, noise-suppression=false:          rms=145 (-22%)
-        // This is the actual root cause of "clear in a raw bench
-        // recording, too quiet in a real call" -- NS at `moderate` was
-        // stripping ~80% of an already-quiet signal, far more
-        // aggressively than intended. echo-cancel is untouched and
-        // stays on; NS and AEC are independent features of webrtcdsp,
-        // disabling one does not affect the other. If background noise
-        // becomes a real problem without NS, prefer capping
-        // noise-suppression-level at `low` over reintroducing
-        // `moderate`/`high` -- both measured as too aggressive for this
-        // mic's naturally low signal level.
-        //
-        // gain-control=true, fixed-digital (2026-09-15): an EARLIER
-        // session attempt at webrtcdsp AGC was rejected as "worse than
-        // plain gain" -- but that test ran with noise-suppression still
-        // on and aggressive, which was independently destroying most of
-        // the signal AGC had to work with. Retested in isolation with NS
-        // disabled (this same session, after the NS fix above): measured
-        // on real hardware, same phrase/distance each time --
-        //   raw mic:                          rms=202
-        //   webrtcdsp, NS off, AGC off:        rms=112
-        //   webrtcdsp, NS off, AGC fixed-digital target=3dBFS: rms=541
-        // A second independent recording (fresh capture, not reusing a
-        // stale file) confirmed rms=1757 with AGC on -- the loudest
-        // reading of the entire investigation, well above even the
-        // mic's raw unprocessed level. NOTE: local bench playback of an
-        // 8kHz-captured file through this board's plughw sink is itself
-        // lossy (confirmed separately: a KNOWN-loud reference file
-        // round-tripped through the same 8kHz-then-back-to-44.1kHz path
-        // used to audition these bench captures came out audibly
-        // quieter than the untouched original) -- so a bench recording
-        // that "sounds quiet" on this panel's speaker is not reliable
-        // evidence against this fix. The rms number, measured on the
-        // raw un-resampled 8kHz samples, is trustworthy; local playback
-        // through plughw is not. Real validation has to happen on an
-        // actual call (8kHz A-law sent directly to the door, no local
-        // resample round-trip involved) -- MADE IT INTO A BUILD BUT NOT
-        // 2026-09-16: confirmed on a REAL CALL -- with target-level-dbfs=3
-        // (near full scale), uplink to the door was excellent, but the
-        // door's OWN downlink to us degraded from real audio to constant
-        // A-law silence (0xd5) after ~15-20s, while our uplink kept
-        // climbing normally (confirmed via /tmp/syncn_intercom_debug.log,
-        // not journald -- see that file's header comment). Working theory,
-        // sanity-checked externally: cheap Tuya-family door stations often
-        // implement half-duplex arbitration via a crude energy/VAD
-        // detector rather than real AEC -- a continuously loud/near-full-
-        // scale uplink can read as "far end talking non-stop", causing the
-        // door's firmware to suppress its OWN downlink to avoid feedback.
-        // The gradual real-audio-to-silence degradation (not an abrupt
-        // cutoff) is consistent with an energy threshold being crossed
-        // and the door settling into a suppressed state, not a connection
-        // failure. Backed target-level-dbfs off from 3 to 15 (quieter
-        // target, well below the door's likely suppression threshold) to
-        // test this directly. If downlink stays alive for a full call at
-        // this level, that confirms the theory -- do not push
-        // target-level-dbfs back toward 0 without re-verifying downlink
-        // survives the WHOLE call, not just checking uplink loudness.
-        "webrtcdsp name=dsp echo-cancel=true noise-suppression=false gain-control=true "
-        "gain-control-mode=fixed-digital target-level-dbfs=15 "
-        "high-pass-filter=true extended-filter=true ! "
+        "webrtcdsp name=dsp echo-cancel=true noise-suppression=true gain-control=false "
+        "high-pass-filter=true noise-suppression-level=moderate extended-filter=true ! "
         "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
     static const char *capture_desc_plain =
-        "alsasrc device=plughw:0,0 ! audio/x-raw,rate=44100,channels=2,format=S16LE ! "
-        "deinterleave name=capdi  capdi.src_0 ! queue ! "
-        "audioconvert ! audioresample quality=10 ! "
+        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
         "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
@@ -1127,70 +991,30 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
                 continue;
             }
             g_signal_connect(capture_appsink, "new-sample", G_CALLBACK(on_new_capture_sample), self);
-            // History of capvol boost attempts on this panel (PANEL_WIDTH=800):
-            // 2026-09-09: 1.8x -> loud whine/buzz, drowned out speech, reverted
-            // to 1.0. 2026-09-10: 1.2x, not isolated from an unrelated AEC
-            // change in the same build, client wanted back to 1.0. Both were
-            // real in-app call tests, but both also predate the standalone
-            // bench-test investigation below.
+            // Tried boosting capvol's gain to 1.8 on this panel (same
+            // PANEL_WIDTH=800 rationale as playvol) to compensate for this
+            // codec having no ALSA-side capture gain control -- confirmed
+            // on-device 2026-09-09 that 1.8 made call audio a loud
+            // whine/buzz (mechanical-sounding, not voice-shaped) that
+            // drowned out speech entirely, worse than the original quiet-
+            // but-clean mic. This is consistent with amplifying the mic's
+            // own electrical/self-noise floor rather than the voice signal
+            // -- there's no real gain-control silicon here to separate the
+            // two, unlike a proper mic preamp. Reverted to the unmodified
+            // 1.0 default (capture_volume kept only for the mute toggle
+            // below); quiet-but-intelligible beats loud-but-unusable, and
+            // there's no ALSA-side alternative to fall back to on this
+            // hardware. Do not re-attempt a capvol gain boost without a
+            // real on-device A/B of intermediate values (e.g. 1.2-1.4)
+            // first.
             //
-            // 2026-09-14 (docs/panel-audio-gain-final-findings.md in
-            // syncn_smarthome_panel): a clean, isolated GStreamer bench
-            // pipeline (alsasrc -> volume -> wavenc, no AEC, no app) at the
-            // real 8kHz call format found 2.5x "clear, if distant-sounding"
-            // -- explicitly confirmed by the client as a real improvement,
-            // with values above (2.7-3.2x) tried and rejected as worse.
-            // webrtcdsp's own AGC (gain-control=true) was ALSO tried
-            // separately that session, multiple configurations, every one
-            // worse than plain gain -- expected, since `amixer -c 0
-            // contents` confirms this codec has zero real preamp/PGA
-            // silicon, so AGC can't distinguish voice from the mic's
-            // electrical noise floor any better than a plain volume
-            // element can.
-            //
-            // 2026-09-15 findings, CONFIRMED ON A REAL CALL with the
-            // channel-0 capture fix (see capture_desc_aec comment above) in
-            // place -- read this before touching capvol again:
-            //
-            // At 2.5x: one direction at a time is clear (far end hears you
-            // fine when only you are talking, and vice versa), but you still
-            // have to stand close to the mic for a comfortable volume.
-            //
-            // At 5.0x (tried and REVERTED): loudness at a distance did not
-            // meaingfully improve, AND double-talk (both parties speaking at
-            // once) became noisy/unclear on BOTH ends -- the same double-
-            // talk-breaks-first signature as the compressor experiment
-            // reverted in a89abe0, except this time triggered by PLAIN
-            // LINEAR GAIN ALONE, no compressor, no non-linearity anywhere in
-            // the chain. This disproves the earlier working theory that
-            // "linear gain is AEC-safe, only non-linear processing isn't" --
-            // on this hardware/AEC combination, pushing capvol too high is
-            // ALSO enough to degrade double-talk cancellation by itself.
-            //
-            // Conclusion (superseded below): 2.5x is the ceiling for
-            // capvol ALONE that keeps double-talk clean. Raising capvol
-            // further was a closed avenue.
-            //
-            // 2026-09-15, LATER: the actual root cause of the raw-mic-
-            // clear-but-real-call-quiet gap was found to be
-            // noise-suppression=moderate (see capture_desc_aec comment,
-            // ~80% signal loss) and now webrtcdsp's own AGC
-            // (gain-control=true) is doing the loudness work instead,
-            // targeting near-full-scale (target-level-dbfs=3). Stacking
-            // capvol=2.5 ON TOP of AGC's own output would clip badly --
-            // AGC already brings the signal close to full scale on its
-            // own (measured rms=541-1757, the loudest readings all
-            // session, well above raw mic level). Reset capvol to 1.0
-            // (no-op) now that AGC is the gain stage. Do NOT re-raise
-            // capvol while AGC is enabled without re-measuring for
-            // clipping first.
-            if (capture_volume != NULL) {
-                const char *panel_width_cap = getenv("PANEL_WIDTH");
-                if (panel_width_cap != NULL && strcmp(panel_width_cap, "800") == 0) {
-                    g_object_set(capture_volume, "volume", 1.0, NULL);
-                    syncn_intercom_debug_log("audio", "start_locked: capvol=1.0 for PANEL_WIDTH=800 (AGC is the gain stage now, see comment above)");
-                }
-            }
+            // 2026-09-10: Tried 1.2x gain (low end of the suggested range)
+            // for PANEL_WIDTH=800. Confirmed on-device this build (with
+            // echo-cancel also disabled the same build, so not fully
+            // isolated) that the client wanted back to 1.0 -- reverted.
+            // Do not re-attempt a capvol gain boost without a real
+            // on-device A/B, isolated from any other audio change in the
+            // same build, confirming the client is fine with it.
             // Hand the playback pipeline's echo probe to webrtcdsp via
             // g_object_set -- gst_parse_launch can't resolve cross-pipeline
             // element references (the `probe=` syntax only works within the
@@ -1484,24 +1308,6 @@ static void on_method_channel_message(void *userdata, const FlutterPlatformMessa
     } else if (strcmp(object.method, "playDownlink") == 0) {
         if (object.std_arg.type == kStdUInt8Array) {
             handle_play_downlink(self, object.std_arg.uint8array, object.std_arg.size);
-        } else {
-            // 2026-09-15: unconditional (no DIAG gate, no per-call cap) --
-            // if the arg type check above is ever false, handle_play_downlink
-            // is silently never called and NOTHING is logged anywhere,
-            // including the unconditional DROPPED line inside that function
-            // (which never runs either, since this branch is what skips
-            // calling it). Confirmed on real hardware 2026-09-15: a call
-            // with rxAudio climbing healthily produced ZERO
-            // handle_play_downlink log lines of any kind, not even DROPPED
-            // -- consistent with this branch being the one actually hit,
-            // not a failure inside handle_play_downlink itself. This log
-            // line is the one piece of visibility that was missing to tell
-            // those two cases apart.
-            LOG_ERROR(
-                "syncn_intercom_audio: playDownlink called with wrong arg type (got %d, want kStdUInt8Array=%d) -- frame silently dropped, playback pipeline never receives it\n",
-                object.std_arg.type,
-                kStdUInt8Array
-            );
         }
         platch_respond_success_std(message->response_handle, NULL);
     } else if (strcmp(object.method, "setMuted") == 0) {
