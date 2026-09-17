@@ -35,6 +35,7 @@ struct syncn_aec3 {
     rtc::scoped_refptr<webrtc::AudioProcessing> apm;
     webrtc::StreamConfig stream_config;
     int num_channels;
+    double capture_gain_multiplier;
 };
 
 extern "C" struct syncn_aec3 *syncn_aec3_create(
@@ -42,7 +43,7 @@ extern "C" struct syncn_aec3 *syncn_aec3_create(
     int num_channels,
     int estimated_render_delay_ms,
     bool noise_suppression_enabled,
-    int agc_target_level_dbfs
+    double capture_gain_multiplier
 ) {
     if (sample_rate_hz != 8000 || num_channels != 1) {
         // The wrapper (and the wire format it serves) is 8kHz mono only --
@@ -57,9 +58,12 @@ extern "C" struct syncn_aec3 *syncn_aec3_create(
     config.echo_canceller.enabled = true;
     config.echo_canceller.mobile_mode = false;  // required for AEC3, see comment above
     config.noise_suppression.enabled = noise_suppression_enabled;
-    config.gain_controller1.enabled = true;
-    config.gain_controller1.mode = webrtc::AudioProcessing::Config::GainController1::kFixedDigital;
-    config.gain_controller1.target_level_dbfs = agc_target_level_dbfs;
+    // gain_controller1 deliberately left disabled (default: false). See
+    // syncn_aec3_create's header comment for the measurement showing
+    // compression_gain_db has no effect in this library build's
+    // kFixedDigital mode -- gain is applied manually in
+    // syncn_aec3_process_capture() instead, after AEC3 has already
+    // cancelled the echo.
     config.high_pass_filter.enabled = true;
 
     webrtc::AudioProcessing *raw = builder.Create();
@@ -77,6 +81,7 @@ extern "C" struct syncn_aec3 *syncn_aec3_create(
     aec->apm = apm;
     aec->stream_config = webrtc::StreamConfig(sample_rate_hz, static_cast<size_t>(num_channels));
     aec->num_channels = num_channels;
+    aec->capture_gain_multiplier = capture_gain_multiplier;
 
     if (estimated_render_delay_ms >= 0) {
         aec->apm->set_stream_delay_ms(estimated_render_delay_ms);
@@ -155,5 +160,25 @@ extern "C" bool syncn_aec3_process_capture(struct syncn_aec3 *aec, const int16_t
             return false;
         }
     }
+
+    // Manual makeup gain, applied AFTER echo cancellation -- see
+    // syncn_aec3_create's header comment for why this replaces AEC3's own
+    // (measured-inert) gain_controller1. Verified via a standalone harness
+    // not to clip a realistic speech-envelope signal at this codebase's
+    // chosen multiplier; still clamp defensively per-sample since real mic
+    // input is not guaranteed to match that synthetic envelope exactly.
+    if (aec->capture_gain_multiplier != 1.0) {
+        for (size_t i = 0; i < num_samples_20ms; i++) {
+            double scaled = static_cast<double>(out[i]) * aec->capture_gain_multiplier;
+            if (scaled > 32767.0) {
+                out[i] = 32767;
+            } else if (scaled < -32768.0) {
+                out[i] = -32768;
+            } else {
+                out[i] = static_cast<int16_t>(scaled);
+            }
+        }
+    }
+
     return true;
 }

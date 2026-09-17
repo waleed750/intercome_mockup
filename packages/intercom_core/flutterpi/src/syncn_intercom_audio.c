@@ -1081,7 +1081,17 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     // frame (see syncn_aec3_process_capture) rather than trusting it
     // blindly, but starting close to the truth beats starting from AEC3's
     // own default of 0.
-    struct syncn_aec3 *aec3 = syncn_aec3_create(8000, 1, 280, /* noise_suppression_enabled */ false, /* agc_target_level_dbfs */ 3);
+    //
+    // capture_gain_multiplier=4.0 (2026-09-17): confirmed on-device that
+    // downlink (door->panel) was excellent but uplink (panel->door) was
+    // weak, only usable close to the mic -- same "too quiet" symptom as
+    // pre-AEC3, because AEC3's own gain_controller1 is inert in this
+    // library build (see syncn_intercom_aec3.h). 4.0x verified via a
+    // standalone harness not to clip a realistic speech-envelope signal
+    // (peaked at 10% of full scale). Re-tune from here based on real-call
+    // feedback -- values up to ~6-8x were also clean in that harness, but
+    // only 4.0x has been chosen for an actual build so far.
+    struct syncn_aec3 *aec3 = syncn_aec3_create(8000, 1, 280, /* noise_suppression_enabled */ false, /* capture_gain_multiplier */ 4.0);
     if (aec3 == NULL) {
         // A call with no echo cancellation beats no call at all.
         LOG_ERROR("syncn_intercom_audio: failed to create AEC3 instance -- proceeding without echo cancellation\n");

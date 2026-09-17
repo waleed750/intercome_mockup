@@ -66,13 +66,32 @@ struct syncn_aec3;
 // + 200ms ALSA buffer-time) rather than 0, which is what AEC3 assumes if you
 // never call syncn_aec3_set_stream_delay_ms at all.
 //
-// noise_suppression_enabled / agc_target_level_dbfs mirror the settings this
-// codebase already measured and kept from the old webrtcdsp config
-// (noise-suppression=false, gain-control=true fixed-digital
-// target-level-dbfs=3) -- see capture_desc_aec's history in
-// syncn_intercom_audio.c for why those specific values. Pass through rather
-// than hardcoding here so a future tuning change doesn't need to touch this
-// file.
+// noise_suppression_enabled mirrors the setting this codebase already
+// measured and kept from the old webrtcdsp config (noise-suppression=false
+// -- see capture_desc's history in syncn_intercom_audio.c: NS=moderate was
+// measured destroying ~80% of an already-weak signal).
+//
+// capture_gain_multiplier (2026-09-17): AEC3's own gain_controller1 is
+// DELIBERATELY left disabled here (see .cpp) -- config.gain_controller1
+// .compression_gain_db was tested across the full 0-18 dB range in this
+// exact library build via a standalone harness (fed a real built
+// AudioProcessing instance synthetic tones, not guessed) and measured ZERO
+// effect on output amplitude every time (steady ~3.1x gain regardless of
+// the value set). Whatever internal path this build's kFixedDigital mode
+// is supposed to use, it isn't reachable through that documented field, and
+// I was not willing to ship a second guess after getting the equivalent
+// target_level_dbfs field wrong first. A plain linear multiplier applied
+// in C, AFTER AEC3's ProcessStream returns and BEFORE A-law encoding, is
+// simple, predictable, and was verified (same harness) not to clip at 4.0x
+// even against a synthetic speech-envelope signal with realistic
+// 5x-average peaks (peaked at only 15% of full scale at 6.0x). Pass 1.0
+// for no additional gain. Values above ~6-8x should be re-verified before
+// use -- this codebase has hit real distortion/whine at aggressive gains
+// before (capvol=5.0, capvol=1.8x on this same mic), though those were
+// applied to the UNCANCELLED signal; gain after AEC3 cancellation is
+// expected to be safer since it's not also amplifying uncancelled echo,
+// but that expectation itself is untested on real hardware as of this
+// writing.
 //
 // Returns NULL on failure (logs nothing itself -- caller logs via
 // syncn_intercom_debug_log, matching this codebase's existing convention).
@@ -81,7 +100,7 @@ struct syncn_aec3 *syncn_aec3_create(
     int num_channels,
     int estimated_render_delay_ms,
     bool noise_suppression_enabled,
-    int agc_target_level_dbfs
+    double capture_gain_multiplier
 );
 
 void syncn_aec3_destroy(struct syncn_aec3 *aec);
@@ -96,11 +115,13 @@ void syncn_aec3_destroy(struct syncn_aec3 *aec);
 // Returns false if the APM call fails (logs nothing; see above).
 bool syncn_aec3_process_render(struct syncn_aec3 *aec, const int16_t *samples, size_t num_samples_20ms);
 
-// Feeds one 20ms PCM chunk of CAPTURE (near-end / mic / uplink) audio and
-// writes the echo-cancelled result into `out` (caller-allocated, same size
-// as `samples` -- may alias `samples` for in-place processing, matching
-// AudioProcessing::ProcessStream's documented support for in-place use).
-// This is the direct replacement for webrtcdsp's role on the capture side.
+// Feeds one 20ms PCM chunk of CAPTURE (near-end / mic / uplink) audio,
+// applies echo cancellation, then multiplies by capture_gain_multiplier
+// (see syncn_aec3_create's comment) and clamps to int16 range, writing the
+// result into `out` (caller-allocated, same size as `samples` -- may alias
+// `samples` for in-place processing, matching AudioProcessing::
+// ProcessStream's documented support for in-place use). This is the direct
+// replacement for webrtcdsp's role on the capture side.
 //
 // delay_ms_hint, if >= 0, is passed to set_stream_delay_ms() before
 // processing (see AudioProcessing's own documented usage pattern: call
