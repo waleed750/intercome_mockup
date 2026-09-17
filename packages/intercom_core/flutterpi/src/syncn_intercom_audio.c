@@ -1113,7 +1113,20 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     // confirmed not to fight AEC3 under synthetic double-talk. Re-tune
     // from here based on real-call feedback -- 18-24 dB were also clean
     // in the harness if more is needed.
-    struct syncn_aec3 *aec3 = syncn_aec3_create(8000, 1, 280, /* noise_suppression_enabled */ false, /* capture_gain_db */ 12.0);
+    // capture_gain_db REVERTED to 0.0 (2026-09-17): the AEC3_GAIN_CHECK
+    // diagnostic (panel-v1.3.95) proved the mic was NEVER quiet on real
+    // hardware -- raw max_in reached 6242-13971 out of a possible 32767
+    // (25-43% of full scale) on an ordinary test call, and AGC2's limiter
+    // was visibly fighting the 12dB fixed gain frame-to-frame (ratio
+    // swinging 0.09 to 4.4x) trying to avoid clipping an already-loud
+    // signal -- max_out hit 28998 (88% of full scale) by frame 29. That
+    // frame-to-frame gain instability, not a config bug, is what produced
+    // the reported noise/garbling. Every earlier theory today
+    // (GainController1 inert, then GainController2 not reaching the
+    // signal) was chasing the wrong problem: the mic was never too quiet,
+    // additional gain was actively harmful. See
+    // docs/aec3-plan-2026-09-17.md for the full investigation.
+    struct syncn_aec3 *aec3 = syncn_aec3_create(8000, 1, 280, /* noise_suppression_enabled */ false, /* capture_gain_db */ 0.0);
     if (aec3 == NULL) {
         // A call with no echo cancellation beats no call at all.
         LOG_ERROR("syncn_intercom_audio: failed to create AEC3 instance -- proceeding without echo cancellation\n");
