@@ -1082,16 +1082,19 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     // blindly, but starting close to the truth beats starting from AEC3's
     // own default of 0.
     //
-    // capture_gain_multiplier=4.0 (2026-09-17): confirmed on-device that
-    // downlink (door->panel) was excellent but uplink (panel->door) was
-    // weak, only usable close to the mic -- same "too quiet" symptom as
-    // pre-AEC3, because AEC3's own gain_controller1 is inert in this
-    // library build (see syncn_intercom_aec3.h). 4.0x verified via a
-    // standalone harness not to clip a realistic speech-envelope signal
-    // (peaked at 10% of full scale). Re-tune from here based on real-call
-    // feedback -- values up to ~6-8x were also clean in that harness, but
-    // only 4.0x has been chosen for an actual build so far.
-    struct syncn_aec3 *aec3 = syncn_aec3_create(8000, 1, 280, /* noise_suppression_enabled */ false, /* capture_gain_multiplier */ 4.0);
+    // capture_gain_db=12.0 (~3.86x) (2026-09-17): confirmed on-device
+    // (panel-v1.3.93, which used a manual post-ProcessStream multiplier
+    // instead of this) that downlink (door->panel) was excellent but
+    // uplink (panel->door) was still weak/close-mic-only. That build's
+    // gain never demonstrably worked; GainController2 (AGC2) via
+    // fixed_digital.gain_db is used here instead, verified via a
+    // standalone harness to be a genuinely live, correctly-scaling gain
+    // knob in this library build (unlike GainController1's two documented
+    // fields, both measured inert -- see syncn_intercom_aec3.h) and
+    // confirmed not to fight AEC3 under synthetic double-talk. Re-tune
+    // from here based on real-call feedback -- 18-24 dB were also clean
+    // in the harness if more is needed.
+    struct syncn_aec3 *aec3 = syncn_aec3_create(8000, 1, 280, /* noise_suppression_enabled */ false, /* capture_gain_db */ 12.0);
     if (aec3 == NULL) {
         // A call with no echo cancellation beats no call at all.
         LOG_ERROR("syncn_intercom_audio: failed to create AEC3 instance -- proceeding without echo cancellation\n");

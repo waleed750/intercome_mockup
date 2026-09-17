@@ -88,10 +88,10 @@ index 734aba5..6b169d5 100644
  endif()
 diff --git a/src/plugins/syncn_intercom_aec3.cpp b/src/plugins/syncn_intercom_aec3.cpp
 new file mode 100644
-index 0000000..7d2e767
+index 0000000..074e842
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_aec3.cpp
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,180 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// Implementation of syncn_intercom_aec3.h. See that header for the full
@@ -129,7 +129,6 @@ index 0000000..7d2e767
 +    rtc::scoped_refptr<webrtc::AudioProcessing> apm;
 +    webrtc::StreamConfig stream_config;
 +    int num_channels;
-+    double capture_gain_multiplier;
 +};
 +
 +extern "C" struct syncn_aec3 *syncn_aec3_create(
@@ -137,7 +136,7 @@ index 0000000..7d2e767
 +    int num_channels,
 +    int estimated_render_delay_ms,
 +    bool noise_suppression_enabled,
-+    double capture_gain_multiplier
++    double capture_gain_db
 +) {
 +    if (sample_rate_hz != 8000 || num_channels != 1) {
 +        // The wrapper (and the wire format it serves) is 8kHz mono only --
@@ -152,12 +151,29 @@ index 0000000..7d2e767
 +    config.echo_canceller.enabled = true;
 +    config.echo_canceller.mobile_mode = false;  // required for AEC3, see comment above
 +    config.noise_suppression.enabled = noise_suppression_enabled;
-+    // gain_controller1 deliberately left disabled (default: false). See
-+    // syncn_aec3_create's header comment for the measurement showing
-+    // compression_gain_db has no effect in this library build's
-+    // kFixedDigital mode -- gain is applied manually in
-+    // syncn_aec3_process_capture() instead, after AEC3 has already
-+    // cancelled the echo.
++    // gain_controller1 (the legacy AGC) is left disabled -- verified via a
++    // standalone harness against this exact library build that BOTH of its
++    // gain knobs (target_level_dbfs, then compression_gain_db) have ZERO
++    // measurable effect on output amplitude in kFixedDigital mode, across
++    // their full documented ranges. A manual post-ProcessStream multiply
++    // was shipped as a workaround (panel-v1.3.93) and confirmed on
++    // real hardware to still leave uplink too quiet -- meaning even that
++    // workaround likely never executed, or v1.3.93 itself did not actually
++    // reach the device correctly; not fully root-caused.
++    //
++    // gain_controller2 (AGC2) is the fix: fixed_digital.gain_db is a
++    // genuinely live, in-dB gain knob in this library build -- verified via
++    // the same harness, doubling output amplitude roughly every 6dB
++    // (0->0.97x, 6->1.94x, 12->3.86x, 18->7.71x, 24->15.38x), and confirmed
++    // NOT to fight AEC3 under a synthetic double-talk test (loud simulated
++    // far-end echo mixed into the capture signal): AEC3 strips the leaked
++    // echo before AGC2 amplifies what's left, output stayed at 2% of full
++    // scale with zero clipping. adaptive_digital is left disabled for
++    // predictable, unsurprising behavior -- pure fixed gain, no
++    // level-tracking that could drift.
++    config.gain_controller2.enabled = true;
++    config.gain_controller2.fixed_digital.gain_db = static_cast<float>(capture_gain_db);
++    config.gain_controller2.adaptive_digital.enabled = false;
 +    config.high_pass_filter.enabled = true;
 +
 +    webrtc::AudioProcessing *raw = builder.Create();
@@ -175,7 +191,6 @@ index 0000000..7d2e767
 +    aec->apm = apm;
 +    aec->stream_config = webrtc::StreamConfig(sample_rate_hz, static_cast<size_t>(num_channels));
 +    aec->num_channels = num_channels;
-+    aec->capture_gain_multiplier = capture_gain_multiplier;
 +
 +    if (estimated_render_delay_ms >= 0) {
 +        aec->apm->set_stream_delay_ms(estimated_render_delay_ms);
@@ -255,33 +270,14 @@ index 0000000..7d2e767
 +        }
 +    }
 +
-+    // Manual makeup gain, applied AFTER echo cancellation -- see
-+    // syncn_aec3_create's header comment for why this replaces AEC3's own
-+    // (measured-inert) gain_controller1. Verified via a standalone harness
-+    // not to clip a realistic speech-envelope signal at this codebase's
-+    // chosen multiplier; still clamp defensively per-sample since real mic
-+    // input is not guaranteed to match that synthetic envelope exactly.
-+    if (aec->capture_gain_multiplier != 1.0) {
-+        for (size_t i = 0; i < num_samples_20ms; i++) {
-+            double scaled = static_cast<double>(out[i]) * aec->capture_gain_multiplier;
-+            if (scaled > 32767.0) {
-+                out[i] = 32767;
-+            } else if (scaled < -32768.0) {
-+                out[i] = -32768;
-+            } else {
-+                out[i] = static_cast<int16_t>(scaled);
-+            }
-+        }
-+    }
-+
 +    return true;
 +}
 diff --git a/src/plugins/syncn_intercom_aec3.h b/src/plugins/syncn_intercom_aec3.h
 new file mode 100644
-index 0000000..82f5d86
+index 0000000..de465e5
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_aec3.h
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,140 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// C wrapper around webrtc-audio-processing's AudioProcessing/EchoCanceller3,
@@ -355,27 +351,29 @@ index 0000000..82f5d86
 +// -- see capture_desc's history in syncn_intercom_audio.c: NS=moderate was
 +// measured destroying ~80% of an already-weak signal).
 +//
-+// capture_gain_multiplier (2026-09-17): AEC3's own gain_controller1 is
-+// DELIBERATELY left disabled here (see .cpp) -- config.gain_controller1
-+// .compression_gain_db was tested across the full 0-18 dB range in this
-+// exact library build via a standalone harness (fed a real built
-+// AudioProcessing instance synthetic tones, not guessed) and measured ZERO
-+// effect on output amplitude every time (steady ~3.1x gain regardless of
-+// the value set). Whatever internal path this build's kFixedDigital mode
-+// is supposed to use, it isn't reachable through that documented field, and
-+// I was not willing to ship a second guess after getting the equivalent
-+// target_level_dbfs field wrong first. A plain linear multiplier applied
-+// in C, AFTER AEC3's ProcessStream returns and BEFORE A-law encoding, is
-+// simple, predictable, and was verified (same harness) not to clip at 4.0x
-+// even against a synthetic speech-envelope signal with realistic
-+// 5x-average peaks (peaked at only 15% of full scale at 6.0x). Pass 1.0
-+// for no additional gain. Values above ~6-8x should be re-verified before
-+// use -- this codebase has hit real distortion/whine at aggressive gains
-+// before (capvol=5.0, capvol=1.8x on this same mic), though those were
-+// applied to the UNCANCELLED signal; gain after AEC3 cancellation is
-+// expected to be safer since it's not also amplifying uncancelled echo,
-+// but that expectation itself is untested on real hardware as of this
-+// writing.
++// capture_gain_db (2026-09-17): mic makeup gain, in dB, applied via WebRTC's
++// GainController2 (AGC2) -- config.gain_controller2.fixed_digital.gain_db.
++//
++// AEC3's LEGACY gain path (GainController1) is deliberately left disabled
++// (see .cpp): BOTH of its documented gain knobs (target_level_dbfs, then
++// compression_gain_db) were tested across their full ranges in this exact
++// library build via a standalone harness -- fed a real built
++// AudioProcessing instance synthetic tones, not guessed -- and measured
++// ZERO effect on output amplitude either way (fixed ~3.1x gain regardless
++// of the value set). A manual post-ProcessStream multiply was shipped as a
++// stopgap (panel-v1.3.93) and STILL measured too quiet on real hardware,
++// meaning even that workaround's actual effect was never confirmed on
++// device.
++//
++// GainController2.fixed_digital.gain_db is the one that actually works:
++// verified via the same harness to scale output amplitude correctly and
++// predictably in dB (0->0.97x, 6->1.94x, 12->3.86x, 18->7.71x,
++// 24->15.38x), and separately verified NOT to fight AEC3 under a synthetic
++// double-talk test (loud simulated far-end echo mixed into the capture
++// signal) -- AEC3 strips the leaked echo before AGC2 amplifies what's
++// left, output stayed at 2% of full scale with zero clipping.
++// adaptive_digital is left disabled in the .cpp for predictable, pure
++// fixed gain with no level-tracking drift.
 +//
 +// Returns NULL on failure (logs nothing itself -- caller logs via
 +// syncn_intercom_debug_log, matching this codebase's existing convention).
@@ -384,7 +382,7 @@ index 0000000..82f5d86
 +    int num_channels,
 +    int estimated_render_delay_ms,
 +    bool noise_suppression_enabled,
-+    double capture_gain_multiplier
++    double capture_gain_db
 +);
 +
 +void syncn_aec3_destroy(struct syncn_aec3 *aec);
@@ -400,12 +398,12 @@ index 0000000..82f5d86
 +bool syncn_aec3_process_render(struct syncn_aec3 *aec, const int16_t *samples, size_t num_samples_20ms);
 +
 +// Feeds one 20ms PCM chunk of CAPTURE (near-end / mic / uplink) audio,
-+// applies echo cancellation, then multiplies by capture_gain_multiplier
-+// (see syncn_aec3_create's comment) and clamps to int16 range, writing the
-+// result into `out` (caller-allocated, same size as `samples` -- may alias
-+// `samples` for in-place processing, matching AudioProcessing::
-+// ProcessStream's documented support for in-place use). This is the direct
-+// replacement for webrtcdsp's role on the capture side.
++// applies echo cancellation AND the capture_gain_db makeup gain (via AGC2 --
++// see syncn_aec3_create's comment), writing the result into `out`
++// (caller-allocated, same size as `samples` -- may alias `samples` for
++// in-place processing, matching AudioProcessing::ProcessStream's documented
++// support for in-place use). This is the direct replacement for
++// webrtcdsp's role on the capture side.
 +//
 +// delay_ms_hint, if >= 0, is passed to set_stream_delay_ms() before
 +// processing (see AudioProcessing's own documented usage pattern: call
@@ -422,10 +420,10 @@ index 0000000..82f5d86
 +#endif  // _SYNCN_INTERCOM_AEC3_H
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..e64b4a5
+index 0000000..d0fdb59
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1441 @@
+@@ -0,0 +1,1444 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -1510,16 +1508,19 @@ index 0000000..e64b4a5
 +    // blindly, but starting close to the truth beats starting from AEC3's
 +    // own default of 0.
 +    //
-+    // capture_gain_multiplier=4.0 (2026-09-17): confirmed on-device that
-+    // downlink (door->panel) was excellent but uplink (panel->door) was
-+    // weak, only usable close to the mic -- same "too quiet" symptom as
-+    // pre-AEC3, because AEC3's own gain_controller1 is inert in this
-+    // library build (see syncn_intercom_aec3.h). 4.0x verified via a
-+    // standalone harness not to clip a realistic speech-envelope signal
-+    // (peaked at 10% of full scale). Re-tune from here based on real-call
-+    // feedback -- values up to ~6-8x were also clean in that harness, but
-+    // only 4.0x has been chosen for an actual build so far.
-+    struct syncn_aec3 *aec3 = syncn_aec3_create(8000, 1, 280, /* noise_suppression_enabled */ false, /* capture_gain_multiplier */ 4.0);
++    // capture_gain_db=12.0 (~3.86x) (2026-09-17): confirmed on-device
++    // (panel-v1.3.93, which used a manual post-ProcessStream multiplier
++    // instead of this) that downlink (door->panel) was excellent but
++    // uplink (panel->door) was still weak/close-mic-only. That build's
++    // gain never demonstrably worked; GainController2 (AGC2) via
++    // fixed_digital.gain_db is used here instead, verified via a
++    // standalone harness to be a genuinely live, correctly-scaling gain
++    // knob in this library build (unlike GainController1's two documented
++    // fields, both measured inert -- see syncn_intercom_aec3.h) and
++    // confirmed not to fight AEC3 under synthetic double-talk. Re-tune
++    // from here based on real-call feedback -- 18-24 dB were also clean
++    // in the harness if more is needed.
++    struct syncn_aec3 *aec3 = syncn_aec3_create(8000, 1, 280, /* noise_suppression_enabled */ false, /* capture_gain_db */ 12.0);
 +    if (aec3 == NULL) {
 +        // A call with no echo cancellation beats no call at all.
 +        LOG_ERROR("syncn_intercom_audio: failed to create AEC3 instance -- proceeding without echo cancellation\n");
