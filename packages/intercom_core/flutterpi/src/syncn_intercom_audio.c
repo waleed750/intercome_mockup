@@ -501,10 +501,29 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
     // beats no call, matching this file's existing posture elsewhere.
     int16_t aec3_out[160];
     const int16_t *processed_pcm = pcm_in;
+    bool aec3_ran = false;
     if (aec3 != NULL && num_samples == 160) {
         if (syncn_aec3_process_capture(aec3, pcm_in, aec3_out, num_samples, 280)) {
             processed_pcm = aec3_out;
+            aec3_ran = true;
         }
+    }
+    // TEMP DIAGNOSTIC (2026-09-17): explicit before/after amplitude, not
+    // inferred from A-law byte ranges -- direct answer to whether AGC2's
+    // gain is reaching the real plugin at all. Remove once resolved.
+    if (should_log) {
+        int16_t max_in = 0, max_out = 0;
+        for (size_t i = 0; i < num_samples; i++) {
+            int16_t a = pcm_in[i] < 0 ? (int16_t) -pcm_in[i] : pcm_in[i];
+            int16_t b = processed_pcm[i] < 0 ? (int16_t) -processed_pcm[i] : processed_pcm[i];
+            if (a > max_in) max_in = a;
+            if (b > max_out) max_out = b;
+        }
+        syncn_intercom_debug_log(
+            "audio",
+            "on_new_capture_sample #%d: AEC3_GAIN_CHECK aec3_ran=%d max_in=%d max_out=%d ratio=%.2f",
+            count, aec3_ran, max_in, max_out, max_in > 0 ? (double) max_out / max_in : 0.0
+        );
     }
 
     // A-law encode the (possibly AEC3-processed) PCM -- this file's own
