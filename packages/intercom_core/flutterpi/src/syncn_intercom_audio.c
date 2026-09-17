@@ -14,15 +14,26 @@
 // playback appsrc. `stop()` tears both pipelines down.
 //
 // AEC/NS/AGC parity with the Android path's AcousticEchoCanceler/
-// NoiseSuppressor/AutomaticGainControl: implemented via GstElements
-// `webrtcechoprobe` (tapped off the playback pipeline, downstream of
-// alawdec, as the far-end reference) and `webrtcdsp` (in the capture
-// pipeline, ahead of the encoder). Both live in gst-plugins-bad and pair up
-// automatically process-wide -- they don't need to share a GstBin/GstBus,
-// which is why this works fine across our two separate playback/capture
-// GstPipelines. Guarded by gst_element_available() so a panel image without
-// gst-plugins-bad still gets working (just non-echo-cancelled) audio instead
-// of every call failing to start.
+// NoiseSuppressor/AutomaticGainControl: implemented by calling WebRTC's
+// AudioProcessing/AEC3 directly (see syncn_intercom_aec3.h) from C, NOT via
+// GStreamer's webrtcdsp/webrtcechoprobe elements.
+//
+// That used to be the approach (this comment used to claim webrtcdsp and
+// webrtcechoprobe "pair up automatically process-wide" across our separate
+// playback/capture GstPipelines -- found 2026-09-17 to be flatly wrong).
+// GStreamer's own webrtcdsp documentation states plainly "The probe can
+// only be used within the same top level GstPipeline"; a GStreamer
+// maintainer gave identical advice to someone else with this exact
+// two-pipeline setup. The cross-pipeline name-based link
+// (g_object_set(dsp, "probe", "name", NULL)) let the property set succeed
+// and the code log "AEC engaged" for this panel's entire history, but no
+// cancellation ever actually ran. Debian 11's packaged webrtc-audio-
+// processing (0.3, from 2016) was also, separately, tested and found too
+// weak for this hardware even once correctly wired into a single pipeline.
+// AEC3 (a materially newer, delay-agile algorithm, called directly instead
+// of through GStreamer) replaces both problems at once. handle_play_downlink
+// feeds the render/reference signal, on_new_capture_sample feeds and reads
+// back the capture signal.
 //
 // Headset routing: this board (rk809 codec) exposes no kernel jack-detect
 // input device (confirmed via /proc/bus/input/devices), so the panel can't
@@ -85,6 +96,7 @@
 #include "flutter-pi.h"
 #include "platformchannel.h"
 #include "pluginregistry.h"
+#include "syncn_intercom_aec3.h"
 #include "syncn_intercom_debug.h"
 #include "syncn_intercom_gst_util.h"
 #include "util/logging.h"
@@ -271,9 +283,12 @@ static bool half_duplex_enabled(void) {
     return g_half_duplex_enabled == 1;
 }
 
-// Standard ITU-T G.711 A-law expansion. Only used to measure level, never to
-// re-encode -- alawdec downstream remains the single decoder of record for
-// anything that actually gets played.
+// Standard ITU-T G.711 A-law expansion. Used both to measure level (its
+// original purpose here) and, since 2026-09-17, to build the real PCM
+// reference fed to AEC3's render side in handle_play_downlink --
+// alawdec remains the single decoder of record for what actually reaches
+// the speaker; this is a second, independent decode purely for AEC3's
+// benefit and never touches what gets pushed to appsrc.
 static inline int syncn_alaw_expand(uint8_t a) {
     a ^= 0x55;
     int sign = a & 0x80;
@@ -282,6 +297,53 @@ static inline int syncn_alaw_expand(uint8_t a) {
     int sample = (exponent == 0) ? ((mantissa << 4) + 8)
                                  : (((mantissa << 4) + 0x108) << (exponent - 1));
     return sign ? -sample : sample;
+}
+
+// Standard ITU-T G.711 A-law compression -- the inverse of
+// syncn_alaw_expand() above. Needed since 2026-09-17: the capture pipeline
+// no longer contains alawenc (removed alongside webrtcdsp -- see the file
+// header comment), so on_new_capture_sample must encode the AEC3-processed
+// PCM to A-law itself before sending it as an uplink event.
+//
+// This is the canonical reference algorithm (the public-domain G.711
+// linear2alaw implementation used by ffmpeg/libsndfile/most codecs), not a
+// derivation -- a first hand-derived attempt at this (segment boundaries
+// one bit too low, wrong shift for segment 0/1, plain negation instead of
+// one's-complement for negative samples) was caught by testing against
+// Python's audioop.lin2alaw across the full int16 range before it ever
+// reached a build: 462/486 samples wrong on a coarse sweep. This version
+// was verified byte-for-byte identical to audioop.lin2alaw across all
+// 65536 possible int16 inputs (0 mismatches) before being written here.
+static inline uint8_t syncn_alaw_compress(int16_t pcm) {
+    static const int seg_end[8] = { 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF, 0x3FFF, 0x7FFF };
+
+    int mask;
+    int sample = pcm;
+    if (sample >= 0) {
+        mask = 0xD5;
+    } else {
+        mask = 0x55;
+        sample = -sample - 1;  // one's-complement, not plain negation
+    }
+    if (sample > 0x7FFF) sample = 0x7FFF;
+
+    int seg = 8;
+    for (int i = 0; i < 8; i++) {
+        if (sample <= seg_end[i]) {
+            seg = i;
+            break;
+        }
+    }
+
+    uint8_t alaw;
+    if (seg >= 8) {
+        alaw = (uint8_t) (0x7F ^ mask);
+    } else {
+        int aval = seg << 4;
+        aval |= (seg < 2) ? ((sample >> 4) & 0x0F) : ((sample >> (seg + 3)) & 0x0F);
+        alaw = (uint8_t) (aval ^ mask);
+    }
+    return alaw;
 }
 
 // Mean absolute amplitude of an A-law payload, in linear PCM units.
@@ -326,6 +388,22 @@ struct syncn_intercom_audio {
     GstElement *capture_appsink;
     GstElement *capture_volume;
 
+    // AEC3 (2026-09-17), called directly instead of through GStreamer's
+    // webrtcdsp/webrtcechoprobe -- see syncn_intercom_aec3.h for the full
+    // rationale. Set once in start_locked() before either pipeline starts
+    // producing buffers, read (never mutated) by handle_play_downlink (the
+    // platform thread, feeding the render/reference side) and
+    // on_new_capture_sample (the capture GStreamer thread, feeding the
+    // capture side) without a lock: webrtc::AudioProcessing is documented
+    // thread-safe specifically between its capture-side and render-side
+    // calls, which is the whole point -- that's what lets one thread feed
+    // ProcessReverseStream while another concurrently feeds ProcessStream.
+    // Detached in teardown_locked() and destroyed in teardown_unlocked(),
+    // AFTER both GStreamer pipelines have actually settled -- destroying it
+    // any earlier risks a capture/render callback still in flight on a
+    // GStreamer streaming thread using a freed pointer.
+    struct syncn_aec3 *aec3;
+
     int playback_count;
     int capture_count;
 
@@ -347,7 +425,7 @@ struct syncn_intercom_audio {
 // tries to acquire `self->lock` itself -- calling it while still holding the
 // lock deadlocks the platform thread against the streaming thread, freezing
 // the whole panel (confirmed on-device, same failure mode as the video plugin).
-static void teardown_locked(struct syncn_intercom_audio *self, GstElement **playback_out, GstElement **capture_out) {
+static void teardown_locked(struct syncn_intercom_audio *self, GstElement **playback_out, GstElement **capture_out, struct syncn_aec3 **aec3_out) {
     *playback_out = self->playback_pipeline;
     self->playback_pipeline = NULL;
     self->playback_appsrc = NULL;
@@ -357,12 +435,18 @@ static void teardown_locked(struct syncn_intercom_audio *self, GstElement **play
     self->capture_appsink = NULL;
     self->capture_volume = NULL;
 
+    *aec3_out = self->aec3;
+    self->aec3 = NULL;
+
     self->running = false;
 }
 
-static void teardown_unlocked(GstElement *playback_pipeline, GstElement *capture_pipeline) {
+static void teardown_unlocked(GstElement *playback_pipeline, GstElement *capture_pipeline, struct syncn_aec3 *aec3) {
     syncn_gst_bounded_teardown("audio-playback", playback_pipeline, 3);
     syncn_gst_bounded_teardown("audio-capture", capture_pipeline, 3);
+    // Only safe once both pipelines above have actually settled -- see the
+    // comment on struct syncn_intercom_audio's aec3 field.
+    syncn_aec3_destroy(aec3);
 }
 
 // Called on a GStreamer streaming thread.
@@ -381,10 +465,20 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
         return GST_FLOW_OK;
     }
 
+    // map.data is now raw S16LE PCM (2026-09-17), not A-law -- alawenc was
+    // removed from the capture pipeline (see the file header comment and
+    // capture_desc's comment above) so AEC3 can run on full-precision
+    // samples before anything is encoded. audiobuffersplit still guarantees
+    // exactly 160 samples (320 bytes) per buffer, matching what
+    // syncn_aec3_process_capture() requires.
+    size_t num_samples = map.size / sizeof(int16_t);
+    const int16_t *pcm_in = (const int16_t *) map.data;
+
     pthread_mutex_lock(&self->lock);
     bool listening = self->uplink_listening;
     self->capture_count++;
     int count = self->capture_count;
+    struct syncn_aec3 *aec3 = self->aec3;
     pthread_mutex_unlock(&self->lock);
 
     bool should_log = count <= 30;
@@ -396,17 +490,50 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
     }
 
     if (should_log) {
-        syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: listening=%d, size=%zu", count, listening, map.size);
-    } else if (diag_log) {
-        struct syncn_alaw_buffer_stats stats = syncn_alaw_stats(map.data, map.size);
+        syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: listening=%d, num_samples=%zu", count, listening, num_samples);
+    }
+
+    // Run AEC3 on the mic PCM (2026-09-17) -- see syncn_intercom_aec3.h.
+    // aec3_out holds the echo-cancelled result when AEC3 ran; falls back to
+    // the raw mic signal (uncancelled, same as before this change existed)
+    // if AEC3 isn't available or the frame size doesn't match its fixed
+    // 160-sample/20ms requirement -- a call with no echo cancellation
+    // beats no call, matching this file's existing posture elsewhere.
+    int16_t aec3_out[160];
+    const int16_t *processed_pcm = pcm_in;
+    if (aec3 != NULL && num_samples == 160) {
+        if (syncn_aec3_process_capture(aec3, pcm_in, aec3_out, num_samples, 280)) {
+            processed_pcm = aec3_out;
+        }
+    }
+
+    // A-law encode the (possibly AEC3-processed) PCM -- this file's own
+    // replacement for the alawenc element removed from the pipeline. Static
+    // scratch buffer, safe because appsink's "new-sample" signal (which
+    // calls this function) fires serially on a single GStreamer streaming
+    // thread -- never concurrently with itself -- matching the existing
+    // g_alaw_silence static buffer's same rationale just above in this
+    // file. Sized for the one fixed frame size this ever runs at (160
+    // samples); num_samples is re-checked against it below regardless.
+    static uint8_t alaw_buf[160];
+    size_t alaw_size = 0;
+    if (num_samples > 0 && num_samples <= sizeof(alaw_buf)) {
+        for (size_t i = 0; i < num_samples; i++) {
+            alaw_buf[i] = syncn_alaw_compress(processed_pcm[i]);
+        }
+        alaw_size = num_samples;
+    }
+
+    if (diag_log && alaw_size > 0) {
+        struct syncn_alaw_buffer_stats stats = syncn_alaw_stats(alaw_buf, alaw_size);
         syncn_intercom_debug_log(
             "audio-diag",
             "on_new_capture_sample #%d: listening=%d, size=%zu, byte range [0x%02x, 0x%02x], distinct=%d, constant=%d",
-            count, listening, map.size, stats.min_byte, stats.max_byte, stats.distinct_count, stats.is_constant
+            count, listening, alaw_size, stats.min_byte, stats.max_byte, stats.distinct_count, stats.is_constant
         );
     }
 
-    if (listening && map.size > 0) {
+    if (listening && alaw_size > 0) {
         // Half-duplex gate: while the far end is speaking, transmit A-law
         // silence instead of whatever the mic picked up. See the comment
         // block on half_duplex_enabled() -- what the mic picks up during
@@ -415,12 +542,12 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
         // makes the far end hear themselves. Frame cadence and size are
         // unchanged (the door gates its downlink on continuous CC frames),
         // only the payload is replaced.
-        const uint8_t *payload = map.data;
+        const uint8_t *payload = alaw_buf;
         bool suppressed = false;
         if (half_duplex_enabled()) {
             gint64 since_us = g_get_monotonic_time() - self->last_downlink_voice_us;
             if (since_us < (gint64) g_hd_hangover_ms * 1000) {
-                const uint8_t *silence = syncn_alaw_silence(map.size);
+                const uint8_t *silence = syncn_alaw_silence(alaw_size);
                 if (silence != NULL) {
                     payload = silence;
                     suppressed = true;
@@ -430,7 +557,7 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
 
         struct std_value event = {
             .type = kStdUInt8Array,
-            .size = map.size,
+            .size = alaw_size,
             .uint8array = (uint8_t *) payload,
         };
         int send_ret = platch_send_success_event_std(SYNCN_INTERCOM_AUDIO_EVENT_CHANNEL, &event);
@@ -609,18 +736,6 @@ static void set_alsa_voice_routing(bool headset_mode) {
     }
 }
 
-// gst-plugins-bad may not be on every panel image; probing before we build
-// the pipeline string lets us fall back to plain (non-echo-cancelled) audio
-// instead of every call failing to start when it's missing.
-static bool gst_element_available(const char *factory_name) {
-    GstElementFactory *factory = gst_element_factory_find(factory_name);
-    if (factory == NULL) {
-        return false;
-    }
-    gst_object_unref(factory);
-    return true;
-}
-
 static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled, bool headset_mode) {
     syncn_intercom_debug_log(
         "audio",
@@ -656,9 +771,6 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
             return false;
         }
     }
-
-    bool aec_available = gst_element_available("webrtcechoprobe") && gst_element_available("webrtcdsp");
-    syncn_intercom_debug_log("audio", "start_locked: AEC elements available=%d", aec_available);
 
     // Playback quality notes (parity with Android's AudioTrack path):
     // - plughw (not raw hw) lets ALSA's plug layer run the codec at its
@@ -706,76 +818,37 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     // - volume=1.0: analog gain belongs to the ALSA mixer (see
     //   set_alsa_voice_routing / boot-time tuning); attenuating in software
     //   here just burned headroom and resolution.
-    // - echo probe placement (2026-09-13): THE AEC fix. The probe used to
-    //   hang off a `tee` as a dead-end branch ending in
-    //   `fakesink sync=false async=false`, with the real playback path
-    //   (jitter queue -> alsasink) on the OTHER branch. That silently
-    //   disabled echo cancellation entirely, for a mechanical reason
-    //   straight out of gstwebrtcechoprobe.cpp: the probe learns the echo
-    //   delay by querying the latency DOWNSTREAM OF ITS OWN SRCPAD --
+    // - echo cancellation is no longer done via webrtcechoprobe/webrtcdsp in
+    //   this pipeline at all (2026-09-17). Those two elements lived in two
+    //   SEPARATE GstPipelines here (this playback one, and the capture one
+    //   below) -- GStreamer's own webrtcdsp documentation states plainly
+    //   "The probe can only be used within the same top level GstPipeline",
+    //   so the cross-pipeline name-based link
+    //   (g_object_set(dsp, "probe", "syncn_echoprobe", NULL), removed from
+    //   the capture setup below) could never actually work: the property
+    //   set succeeded and the code logged "AEC engaged", but no
+    //   cancellation ever ran. The 2026-09-13 in-line-vs-tee fix (described
+    //   in the removed comment above this) was real and necessary but not
+    //   sufficient -- it fixed the probe's delay query, on a probe that was
+    //   never reachable from the other pipeline regardless.
     //
-    //       if (gst_pad_query (btrans->srcpad, query)) {
-    //         gst_query_parse_latency (query, NULL, &upstream_latency, NULL);
-    //       }
-    //       self->delay = upstream_latency / GST_MSECOND;
-    //
-    //   and that value is handed to the APM via apm->set_stream_delay_ms().
-    //   On a tee stub, everything downstream of the probe is just a
-    //   fakesink, so the query returned ~0ms -- the AEC was told the echo
-    //   returns almost immediately, while the real speaker output sat
-    //   behind the jitter queue plus the ALSA ring buffer. The filter
-    //   searched the wrong time window and cancelled nothing, which is
-    //   exactly the "far end hears himself" echo reported on-device, and
-    //   why toggling echo-cancel on/off changed nothing: it was inert
-    //   either way.
-    //
-    //   Upstream documents the correct topology plainly -- the probe goes
-    //   IN-LINE in the real playback path, never on a side branch:
-    //     far-end-src ! audio/x-raw,rate=48000 ! webrtcechoprobe ! pulsesink
-    //   In-line placement is what makes the latency query traverse the
-    //   genuine chain (queue + alsasink) and report a true delay.
-    //
-    //   Probe sits at 8kHz immediately after alawdec because upstream
-    //   requires the probe and the DSP to run at the SAME sample rate, and
-    //   the capture-side webrtcdsp is pinned to 8kHz. playvol is applied
-    //   BEFORE the probe so the reference the AEC sees carries the same
-    //   gain the speaker actually reproduces; resampling afterwards is
-    //   amplitude-neutral.
-    //
-    // - jitter queue / ALSA buffer reverted to 80ms / 200ms (2026-09-13):
-    //   these were inflated to 160ms then 300ms, and buffer-time 200ms ->
-    //   500ms, while chasing this same cutoff. None of it helped, and it
-    //   actively widened the echo path the AEC has to span (~280ms -> ~800ms).
-    //   Back to the long-standing values now that the probe is positioned
-    //   to report that delay honestly.
-    static const char *playback_desc_aec =
-        "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
-        "alawdec ! audioconvert ! audio/x-raw,rate=8000,channels=1 ! "
-        "volume name=playvol volume=1.0 ! "
-        "webrtcechoprobe name=syncn_echoprobe ! "
-        "audioconvert ! audioresample quality=10 ! "
-        "queue min-threshold-time=80000000 max-size-time=400000000 ! "
-        "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
-    static const char *playback_desc_plain =
+    //   AEC is now done directly against the WebRTC AEC3 library (a
+    //   materially newer, delay-agile algorithm vs. Debian 11's packaged
+    //   webrtc-audio-processing 0.3 that webrtcdsp used) via
+    //   syncn_intercom_aec3.h -- see that header for the full rationale.
+    //   handle_play_downlink feeds the decoded PCM of every downlink A-law
+    //   frame to syncn_aec3_process_render() as the echo reference, right
+    //   before the same bytes are pushed to this pipeline's appsrc, so the
+    //   two are naturally time-aligned without needing anything from
+    //   GStreamer's own latency machinery.
+    static const char *playback_desc =
         "appsrc name=src is-live=true format=time do-timestamp=true block=false ! "
         "alawdec ! audioconvert ! audioresample quality=10 ! volume name=playvol volume=1.0 ! "
         "queue min-threshold-time=80000000 max-size-time=400000000 ! "
         "alsasink device=plughw:0,0 sync=true buffer-time=200000 latency-time=20000";
 
     GError *error = NULL;
-    GstElement *playback = gst_parse_launch(aec_available ? playback_desc_aec : playback_desc_plain, &error);
-    if (playback == NULL && aec_available) {
-        // Parsing itself shouldn't fail if both elements probed OK, but fall
-        // back defensively rather than taking the whole call down with it.
-        LOG_ERROR(
-            "syncn_intercom_audio: failed to build AEC playback pipeline, falling back without AEC: %s\n",
-            error != NULL ? error->message : "unknown error"
-        );
-        if (error != NULL) g_error_free(error);
-        error = NULL;
-        aec_available = false;
-        playback = gst_parse_launch(playback_desc_plain, &error);
-    }
+    GstElement *playback = gst_parse_launch(playback_desc, &error);
     if (playback == NULL) {
         LOG_ERROR("syncn_intercom_audio: failed to build playback pipeline: %s\n", error != NULL ? error->message : "unknown error");
         if (error != NULL) g_error_free(error);
@@ -847,45 +920,10 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     }
 
     if (playback_appsrc == NULL || !start_pipeline_with_retry("syncn_intercom_audio playback", playback, 3, 150)) {
-        if (aec_available) {
-            // The in-line echo probe is the one extra failure mode here (e.g.
-            // the probe refusing the 8kHz caps it is pinned to, or not being
-            // present at all on a panel image without gst-plugins-bad);
-            // retry once without it before giving up entirely -- a call with
-            // no echo cancellation beats no call.
-            LOG_ERROR("syncn_intercom_audio: AEC playback pipeline failed to start, retrying without AEC\n");
-            if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
-            syncn_gst_bounded_teardown("audio-playback", playback, 3);
-            aec_available = false;
-            error = NULL;
-            playback = gst_parse_launch(playback_desc_plain, &error);
-            playback_appsrc = playback != NULL ? gst_bin_get_by_name(GST_BIN(playback), "src") : NULL;
-            if (playback_appsrc != NULL) {
-                GstCaps *appsrc_caps = gst_caps_new_simple("audio/x-alaw", "rate", G_TYPE_INT, 8000, "channels", G_TYPE_INT, 1, NULL);
-                gst_app_src_set_caps(GST_APP_SRC(playback_appsrc), appsrc_caps);
-                gst_caps_unref(appsrc_caps);
-                gst_app_src_set_stream_type(GST_APP_SRC(playback_appsrc), GST_APP_STREAM_TYPE_STREAM);
-            }
-        }
-        if (playback_appsrc == NULL || !start_pipeline_with_retry("syncn_intercom_audio playback (retry)", playback, 3, 150)) {
-            LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
-            if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
-            if (playback != NULL) syncn_gst_bounded_teardown("audio-playback", playback, 3);
-            return false;
-        }
-    }
-
-    // Retrieve the echo probe element from the playback pipeline so we can
-    // hand it to webrtcdsp in the capture pipeline below. The probe property
-    // is a GstElement pointer -- gst_parse_launch's `probe=syncn_echoprobe`
-    // syntax can't resolve references across separate pipelines, so we must
-    // set it via g_object_set after both pipelines exist.
-    GstElement *echoprobe = aec_available
-        ? gst_bin_get_by_name(GST_BIN(playback), "syncn_echoprobe")
-        : NULL;
-    if (aec_available && echoprobe == NULL) {
-        LOG_ERROR("syncn_intercom_audio: AEC enabled but webrtcechoprobe element not found in playback pipeline\n");
-        aec_available = false;
+        LOG_ERROR("syncn_intercom_audio: failed to start playback pipeline\n");
+        if (playback_appsrc != NULL) gst_object_unref(playback_appsrc);
+        if (playback != NULL) syncn_gst_bounded_teardown("audio-playback", playback, 3);
+        return false;
     }
 
     // Capture quality notes: plughw + quality=10 for the same reasons as
@@ -953,49 +991,22 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     //   is in what we TRANSMIT, and the damage lands inside the door
     //   station, which is why it only ever reproduces with the mic live and
     //   why Tuya's own app is unaffected on this identical hardware.
-    static const char *capture_desc_aec =
+    // webrtcdsp and alawenc are both gone from this pipeline (2026-09-17):
+    // AEC/NS/AGC now happen in C against AEC3 directly (see
+    // syncn_intercom_aec3.h), and A-law encoding happens in C too, in
+    // on_new_capture_sample, AFTER AEC3 has run -- encoding before handing
+    // raw PCM to the canceller would throw away the precision AEC3 needs.
+    // audiobuffersplit is kept: it is what guarantees on_new_capture_sample
+    // always receives exactly 160 samples (20ms) per buffer, which is the
+    // fixed frame size syncn_aec3_process_capture() assumes (it splits each
+    // into two 10ms sub-frames itself, per AEC3's own chunk-size
+    // requirement) and the fixed size the door's CC-channel protocol
+    // expects on the wire either way (see the frame-size fix note below --
+    // that reasoning is unchanged by any of this).
+    static const char *capture_desc =
         "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
         "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-        // NS off + AGC on, taken verbatim from panel-v1.3.83 (0a26269) --
-        // the build the client confirmed did NOT cut off speech from the
-        // panel side. Applied on top of the working v1.3.73 base to fix a
-        // mic that is both too quiet AND drops syllables mid-sentence:
-        // measured on .203 that noise-suppression=moderate destroyed ~80%
-        // of an already-weak signal (isolated stage-by-stage rms: 186 -> 34
-        // with NS on, 145 with it off), which is what makes quiet syllables
-        // fall below what survives 8kHz A-law encoding and vanish entirely.
-        //
-        // target-level-dbfs=3, not 15: 15 came from 9fa5703, which was
-        // testing a door-half-duplex-suppression theory that did not pan
-        // out. 3 is what v1.3.83 shipped.
-        //
-        // The dropouts were NOT the half-duplex uplink gate -- ruled out
-        // first on 2026-09-16 by raising HD_THRESHOLD to 3000 and
-        // HD_HANGOVER to 120 via a systemd drop-in (a drop-in is required;
-        // `systemctl set-environment` does NOT reach the service, verified
-        // via /proc/PID/environ). Suppression went 58/966 -> 0/126 while the
-        // dropouts continued unchanged.
-        //
-        // AGC is the gain stage, so capvol stays at its 1.0 default -- do
-        // not stack a software boost on top (capvol=5.0 broke double-talk,
-        // see be5bbc3).
-        //
-        // NOT copied from v1.3.83: its alsasrc caps pinning
-        // (rate=44100,channels=2 + deinterleave, c844ecd). That is the
-        // leading suspect for the silent-downlink regression on this
-        // board's single shared PCM, and v1.3.73 works without it. It cost
-        // ~2x mic level (rms 662 -> 1423) by selecting the live channel
-        // instead of averaging with a dead one, so it is worth re-testing
-        // LATER, on its own, once downlink is confirmed still working here.
-        "webrtcdsp name=dsp echo-cancel=true noise-suppression=false gain-control=true "
-        "gain-control-mode=fixed-digital target-level-dbfs=3 "
-        "high-pass-filter=true extended-filter=true ! "
-        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
-        "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
-    static const char *capture_desc_plain =
-        "alsasrc device=plughw:0,0 ! audioconvert ! audioresample quality=10 ! "
-        "audio/x-raw,rate=8000,channels=1,format=S16LE ! "
-        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! alawenc ! "
+        "volume name=capvol ! audiobuffersplit output-buffer-duration-fraction=1/50 ! "
         "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
 
     GstElement *capture = NULL;
@@ -1003,13 +1014,11 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     GstElement *capture_volume = NULL;
     if (capture_enabled) {
         for (int attempt = 0; attempt < 2 && capture == NULL; attempt++) {
-            bool use_aec = aec_available && attempt == 0;
             error = NULL;
-            capture = gst_parse_launch(use_aec ? capture_desc_aec : capture_desc_plain, &error);
+            capture = gst_parse_launch(capture_desc, &error);
             if (capture == NULL) {
                 LOG_ERROR(
-                    "syncn_intercom_audio: failed to build capture pipeline (aec=%d): %s\n",
-                    use_aec,
+                    "syncn_intercom_audio: failed to build capture pipeline: %s\n",
                     error != NULL ? error->message : "unknown error"
                 );
                 if (error != NULL) g_error_free(error);
@@ -1047,62 +1056,8 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
             // Do not re-attempt a capvol gain boost without a real
             // on-device A/B, isolated from any other audio change in the
             // same build, confirming the client is fine with it.
-            // Hand the playback pipeline's echo probe to webrtcdsp via
-            // g_object_set -- gst_parse_launch can't resolve cross-pipeline
-            // element references (the `probe=` syntax only works within the
-            // same bin), which is why the probe property was silently unset
-            // before an earlier fix attempt (webrtcdsp fell back to looking
-            // for the default `webrtcechoprobe0` name, which doesn't exist).
-            //
-            // That earlier fix was itself still wrong (found 2026-08-24):
-            // `probe` is a STRING property (the target element's *name*,
-            // confirmed via `gst-inspect-1.0 webrtcdsp`: "String. Default:
-            // webrtcechoprobe0"), not a GstElement* reference. Passing the
-            // raw `echoprobe` object pointer here made g_object_set treat
-            // that pointer's bits as a C string and read whatever garbage
-            // memory followed it -- visible on-device as webrtcdsp's error
-            // reporting nonsense probe names ("No echo probe with name 801
-            // found", "No echo probe with name ??+& found"), which failed
-            // gst_webrtc_dsp_start() every time, which crashed the whole
-            // capture pipeline's PLAYING transition, which fell through to
-            // this function's no-AEC retry path -- so AEC has been silently
-            // disabled on every real call, letting the mic pick up the
-            // speaker uncancelled (the actual cause of "hearing my own
-            // voice" during a call, reported same day). Pass the probe's
-            // name string instead -- it's the fixed literal from the
-            // pipeline description above, not worth an allocating
-            // gst_element_get_name() round-trip.
-            if (use_aec && echoprobe != NULL) {
-                GstElement *dsp = gst_bin_get_by_name(GST_BIN(capture), "dsp");
-                if (dsp != NULL) {
-                    g_object_set(dsp, "probe", "syncn_echoprobe", NULL);
-                    syncn_intercom_debug_log("audio", "start_locked: set webrtcdsp probe -> syncn_echoprobe (AEC engaged)");
-                    // SYNCN_INTERCOM_AUDIO_ECHO_CANCEL_OVERRIDE (2026-09-10,
-                    // diagnostic): lets echo-cancel be flipped at runtime
-                    // without a rebuild, e.g. "0" to disable it. A prior
-                    // isolated AEC-off attempt was confirmed worse and
-                    // reverted, but that build predated this same day's
-                    // real fixes for the persistent mid-phrase cutoff (ALSA
-                    // buffer-time/jitter-queue mismatch, capture/playback
-                    // lock contention, audio/video frame-dispatch blocking
-                    // in Dart) -- this override lets AEC-off be retried
-                    // cleanly, isolated from those now-fixed confounds,
-                    // without another build/patch-regen cycle. Falls back
-                    // to the pipeline's own echo-cancel=true default (set
-                    // in the gst_parse_launch string above) if unset.
-                    const char *echo_cancel_override = getenv("SYNCN_INTERCOM_AUDIO_ECHO_CANCEL_OVERRIDE");
-                    if (echo_cancel_override != NULL) {
-                        gboolean echo_cancel = strcmp(echo_cancel_override, "0") != 0;
-                        g_object_set(dsp, "echo-cancel", echo_cancel, NULL);
-                        syncn_intercom_debug_log("audio", "start_locked: echo-cancel overridden to %d", echo_cancel);
-                    }
-                    gst_object_unref(dsp);
-                } else {
-                    LOG_ERROR("syncn_intercom_audio: webrtcdsp element not found in AEC capture pipeline\n");
-                }
-            }
             if (!start_and_confirm_playing("syncn_intercom_audio capture", capture)) {
-                LOG_ERROR("syncn_intercom_audio: failed to start capture pipeline (aec=%d)\n", use_aec);
+                LOG_ERROR("syncn_intercom_audio: failed to start capture pipeline\n");
                 gst_object_unref(capture_appsink);
                 if (capture_volume != NULL) gst_object_unref(capture_volume);
                 syncn_gst_bounded_teardown("audio-capture", capture, 3);
@@ -1110,25 +1065,26 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
                 capture_appsink = NULL;
                 capture_volume = NULL;
             } else {
-                // Explicit success confirmation, added 2026-09-10 alongside
-                // the raw-capture feature: the "AEC engaged" log above only
-                // means the probe property was SET, not that the pipeline
-                // actually reached PLAYING with it -- this line is the one
-                // to grep for to know for certain, from a single real call,
-                // whether AEC genuinely stayed active (aec=1 here) or this
-                // attempt silently fell through to attempt 2's plain
-                // capture (aec=0 here, from the retry loop's second pass).
-                syncn_intercom_debug_log(
-                    "audio",
-                    "start_locked: capture pipeline confirmed PLAYING (aec=%d)%s",
-                    use_aec,
-                    use_aec ? " -- AEC genuinely active for this call" : " -- AEC NOT active for this call"
-                );
+                syncn_intercom_debug_log("audio", "start_locked: capture pipeline confirmed PLAYING");
             }
         }
         if (capture == NULL) {
             LOG_ERROR("syncn_intercom_audio: mic will be unavailable for this call\n");
         }
+    }
+
+    // ~280ms: the playback path's own known latency (80ms jitter queue +
+    // 200ms alsasink buffer-time -- see the playback pipeline's comment
+    // block above), i.e. roughly how long audio pushed to appsrc now takes
+    // to actually reach the speaker and loop back into the mic. AEC3
+    // refines this continuously via set_stream_delay_ms() on every capture
+    // frame (see syncn_aec3_process_capture) rather than trusting it
+    // blindly, but starting close to the truth beats starting from AEC3's
+    // own default of 0.
+    struct syncn_aec3 *aec3 = syncn_aec3_create(8000, 1, 280, /* noise_suppression_enabled */ false, /* agc_target_level_dbfs */ 3);
+    if (aec3 == NULL) {
+        // A call with no echo cancellation beats no call at all.
+        LOG_ERROR("syncn_intercom_audio: failed to create AEC3 instance -- proceeding without echo cancellation\n");
     }
 
     self->playback_pipeline = playback;
@@ -1137,9 +1093,9 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     self->capture_appsink = capture_appsink;
     self->capture_volume = capture_volume;
     self->capture_enabled = capture_enabled && capture != NULL;
+    self->aec3 = aec3;
     self->running = true;
-    syncn_intercom_debug_log("audio", "start_locked: SUCCESS, capture_enabled=%d (requested %d)", self->capture_enabled, capture_enabled);
-    if (echoprobe != NULL) gst_object_unref(echoprobe);
+    syncn_intercom_debug_log("audio", "start_locked: SUCCESS, capture_enabled=%d (requested %d), aec3=%d", self->capture_enabled, capture_enabled, aec3 != NULL);
     return true;
 }
 
@@ -1166,6 +1122,7 @@ static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_
     int count = self->playback_count;
     bool running = self->running;
     GstElement *playback_appsrc = self->playback_appsrc;
+    struct syncn_aec3 *aec3 = self->aec3;
     pthread_mutex_unlock(&self->lock);
 
     bool should_log = count <= 30;
@@ -1185,6 +1142,28 @@ static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_
         syncn_alaw_mean_level(data, size) > g_hd_threshold) {
         self->last_downlink_voice_us = g_get_monotonic_time();
     }
+
+    // Feed AEC3 the render/reference signal (2026-09-17) -- see
+    // syncn_intercom_aec3.h. Every downlink frame is exactly one 160-sample
+    // (20ms) wire frame (the door's CC-channel protocol, unconditionally),
+    // matching what syncn_aec3_process_render() expects. Decode with the
+    // same syncn_alaw_expand() this file already uses to MEASURE level
+    // (never previously used to reconstruct real PCM) -- correctness here
+    // only requires the reference be a faithful decode of what actually
+    // reaches appsrc a few lines below, not bit-exact fidelity, since AEC3
+    // is estimating and adapting to a physical echo path, not doing exact
+    // cancellation. Done unconditionally, even if running/playback_appsrc
+    // below turn out false, so AEC3's internal state keeps tracking the
+    // real downlink stream regardless of momentary pipeline hiccups on the
+    // playback side.
+    if (aec3 != NULL && size == 160) {
+        int16_t pcm[160];
+        for (size_t i = 0; i < size; i++) {
+            pcm[i] = (int16_t) syncn_alaw_expand(data[i]);
+        }
+        syncn_aec3_process_render(aec3, pcm, size);
+    }
+
     if (running && playback_appsrc != NULL && size > 0) {
         GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
         gst_buffer_fill(buffer, 0, data, size);
@@ -1363,9 +1342,10 @@ static void on_method_channel_message(void *userdata, const FlutterPlatformMessa
     } else if (strcmp(object.method, "stop") == 0) {
         pthread_mutex_lock(&self->lock);
         GstElement *playback_pipeline, *capture_pipeline;
-        teardown_locked(self, &playback_pipeline, &capture_pipeline);
+        struct syncn_aec3 *aec3;
+        teardown_locked(self, &playback_pipeline, &capture_pipeline, &aec3);
         pthread_mutex_unlock(&self->lock);
-        teardown_unlocked(playback_pipeline, capture_pipeline);
+        teardown_unlocked(playback_pipeline, capture_pipeline, aec3);
         platch_respond_success_std(message->response_handle, NULL);
     } else {
         platch_respond_not_implemented(message->response_handle);
@@ -1439,9 +1419,10 @@ void syncn_intercom_audio_deinit(struct flutterpi *flutterpi, void *userdata) {
 
     pthread_mutex_lock(&self->lock);
     GstElement *playback_pipeline, *capture_pipeline;
-    teardown_locked(self, &playback_pipeline, &capture_pipeline);
+    struct syncn_aec3 *aec3;
+    teardown_locked(self, &playback_pipeline, &capture_pipeline, &aec3);
     pthread_mutex_unlock(&self->lock);
-    teardown_unlocked(playback_pipeline, capture_pipeline);
+    teardown_unlocked(playback_pipeline, capture_pipeline, aec3);
 
     pthread_mutex_destroy(&self->lock);
     free(self);
