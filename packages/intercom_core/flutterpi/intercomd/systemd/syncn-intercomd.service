@@ -1,0 +1,45 @@
+[Unit]
+Description=SyncN panel intercom daemon
+Documentation=https://github.com/RayanH19/syncn-intercom
+# syncnhome.service (the Flutter UI) connects to this daemon's control socket
+# and, via syncn_video.c, its video frame socket -- both must exist before the
+# UI starts, or its first frames/first "state" query silently no-op against a
+# socket that isn't there yet. sound.target ordering matches upstream; the
+# daemon opens ALSA itself and tolerates it being unready (see audio.c retry).
+After=network-online.target sound.target
+Before=syncnhome.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Path matches this repo's install convention: everything the app needs lives
+# under /opt/syncn-panel (see syncnhome.service's WorkingDirectory) -- NOT
+# /usr/local/bin as upstream ships it, and NOT /userdata (that path is for the
+# live *bundle* payload the panel restores from, not for daemon binaries).
+ExecStart=/opt/syncn-panel/syncn-intercomd --config /etc/syncn/intercom.conf --batch
+Restart=always
+RestartSec=2
+
+# The audio thread asks for SCHED_FIFO: a missed 20 ms deadline is audible, and
+# it breaks the uplink cadence the door gates its downlink on.
+LimitRTPRIO=20
+LimitMEMLOCK=infinity
+
+# Deliberately root, matching syncnhome.service (which also runs unconfined,
+# unsandboxed, as root -- see that unit). Upstream's own unit runs this as a
+# dedicated `syncn` user via SupplementaryGroups=audio video render, but that
+# user/group is not created anywhere in this repo's postinst, and getting
+# ALSA/DRM/render-node device permissions right for a brand-new unprivileged
+# user on THIS board's driver stack is exactly the kind of thing that has
+# bitten this project before (see docs/panel-mic-bias-stuck-power-cycle-fix.md,
+# docs/panel-intercom-*.md) -- not worth the risk in this port. Revisit if the
+# user wants to sandbox this unit properly; do it deliberately, not as a
+# side effect of a source port.
+StateDirectory=syncn
+RuntimeDirectory=syncn
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=syncn-intercomd
+
+[Install]
+WantedBy=multi-user.target

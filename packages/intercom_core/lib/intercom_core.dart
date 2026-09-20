@@ -27,6 +27,12 @@ export 'src/net/local_ip_address.dart';
 export 'src/media/audio_pipeline.dart';
 export 'src/media/video_decoder.dart';
 
+// Daemon (flutter-pi panel backend -- see DaemonCallController's doc comment)
+export 'src/daemon/daemon_call_controller.dart';
+export 'src/daemon/daemon_config_sync.dart';
+export 'src/daemon/intercomd_client.dart';
+export 'src/daemon/intercomd_video.dart';
+
 // Config
 export 'src/config/device_config.dart';
 export 'src/config/device_identity.dart';

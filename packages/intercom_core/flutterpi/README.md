@@ -1,119 +1,86 @@
-# flutter-pi native backend for `syncn_intercom/audio` and `syncn_intercom/video`
+# flutter-pi backend for the panel's intercom (2026-09-20 rewrite)
 
-This directory is the Linux/flutter-pi counterpart to `android/` and `ios/` in
-this package. It implements the same two platform channels those native
-implementations provide (`syncn_intercom/audio` +
-`syncn_intercom/audio_uplink`, `syncn_intercom/video`), so
-`lib/src/media/audio_pipeline.dart` and `lib/src/media/video_decoder.dart`
-work unmodified on the Debian/flutter-pi panel.
+This directory used to hold two flutter-pi plugins (`syncn_intercom_audio.c`,
+`syncn_intercom_video.c`) that ran GStreamer pipelines directly inside the
+`flutter-pi` process and talked to Dart over `syncn_intercom/audio` +
+`syncn_intercom/audio_uplink` (MethodChannel/EventChannel) and
+`syncn_intercom/video` (MethodChannel + texture). **That audio path never
+worked reliably on real hardware** (see this repo's own git history and
+`syncn_smarthome_panel`'s `docs/panel-intercom-*.md`), and video showed a
+black preview on incoming calls, root cause never confirmed.
 
-## Why this isn't a normal Flutter Linux plugin
+This has been replaced wholesale with a standalone daemon,
+**`syncn-intercomd`**, ported as-is from `github.com/RayanH19/syncn-intercom`
+(a proven-working reference implementation for the same door hardware and
+wire protocol — confirmed identical: UDP discovery on 8089, TCP call session
+on 8189, `appid=7551000`, mandatory StartTalk handshake; see that project's
+`docs/10-protocol-reference.md`).
 
-The panel runs `flutter-pi` (github.com/ardera/flutter-pi), a standalone C
-engine embedder — not the standard GTK-based Flutter Linux desktop runner.
-flutter-pi does not load third-party plugins from a `linux/` CMake folder the
-way the desktop embedder does; its plugins are C sources compiled directly
-into the `flutter-pi` binary itself and registered via its
-`FLUTTERPI_PLUGIN(...)` macro (see `flutter-pi`'s own `src/plugins/` for
-precedent — `gstreamer_video_player`, `audioplayers`, `test_plugin`, etc.).
+## What lives here now
 
-So instead of Dart-plugin platform code, this directory ships:
+- `intercomd/` — the daemon's full source tree, copied verbatim from the
+  reference repo (`src/`, `include/syncn/`, `third_party/rnnoise/`,
+  `systemd/`, its own `CMakeLists.txt`). It is a **standalone C project**,
+  built and run independently of flutter-pi — it owns ALSA, the door's TCP/UDP
+  protocol, H.264 decode (Rockchip MPP) and RGA colour conversion directly, in
+  one process (`syncn-intercomd`). It does not link against flutter-pi at all.
+  See `intercomd/README.md`-equivalent docs shipped inside that tree (its own
+  `docs/*.md`, not duplicated here) for the daemon's internals.
+- `src/syncn_video.c` / `src/syncn_video_proto.h` — the ONE remaining
+  flutter-pi plugin. It is a thin DMA-BUF-to-Flutter-texture bridge: it
+  connects to the daemon's Unix socket (`/run/syncn/intercomd.sock`),
+  subscribes to video frames, imports each decoded frame the daemon hands it
+  as an EGL image (zero-copy — the daemon already decoded and colour-converted
+  it via hardware), and pushes it to Flutter as an external texture on channel
+  `syncn/video`. This is a materially different, and simpler, design than the
+  old `syncn_intercom_video.c`: no GStreamer, no CPU-side `glTexImage2D` copy,
+  no H.264 decode in this process at all.
 
-- `src/syncn_intercom_video.c` / `.h` — a flutter-pi plugin implementing
-  `syncn_intercom/video`. Decodes H.264 via a GStreamer pipeline
-  (`appsrc ! h264parse ! avdec_h264 ! videoconvert`) and uploads each decoded
-  frame into a plain `GL_TEXTURE_2D` on a dedicated EGL context shared with
-  flutter-pi's main GL context, then pushes it through flutter-pi's
-  `texture_registry`.
-- `src/syncn_intercom_audio.c` / `.h` — a flutter-pi plugin implementing
-  `syncn_intercom/audio` (downlink playback: `appsrc ! alawdec ! audioconvert
-  ! audioresample ! alsasink`) and `syncn_intercom/audio_uplink`
-  (capture: `alsasrc ! audioconvert ! audioresample ! volume ! alawenc !
-  appsink`, forwarded to Dart as `EventChannel` events via
-  `platch_send_success_event_std`). On the RK809 panel codec it also sets
-  `Playback Path=SPK_HP` and `Capture MIC Path=Main Mic` before pipeline start,
-  logging and ignoring failures on other hardware.
-- `patches/0001-add-syncn-intercom-audio-video-plugins.patch` — a patch
-  against `ardera/flutter-pi` that drops the two `.c`/`.h` pairs above into
-  `src/plugins/` and wires them into `CMakeLists.txt` behind a new
-  `BUILD_SYNCN_INTERCOM_PLUGIN` option (mirroring the existing
-  `BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN` / `BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN`
-  options).
+## What is GONE
 
-**Verified:** this patch applies cleanly with `git apply` against
-`ardera/flutter-pi` commit `f0b333052f4e71e51f9049e5016082357175057a` — the
-same commit the app repo's `flutterpi-real-app-poc.yml` CI workflow currently
-pins and already applies `patches/flutter-pi-gem-close-on-exit.patch`
-against. Both patches can be applied in the same step (order doesn't matter,
-they touch disjoint regions of `CMakeLists.txt`/`src/modesetting.c`).
+- `syncn_intercom_audio.c/.h`, `syncn_intercom_aec3.cpp/.h`,
+  `syncn_intercom_video.c/.h`, `syncn_intercom_debug.h`, `syncn_intercom_dsp.h`,
+  `syncn_intercom_gst_util.h` — deleted outright (2026-09-20), not left as dead
+  code. The daemon now owns 100% of audio I/O (ALSA, speexdsp-based echo
+  cancellation, the "hold-the-floor" half-duplex gate, the independent return
+  canceller) and H.264 decode/colour-conversion. There is no flutter-pi
+  MethodChannel/EventChannel for audio any more — audio never crosses into
+  Dart or into the flutter-pi process at all.
+- `patches/0001-add-syncn-intercom-audio-video-plugins.patch` — deleted. It
+  wired the two deleted plugins (and a `webrtc-audio-processing`/abseil
+  dependency chain that was awkward to build — see its own historical
+  comments in git blame) into a patched `ardera/flutter-pi` CMakeLists.txt.
+  Superseded by `syncn_smarthome_panel`'s own
+  `patches/0003-add-syncn-video-plugin.patch`, which adds ONLY
+  `syncn_video.c` (no GStreamer, no webrtc-audio-processing/abseil at all —
+  just EGL/GLES, already required for everything else flutter-pi renders).
 
 ## Consuming this from the app repo (`syncn_smarthome_panel`)
 
-That repo's CI (`.github/workflows/flutterpi-real-app-poc.yml`) already
-clones `ardera/flutter-pi`, applies `patches/flutter-pi-gem-close-on-exit.patch`,
-and builds with CMake. To pick this up, that workflow's "Clone and patch
-flutter-pi source" step needs one more `git apply` line for
-`packages/intercom_core/flutterpi/patches/0001-add-syncn-intercom-audio-video-plugins.patch`
-(from wherever this package is checked out in that build — it's a git
-dependency there), and its "Install flutter-pi native build dependencies"
-step needs GStreamer *development* headers added:
-`libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`,
-`libgstreamer-plugins-good1.0-dev` (for `alawenc`/`alawdec`, part of the
-"law" element in gst-plugins-good), `gstreamer1.0-libav` (for `avdec_h264`).
-The runtime packages already added to `packaging/debian/control.in` /
-`scripts/install_debian_panel_remote.sh` in that repo cover the on-device
-runtime side of this; they are not sufficient for *compiling* the plugin,
-only for running it. **That workflow/packaging change is out of scope for
-this package repo** and belongs in `syncn_smarthome_panel` once this patch
-is available at a pinned ref here.
+Three independent things need to happen there (see that repo's own
+`patches/0003-add-syncn-video-plugin.patch`, `.github/workflows/release-panel-deb.yml`,
+and `packaging/debian/`):
 
-## What's verified vs. not
+1. **flutter-pi** gets `patches/0003-add-syncn-video-plugin.patch` applied
+   (replacing the old `0001` intercom_core patch), building `syncn_video.c`
+   into the `flutter-pi` binary under `BUILD_SYNCN_VIDEO_PLUGIN` (default ON,
+   no GStreamer dependency).
+2. **`syncn-intercomd`** is built as a second, independent binary (see
+   `intercomd/CMakeLists.txt`) and packaged alongside `flutter-pi` in the
+   `.deb`, with its own systemd unit (`intercomd/systemd/syncn-intercomd.service`,
+   adapted for this repo's install paths and started before `syncnhome.service`).
+3. **Dart call control** (`lib/src/call/call_controller.dart` and friends) is
+   rewired to speak the daemon's JSON-over-Unix-socket protocol instead of
+   running its own TCP door client — see
+   `lib/src/daemon/` (new in this port) and the reference's
+   `ui/syncn_intercom/lib/src/intercom_client.dart`, which
+   `lib/src/daemon/intercomd_client.dart` here is ported from.
 
-Every flutter-pi API used here (`plugin_registry_set_receiver_v2_locked`,
-`texture_new`/`texture_push_frame`, `gl_renderer_create_context`,
-`gl_renderer_get_egl_display`, `platch_respond_success_std`/`platch_send_success_event_std`, the
-`FLUTTERPI_PLUGIN` registration macro, `struct std_value`/`struct platch_obj`
-field layouts) was checked directly against `ardera/flutter-pi`'s actual
-source at the pinned commit above, not guessed from memory — see comments in
-the `.c` files for what precedent each pattern follows (`testplugin.c` for
-the platform-channel wiring, `gstreamer_video_player`/`audioplayers` for the
-GStreamer + texture/audio patterns).
+## What's NOT verified
 
-**Not verified — no on-device or full build/link test was possible in the
-environment this was written in** (no root to install `libsystemd-dev` /
-`libinput-dev`, and `flutter_embedder.h` is fetched by flutter-pi's own CMake
-configure step, which those missing deps blocked). Before shipping, verify:
-
-1. **The patch actually compiles and links** as part of a full flutter-pi
-   build (the CI job described above is the natural place to find out).
-2. **H.264 NAL framing/alignment — confirmed against `mock_door`, not yet
-   against a real door unit.** The appsrc caps use
-   `stream-format=byte-stream,alignment=nal` (Annex-B, one NAL unit per
-   `submit()` call). This matches `mock_door/video_stream.py`'s
-   `_read_ffmpeg_stdout`, which splits ffmpeg's Annex-B output on start
-   codes and sends each NAL individually — h264parse reassembles NALs into
-   access units on the receiving end. `mock_door` is a development stand-in
-   (ffmpeg libx264, baseline profile) though, not the real door unit's
-   hardware encoder — re-confirm against real traffic if frames don't
-   decode on real hardware.
-3. **Audio device selection.** `autoaudiosrc`/`autoaudiosink` pick whatever
-   GStreamer autodetects as the default ALSA/Pulse device on the panel —
-   confirm that's actually the panel's mic/speaker and not some other ALSA
-   card, and that the `SupplementaryGroups=audio ...` the app repo's service
-   unit grants is sufficient for device access.
-4. **Video upload performance.** Frames are uploaded via `glTexImage2D`/
-   `glTexSubImage2D` (a CPU→GPU copy each frame), not a zero-copy DMA-BUF
-   path. This is the safe, portable choice (works regardless of whether
-   `avdec_h264`'s output is DMA-BUF-backed), but if latency/CPU usage is a
-   problem on real hardware, a hardware-decoder + DMA-BUF path (reusing
-   `gstreamer_video_player`'s own `frame_interface`/`frame_new` bridge
-   instead of manual GL upload) is the next thing to try.
-5. **No AEC/NS/AGC yet.** The Android path enables
-   `AcousticEchoCanceler`/`NoiseSuppressor`/`AutomaticGainControl`; this
-   implementation doesn't have an equivalent yet (GStreamer's `webrtcdsp`,
-   from gst-plugins-bad, is the natural fit if echo turns out to be a
-   problem on real hardware). Not blocking for the "no sound at all" bug
-   this exists to fix, but a known gap versus Android/iOS.
-6. **`setMuted` semantics.** Matches Android: mutes the outgoing mic only
-   (via the `volume` element's `mute` property ahead of the encoder, so
-   frames keep flowing but silent), not the speaker.
+Same caveat as before this rewrite: no on-device or full build/link test was
+possible in the environment this port was written in (no panel hardware
+reachable). The reference daemon is described by its own authors as
+hardware-verified against a real door station; this port's *packaging and
+Dart wiring* around it is new and unverified. See the handback report for the
+specific list.
