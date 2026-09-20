@@ -116,8 +116,22 @@ final class DaemonCallController extends ChangeNotifier {
     }
     _wasRinging = isRingingNow;
 
-    final shouldHaveVideo =
-        phase == CallPhase.connected || phase == CallPhase.previewing;
+    // Includes CallPhase.ringing (2026-09-20, fixed after on-device testing
+    // found the incoming-call screen was showing black): the daemon starts
+    // its own video pipeline as soon as it enters SYNCN_CALL_RINGING (see
+    // video_session_start()'s call site in the door-connected/incoming-call
+    // handler in src/core/call.c) and confirmed on-device to already be
+    // streaming real frames ("stats: ringing | ... video 91 NALs") well
+    // before the call is ever answered. intercom_page.dart's own ringing
+    // screen (_CallView) already renders VideoSurface(textureId:
+    // controller.videoTextureId) for exactly this reason ("Show the live
+    // door camera feed during ringing too, not just after answering") --
+    // this controller just never told the video plugin to subscribe during
+    // that phase, leaving videoTextureId null the whole time the door was
+    // ringing regardless of what the daemon was already sending.
+    final shouldHaveVideo = phase == CallPhase.ringing ||
+        phase == CallPhase.connected ||
+        phase == CallPhase.previewing;
     if (shouldHaveVideo && !_videoActiveForPhase) {
       _videoActiveForPhase = true;
       unawaited(_video.start().then((_) => _setState(_state.copyWith(
