@@ -420,10 +420,10 @@ index 0000000..de465e5
 +#endif  // _SYNCN_INTERCOM_AEC3_H
 diff --git a/src/plugins/syncn_intercom_audio.c b/src/plugins/syncn_intercom_audio.c
 new file mode 100644
-index 0000000..55b1679
+index 0000000..b9b641f
 --- /dev/null
 +++ b/src/plugins/syncn_intercom_audio.c
-@@ -0,0 +1,1476 @@
+@@ -0,0 +1,1575 @@
 +// SPDX-License-Identifier: MIT
 +//
 +// flutter-pi native implementation of "syncn_intercom/audio" (MethodChannel)
@@ -509,6 +509,7 @@ index 0000000..55b1679
 +
 +#include "syncn_intercom_audio.h"
 +
++#include <math.h>
 +#include <pthread.h>
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -686,9 +687,34 @@ index 0000000..55b1679
 +#define SYNCN_HD_DEFAULT_THRESHOLD 800
 +#define SYNCN_HD_DEFAULT_HANGOVER_MS 300
 +
++// Uplink hold-the-floor tuning (2026-09-20) -- see the struct field comment
++// on uplink_talking_since_us for the full rationale. Values ported from the
++// other team's syncn-intercom (docs/14-audio-as-shipped.md), which measured
++// them against the real door station on hardware with the same speaker/mic
++// electrical coupling fault:
++//   SYNCN_INTERCOM_AUDIO_HD_HOLD_AFTER_MS   continuous uplink speech needed
++//                                           to earn the hold (default 300)
++//   SYNCN_INTERCOM_AUDIO_HD_HOLD_LOUD_DBFS  a single frame this loud earns
++//                                           the hold immediately (default
++//                                           -18 dBFS -- deliberately far
++//                                           above a visitor's level, which
++//                                           tops out around -26 dBFS on
++//                                           their bench; only a person
++//                                           actually at the panel reaches
++//                                           it, per their own tuning notes)
++//   SYNCN_INTERCOM_AUDIO_HD_HOLD_TAIL_MS    how long the hold lasts after
++//                                           the panel's last voiced frame
++//                                           (default 600)
++#define SYNCN_HD_HOLD_DEFAULT_AFTER_MS 300
++#define SYNCN_HD_HOLD_DEFAULT_LOUD_DBFS (-18)
++#define SYNCN_HD_HOLD_DEFAULT_TAIL_MS 600
++
 +static int g_half_duplex_enabled = -1;
 +static int g_hd_threshold = -1;
 +static int g_hd_hangover_ms = -1;
++static int g_hd_hold_after_ms = -1;
++static int g_hd_hold_loud_amplitude = -1;  // converted from dBFS once, linear 0-32767 scale
++static int g_hd_hold_tail_ms = -1;
 +
 +static int syncn_env_int(const char *name, int fallback) {
 +    const char *v = getenv(name);
@@ -699,12 +725,28 @@ index 0000000..55b1679
 +    return (int) parsed;
 +}
 +
++// Signed version of syncn_env_int -- SYNCN_INTERCOM_AUDIO_HD_HOLD_LOUD_DBFS
++// is negative by nature (dBFS relative to full scale).
++static int syncn_env_int_signed(const char *name, int fallback) {
++    const char *v = getenv(name);
++    if (v == NULL) return fallback;
++    char *end = NULL;
++    long parsed = strtol(v, &end, 10);
++    if (end == v || parsed < -1000 || parsed > 1000) return fallback;
++    return (int) parsed;
++}
++
 +static bool half_duplex_enabled(void) {
 +    if (g_half_duplex_enabled < 0) {
 +        const char *v = getenv("SYNCN_INTERCOM_AUDIO_HALF_DUPLEX");
 +        g_half_duplex_enabled = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
 +        g_hd_threshold = syncn_env_int("SYNCN_INTERCOM_AUDIO_HD_THRESHOLD", SYNCN_HD_DEFAULT_THRESHOLD);
 +        g_hd_hangover_ms = syncn_env_int("SYNCN_INTERCOM_AUDIO_HD_HANGOVER", SYNCN_HD_DEFAULT_HANGOVER_MS);
++        g_hd_hold_after_ms = syncn_env_int("SYNCN_INTERCOM_AUDIO_HD_HOLD_AFTER_MS", SYNCN_HD_HOLD_DEFAULT_AFTER_MS);
++        g_hd_hold_tail_ms = syncn_env_int("SYNCN_INTERCOM_AUDIO_HD_HOLD_TAIL_MS", SYNCN_HD_HOLD_DEFAULT_TAIL_MS);
++        int loud_dbfs = syncn_env_int_signed("SYNCN_INTERCOM_AUDIO_HD_HOLD_LOUD_DBFS", SYNCN_HD_HOLD_DEFAULT_LOUD_DBFS);
++        // linear = 32767 * 10^(dbfs/20)
++        g_hd_hold_loud_amplitude = (int) (32767.0 * pow(10.0, loud_dbfs / 20.0));
 +    }
 +    return g_half_duplex_enabled == 1;
 +}
@@ -842,6 +884,30 @@ index 0000000..55b1679
 +    // lock scope in handle_play_downlink for why that mattered), and a
 +    // torn read here would at worst mis-gate a single 20ms frame.
 +    volatile gint64 last_downlink_voice_us;
++
++    // Uplink hold-the-floor state (2026-09-20), ported from the other
++    // team's syncn-intercom half-duplex gate (docs/14-audio-as-shipped.md
++    // in that repo, "hold_floor_dbfs"/"hold_loud_dbfs"). Same electrical
++    // cause as the gate above (docs/13 in that repo: this board's speaker
++    // is driven through a headphone charge pump that injects into the mic
++    // preamp's shared supply, ~30dB louder than a real talker -- confirmed
++    // by register dump and by the coupling vanishing when the speaker path
++    // is turned off, not when the speaker is muffled). Their finding: a
++    // gate that only compares levels mutes the panel talker mid-word,
++    // because their OWN voice comes back through the door 100-300ms later
++    // at a level indistinguishable from a real visitor. The fix is to give
++    // the panel talker "possession" of the floor once they've clearly been
++    // speaking, so their own returning echo can't be mistaken for the
++    // visitor stealing it back.
++    //
++    // Written by on_new_capture_sample on the GStreamer capture thread
++    // (where the panel's own uplink level is known), read by
++    // handle_play_downlink on the platform thread (which decides whether
++    // the door's level is allowed to arm the mute above). Same
++    // lock-free/volatile treatment as last_downlink_voice_us and for the
++    // same reason.
++    volatile gint64 uplink_talking_since_us;   // 0 if not currently talking
++    volatile gint64 uplink_hold_until_us;      // 0 if no hold is active
 +};
 +
 +// Split into a quick locked "detach" part and a separately-called unlocked
@@ -927,29 +993,49 @@ index 0000000..55b1679
 +    // beats no call, matching this file's existing posture elsewhere.
 +    int16_t aec3_out[160];
 +    const int16_t *processed_pcm = pcm_in;
-+    bool aec3_ran = false;
 +    if (aec3 != NULL && num_samples == 160) {
 +        if (syncn_aec3_process_capture(aec3, pcm_in, aec3_out, num_samples, 280)) {
 +            processed_pcm = aec3_out;
-+            aec3_ran = true;
 +        }
 +    }
-+    // TEMP DIAGNOSTIC (2026-09-17): explicit before/after amplitude, not
-+    // inferred from A-law byte ranges -- direct answer to whether AGC2's
-+    // gain is reaching the real plugin at all. Remove once resolved.
-+    if (should_log) {
-+        int16_t max_in = 0, max_out = 0;
++
++    // Uplink hold-the-floor tracking (2026-09-20) -- see the struct field
++    // comment on uplink_talking_since_us for the full rationale (ported
++    // from the other team's syncn-intercom half-duplex gate). Measured on
++    // the post-AEC3 signal, since that is what actually goes out and what
++    // "the panel is talking" should mean here.
++    //
++    // half_duplex_enabled() must be called before reading g_hd_hold_*
++    // (lazy-inits them); cheap after the first call, same pattern as the
++    // existing gate's own use of it below.
++    if (half_duplex_enabled() && listening) {
++        int16_t max_amp = 0;
 +        for (size_t i = 0; i < num_samples; i++) {
-+            int16_t a = pcm_in[i] < 0 ? (int16_t) -pcm_in[i] : pcm_in[i];
-+            int16_t b = processed_pcm[i] < 0 ? (int16_t) -processed_pcm[i] : processed_pcm[i];
-+            if (a > max_in) max_in = a;
-+            if (b > max_out) max_out = b;
++            int16_t a = processed_pcm[i] < 0 ? (int16_t) -processed_pcm[i] : processed_pcm[i];
++            if (a > max_amp) max_amp = a;
 +        }
-+        syncn_intercom_debug_log(
-+            "audio",
-+            "on_new_capture_sample #%d: AEC3_GAIN_CHECK aec3_ran=%d max_in=%d max_out=%d ratio=%.2f",
-+            count, aec3_ran, max_in, max_out, max_in > 0 ? (double) max_out / max_in : 0.0
-+        );
++
++        gint64 now_us = g_get_monotonic_time();
++        // "Talking" for this purpose means clearly above the room floor --
++        // reuse the existing far-end speech threshold (g_hd_threshold,
++        // default 800) as the same bar for "is this frame voice", since
++        // both gates are answering the same underlying question on their
++        // own side of the call. A silent/near-silent frame resets the
++        // continuous-speech timer, matching their "climbs while the panel
++        // talks, flat while [quiet]" behaviour.
++        if (max_amp > g_hd_threshold) {
++            if (self->uplink_talking_since_us == 0) {
++                self->uplink_talking_since_us = now_us;
++            }
++            gint64 talking_for_us = now_us - self->uplink_talking_since_us;
++            bool earned_by_duration = talking_for_us >= (gint64) g_hd_hold_after_ms * 1000;
++            bool earned_by_loudness = max_amp > g_hd_hold_loud_amplitude;
++            if (earned_by_duration || earned_by_loudness) {
++                self->uplink_hold_until_us = now_us + (gint64) g_hd_hold_tail_ms * 1000;
++            }
++        } else {
++            self->uplink_talking_since_us = 0;
++        }
 +    }
 +
 +    // A-law encode the (possibly AEC3-processed) PCM -- this file's own
@@ -1202,6 +1288,8 @@ index 0000000..55b1679
 +    // Clear half-duplex state so a previous call's far-end speech can never
 +    // suppress the opening moments of a new one.
 +    self->last_downlink_voice_us = 0;
++    self->uplink_talking_since_us = 0;
++    self->uplink_hold_until_us = 0;
 +    if (raw_capture_enabled()) {
 +        // Fresh files per pipeline start -- these are meant to capture ONE
 +        // test call, not accumulate across repeated start/stop cycles.
@@ -1609,9 +1697,20 @@ index 0000000..55b1679
 +    // pipeline, so this is unaffected by anything downstream -- jitter
 +    // queue, resampling or the ALSA buffer. Cheap: one table-free expand per
 +    // byte over a 160-byte frame, outside the lock.
-+    if (half_duplex_enabled() && size > 0 &&
++    //
++    // uplink_hold_until_us (2026-09-20, see the struct field comment on
++    // uplink_talking_since_us) gates this: while the panel talker holds the
++    // floor, the door's own loudness -- most of which, per the other team's
++    // docs/13 measurement, is the panel's own voice injected electrically
++    // back into the mic and returned -- is NOT allowed to arm the mute.
++    // Without this, the panel's own returning voice looks exactly like the
++    // door taking the floor and cuts the talker off mid-word.
++    gint64 now_us = g_get_monotonic_time();
++    bool panel_holds_floor = half_duplex_enabled() && self->uplink_hold_until_us != 0 &&
++        now_us < self->uplink_hold_until_us;
++    if (half_duplex_enabled() && !panel_holds_floor && size > 0 &&
 +        syncn_alaw_mean_level(data, size) > g_hd_threshold) {
-+        self->last_downlink_voice_us = g_get_monotonic_time();
++        self->last_downlink_voice_us = now_us;
 +    }
 +
 +    // Feed AEC3 the render/reference signal (2026-09-17) -- see
