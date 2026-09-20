@@ -99,6 +99,7 @@
 #include "pluginregistry.h"
 #include "syncn_intercom_aec3.h"
 #include "syncn_intercom_debug.h"
+#include "syncn_intercom_dsp.h"
 #include "syncn_intercom_gst_util.h"
 #include "util/logging.h"
 
@@ -283,6 +284,34 @@ static struct syncn_alaw_buffer_stats syncn_alaw_stats(const uint8_t *data, size
 #define SYNCN_HD_HOLD_DEFAULT_LOUD_DBFS (-18)
 #define SYNCN_HD_HOLD_DEFAULT_TAIL_MS 600
 
+// Remaining audio-chain tunables ported from the other team's syncn-intercom
+// (docs/14-audio-as-shipped.md): telephony bandpass, per-direction noise
+// gates with hangover, and comfort noise substituted for hard silence while
+// gated. Same rationale as the hold-the-floor values above -- these were
+// bench-tuned against a real door station sharing this board's electrical
+// coupling fault, not guessed.
+#define SYNCN_BANDPASS_HIGHPASS_HZ 250.0
+#define SYNCN_BANDPASS_LOWPASS_HZ 3400.0
+#define SYNCN_UPLINK_NOISE_FLOOR_DBFS (-34.0)
+#define SYNCN_DOWNLINK_NOISE_FLOOR_DBFS (-37.0)
+#define SYNCN_NOISE_GATE_HANGOVER_MS 300
+#define SYNCN_COMFORT_NOISE_DBFS (-55.0)
+
+// Return canceller (2026-09-20): a second, independent AEC3 instance that
+// strips the panel's OWN voice back out of the door's downlink, ported from
+// the other team's syncn-intercom "return_cancel" stage (docs/14 in that
+// repo, ~17dB measured removal on their bench). Distinct problem from the
+// primary AEC3 instance and from the half-duplex/hold-the-floor gates above:
+// those decide who gets to speak; this actually cancels the specific,
+// well-defined echo of "the door replaying what we just sent it" out of what
+// it sends back, the same way the primary AEC3 instance cancels our own
+// speaker bleeding into our own mic. Reference signal is our own outgoing
+// (post-AEC3, post-gain) uplink PCM, fed as this instance's "render" side
+// in on_new_capture_sample; the door's downlink PCM is fed as its "capture"
+// side in handle_play_downlink, and the cancelled result is what actually
+// reaches the speaker.
+#define SYNCN_RETURN_CANCEL_NOISE_SUPPRESS_DB 0.0
+
 static int g_half_duplex_enabled = -1;
 static int g_hd_threshold = -1;
 static int g_hd_hangover_ms = -1;
@@ -399,21 +428,6 @@ static int syncn_alaw_mean_level(const uint8_t *data, size_t size) {
     return (int) (total / (int64_t) size);
 }
 
-// Pre-built A-law digital silence, substituted for the real uplink payload
-// while the far end is speaking. Static so the capture callback never
-// allocates on its hot path.
-#define SYNCN_HD_SILENCE_MAX 512
-static uint8_t g_alaw_silence[SYNCN_HD_SILENCE_MAX];
-static bool g_alaw_silence_ready = false;
-
-static const uint8_t *syncn_alaw_silence(size_t size) {
-    if (!g_alaw_silence_ready) {
-        memset(g_alaw_silence, 0xD5, sizeof(g_alaw_silence));
-        g_alaw_silence_ready = true;
-    }
-    return (size <= SYNCN_HD_SILENCE_MAX) ? g_alaw_silence : NULL;
-}
-
 struct syncn_intercom_audio {
     struct flutterpi *flutterpi;
 
@@ -445,6 +459,27 @@ struct syncn_intercom_audio {
     // any earlier risks a capture/render callback still in flight on a
     // GStreamer streaming thread using a freed pointer.
     struct syncn_aec3 *aec3;
+
+    // Return canceller (2026-09-20) -- see its define block above for the
+    // full rationale. Same threading/lifetime treatment as aec3: set once in
+    // start_locked() before either pipeline runs, read (never mutated) by
+    // both streaming callbacks without a lock, destroyed in
+    // teardown_unlocked() after both pipelines have settled.
+    struct syncn_aec3 *return_aec3;
+
+    // Bandpass filter state (2026-09-20), one instance per direction since
+    // each has its own running filter history. Uplink instance is only ever
+    // touched by on_new_capture_sample (capture GStreamer thread); downlink
+    // instance only by handle_play_downlink (platform thread) -- no lock
+    // needed, same reasoning as the AEC3 instances above.
+    struct syncn_bandpass_state uplink_bandpass;
+    struct syncn_bandpass_state downlink_bandpass;
+
+    // Noise gate state (2026-09-20), same per-direction/no-lock treatment.
+    struct syncn_noise_gate_state uplink_noise_gate;
+    struct syncn_noise_gate_state downlink_noise_gate;
+    uint32_t uplink_comfort_rng;
+    uint32_t downlink_comfort_rng;
 
     int playback_count;
     int capture_count;
@@ -491,7 +526,7 @@ struct syncn_intercom_audio {
 // tries to acquire `self->lock` itself -- calling it while still holding the
 // lock deadlocks the platform thread against the streaming thread, freezing
 // the whole panel (confirmed on-device, same failure mode as the video plugin).
-static void teardown_locked(struct syncn_intercom_audio *self, GstElement **playback_out, GstElement **capture_out, struct syncn_aec3 **aec3_out) {
+static void teardown_locked(struct syncn_intercom_audio *self, GstElement **playback_out, GstElement **capture_out, struct syncn_aec3 **aec3_out, struct syncn_aec3 **return_aec3_out) {
     *playback_out = self->playback_pipeline;
     self->playback_pipeline = NULL;
     self->playback_appsrc = NULL;
@@ -504,15 +539,19 @@ static void teardown_locked(struct syncn_intercom_audio *self, GstElement **play
     *aec3_out = self->aec3;
     self->aec3 = NULL;
 
+    *return_aec3_out = self->return_aec3;
+    self->return_aec3 = NULL;
+
     self->running = false;
 }
 
-static void teardown_unlocked(GstElement *playback_pipeline, GstElement *capture_pipeline, struct syncn_aec3 *aec3) {
+static void teardown_unlocked(GstElement *playback_pipeline, GstElement *capture_pipeline, struct syncn_aec3 *aec3, struct syncn_aec3 *return_aec3) {
     syncn_gst_bounded_teardown("audio-playback", playback_pipeline, 3);
     syncn_gst_bounded_teardown("audio-capture", capture_pipeline, 3);
     // Only safe once both pipelines above have actually settled -- see the
     // comment on struct syncn_intercom_audio's aec3 field.
     syncn_aec3_destroy(aec3);
+    syncn_aec3_destroy(return_aec3);
 }
 
 // Called on a GStreamer streaming thread.
@@ -545,6 +584,7 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
     self->capture_count++;
     int count = self->capture_count;
     struct syncn_aec3 *aec3 = self->aec3;
+    struct syncn_aec3 *return_aec3 = self->return_aec3;
     pthread_mutex_unlock(&self->lock);
 
     bool should_log = count <= 30;
@@ -559,6 +599,18 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
         syncn_intercom_debug_log("audio", "on_new_capture_sample #%d: listening=%d, num_samples=%zu", count, listening, num_samples);
     }
 
+    // Telephony bandpass (2026-09-20, ported from the other team's
+    // syncn-intercom -- see syncn_intercom_dsp.h) ahead of AEC3, same
+    // ordering as their chain: strips DC/rumble and above-voice-band content
+    // before the canceller and gate ever see it, rather than fighting it
+    // downstream.
+    int16_t bandpass_out[160];
+    const int16_t *bandpass_pcm = pcm_in;
+    if (num_samples <= 160) {
+        syncn_bandpass_process(&self->uplink_bandpass, pcm_in, bandpass_out, num_samples);
+        bandpass_pcm = bandpass_out;
+    }
+
     // Run AEC3 on the mic PCM (2026-09-17) -- see syncn_intercom_aec3.h.
     // aec3_out holds the echo-cancelled result when AEC3 ran; falls back to
     // the raw mic signal (uncancelled, same as before this change existed)
@@ -566,11 +618,21 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
     // 160-sample/20ms requirement -- a call with no echo cancellation
     // beats no call, matching this file's existing posture elsewhere.
     int16_t aec3_out[160];
-    const int16_t *processed_pcm = pcm_in;
+    const int16_t *processed_pcm = bandpass_pcm;
     if (aec3 != NULL && num_samples == 160) {
-        if (syncn_aec3_process_capture(aec3, pcm_in, aec3_out, num_samples, 280)) {
+        if (syncn_aec3_process_capture(aec3, bandpass_pcm, aec3_out, num_samples, 280)) {
             processed_pcm = aec3_out;
         }
+    }
+
+    // Feed the return canceller's render/reference side with our own
+    // outgoing signal (2026-09-20) -- see the SYNCN_RETURN_CANCEL define
+    // block near the top of this file. Must happen every frame regardless of
+    // `listening`/half-duplex gating below, so its internal adaptive filter
+    // keeps tracking what we actually sent, matching handle_play_downlink's
+    // same "feed unconditionally" treatment of the primary AEC3 instance.
+    if (return_aec3 != NULL && num_samples == 160) {
+        syncn_aec3_process_render(return_aec3, processed_pcm, num_samples);
     }
 
     // Uplink hold-the-floor tracking (2026-09-20) -- see the struct field
@@ -616,9 +678,8 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
     // replacement for the alawenc element removed from the pipeline. Static
     // scratch buffer, safe because appsink's "new-sample" signal (which
     // calls this function) fires serially on a single GStreamer streaming
-    // thread -- never concurrently with itself -- matching the existing
-    // g_alaw_silence static buffer's same rationale just above in this
-    // file. Sized for the one fixed frame size this ever runs at (160
+    // thread -- never concurrently with itself. Sized for the one fixed
+    // frame size this ever runs at (160
     // samples); num_samples is re-checked against it below regardless.
     static uint8_t alaw_buf[160];
     size_t alaw_size = 0;
@@ -639,25 +700,47 @@ static GstFlowReturn on_new_capture_sample(GstAppSink *sink, gpointer userdata) 
     }
 
     if (listening && alaw_size > 0) {
-        // Half-duplex gate: while the far end is speaking, transmit A-law
-        // silence instead of whatever the mic picked up. See the comment
-        // block on half_duplex_enabled() -- what the mic picks up during
-        // far-end speech is dominated by speaker/DAC crosstalk that AEC has
+        // Half-duplex gate: while the far end is speaking, transmit comfort
+        // noise instead of whatever the mic picked up. See the comment block
+        // on half_duplex_enabled() -- what the mic picks up during far-end
+        // speech is dominated by speaker/DAC crosstalk that AEC has
         // repeatedly proven unable to remove, and sending it back is what
         // makes the far end hear themselves. Frame cadence and size are
         // unchanged (the door gates its downlink on continuous CC frames),
         // only the payload is replaced.
+        //
+        // Uplink noise gate (2026-09-20, ported from the other team's
+        // syncn-intercom -- see syncn_intercom_dsp.h): independently of the
+        // half-duplex gate above, also gate frames that are simply below the
+        // room noise floor -- quiet mic self-noise/hum that AEC/bandpass
+        // don't fully remove, not related to far-end speech at all.
+        //
+        // Both cases substitute comfort noise (SYNCN_COMFORT_NOISE_DBFS)
+        // rather than hard A-law silence (0xD5 repeated): this door reads
+        // sustained true digital silence as "line idle" and stops sending
+        // audio (see the other team's docs/14-audio-as-shipped.md) -- a
+        // protocol-compatibility concern this file's own half-duplex gate
+        // predates and never accounted for.
+        static uint8_t comfort_alaw_buf[160];
         const uint8_t *payload = alaw_buf;
         bool suppressed = false;
+        bool half_duplex_gated = false;
         if (half_duplex_enabled()) {
             gint64 since_us = g_get_monotonic_time() - self->last_downlink_voice_us;
-            if (since_us < (gint64) g_hd_hangover_ms * 1000) {
-                const uint8_t *silence = syncn_alaw_silence(alaw_size);
-                if (silence != NULL) {
-                    payload = silence;
-                    suppressed = true;
-                }
+            half_duplex_gated = since_us < (gint64) g_hd_hangover_ms * 1000;
+        }
+
+        double uplink_rms = syncn_pcm_rms(processed_pcm, num_samples);
+        bool noise_gated = syncn_noise_gate_update(&self->uplink_noise_gate, uplink_rms, g_get_monotonic_time());
+
+        if (half_duplex_gated || noise_gated) {
+            int16_t comfort_pcm[160];
+            syncn_comfort_noise_fill(comfort_pcm, alaw_size, SYNCN_COMFORT_NOISE_DBFS, &self->uplink_comfort_rng);
+            for (size_t i = 0; i < alaw_size; i++) {
+                comfort_alaw_buf[i] = syncn_alaw_compress(comfort_pcm[i]);
             }
+            payload = comfort_alaw_buf;
+            suppressed = true;
         }
 
         struct std_value event = {
@@ -1220,6 +1303,30 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
         LOG_ERROR("syncn_intercom_audio: failed to create AEC3 instance -- proceeding without echo cancellation\n");
     }
 
+    // Return canceller (2026-09-20) -- see its define block near the top of
+    // this file. Own AEC3 instance, own (zero) starting delay estimate: its
+    // "render" reference (our own outgoing uplink) and "capture" input (the
+    // door's downlink) arrive over the same in-process call path with no
+    // jitter-queue/ALSA buffering between them, unlike the primary AEC3
+    // instance's ~280ms acoustic round trip -- so 0 is the right starting
+    // point here, refined the same way via set_stream_delay_ms on every
+    // frame. No makeup gain (capture_gain_db=0.0): this instance's job is
+    // cancellation only, downlink gain is applied separately (playvol).
+    struct syncn_aec3 *return_aec3 = syncn_aec3_create(8000, 1, 0, /* noise_suppression_enabled */ false, /* capture_gain_db */ 0.0);
+    if (return_aec3 == NULL) {
+        LOG_ERROR("syncn_intercom_audio: failed to create return-canceller AEC3 instance -- proceeding without return cancellation\n");
+    }
+
+    // Bandpass + noise gate state (2026-09-20), ported from the other team's
+    // syncn-intercom -- see syncn_intercom_dsp.h. Fresh per call start so
+    // filter history/gate timers never carry over from a previous call.
+    syncn_bandpass_init(&self->uplink_bandpass, 8000, SYNCN_BANDPASS_HIGHPASS_HZ, SYNCN_BANDPASS_LOWPASS_HZ);
+    syncn_bandpass_init(&self->downlink_bandpass, 8000, SYNCN_BANDPASS_HIGHPASS_HZ, SYNCN_BANDPASS_LOWPASS_HZ);
+    syncn_noise_gate_init(&self->uplink_noise_gate, SYNCN_UPLINK_NOISE_FLOOR_DBFS, SYNCN_NOISE_GATE_HANGOVER_MS);
+    syncn_noise_gate_init(&self->downlink_noise_gate, SYNCN_DOWNLINK_NOISE_FLOOR_DBFS, SYNCN_NOISE_GATE_HANGOVER_MS);
+    self->uplink_comfort_rng = 0x9E3779B9u;
+    self->downlink_comfort_rng = 0x85EBCA6Bu;
+
     self->playback_pipeline = playback;
     self->playback_appsrc = playback_appsrc;
     self->capture_pipeline = capture;
@@ -1227,8 +1334,9 @@ static bool start_locked(struct syncn_intercom_audio *self, bool capture_enabled
     self->capture_volume = capture_volume;
     self->capture_enabled = capture_enabled && capture != NULL;
     self->aec3 = aec3;
+    self->return_aec3 = return_aec3;
     self->running = true;
-    syncn_intercom_debug_log("audio", "start_locked: SUCCESS, capture_enabled=%d (requested %d), aec3=%d", self->capture_enabled, capture_enabled, aec3 != NULL);
+    syncn_intercom_debug_log("audio", "start_locked: SUCCESS, capture_enabled=%d (requested %d), aec3=%d, return_aec3=%d", self->capture_enabled, capture_enabled, aec3 != NULL, return_aec3 != NULL);
     return true;
 }
 
@@ -1256,6 +1364,7 @@ static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_
     bool running = self->running;
     GstElement *playback_appsrc = self->playback_appsrc;
     struct syncn_aec3 *aec3 = self->aec3;
+    struct syncn_aec3 *return_aec3 = self->return_aec3;
     pthread_mutex_unlock(&self->lock);
 
     bool should_log = count <= 30;
@@ -1308,41 +1417,103 @@ static void handle_play_downlink(struct syncn_intercom_audio *self, const uint8_
         syncn_aec3_process_render(aec3, pcm, size);
     }
 
-    if (running && playback_appsrc != NULL && size > 0) {
-        GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
-        gst_buffer_fill(buffer, 0, data, size);
+    // Return-canceller + downlink bandpass + downlink noise gate
+    // (2026-09-20, ported from the other team's syncn-intercom -- see the
+    // SYNCN_RETURN_CANCEL define block and syncn_intercom_dsp.h). Decoded
+    // once here (separately from the AEC3 render-feed decode above, which
+    // only measures/references -- this is the actual signal that reaches
+    // the speaker) so a single processed buffer can be pushed to appsrc
+    // below instead of the raw `data` bytes.
+    //
+    // Order: return-cancel first (strips OUR OWN voice the door is
+    // replaying back at us, before it can pollute the bandpass filter's
+    // history or the noise gate's level measurement), then bandpass, then
+    // the noise gate/comfort-noise substitution, mirroring the uplink
+    // chain's own ordering in on_new_capture_sample.
+    static uint8_t downlink_alaw_buf[160];
+    const uint8_t *downlink_payload = data;
+    size_t downlink_payload_size = size;
+    if (size == 160) {
+        int16_t pcm[160];
+        for (size_t i = 0; i < size; i++) {
+            pcm[i] = (int16_t) syncn_alaw_expand(data[i]);
+        }
+
+        int16_t return_cancelled[160];
+        const int16_t *downlink_pcm = pcm;
+        if (return_aec3 != NULL) {
+            if (syncn_aec3_process_capture(return_aec3, pcm, return_cancelled, size, 0)) {
+                downlink_pcm = return_cancelled;
+            }
+        }
+
+        int16_t bandpass_out[160];
+        syncn_bandpass_process(&self->downlink_bandpass, downlink_pcm, bandpass_out, size);
+
+        // Speaker mute while the panel talker holds the floor (2026-09-20):
+        // the other team's docs/14-audio-as-shipped.md mutes the speaker
+        // for the same duration as their hold, on the same reasoning as the
+        // uplink half-duplex gate above -- while the panel is confidently
+        // speaking, whatever the door sends back is overwhelmingly the
+        // panel's own voice returning, not new content worth playing, and
+        // playing it back only re-feeds the return canceller's job. Distinct
+        // from the return canceller itself: that cancels a known, correlated
+        // echo; this suppresses everything during a period where nothing
+        // useful is expected regardless of whether cancellation caught it.
+        double downlink_rms = syncn_pcm_rms(bandpass_out, size);
+        bool noise_gated = syncn_noise_gate_update(&self->downlink_noise_gate, downlink_rms, now_us);
+
+        int16_t final_pcm[160];
+        if (panel_holds_floor || noise_gated) {
+            syncn_comfort_noise_fill(final_pcm, size, SYNCN_COMFORT_NOISE_DBFS, &self->downlink_comfort_rng);
+        } else {
+            memcpy(final_pcm, bandpass_out, size * sizeof(int16_t));
+        }
+
+        for (size_t i = 0; i < size; i++) {
+            downlink_alaw_buf[i] = syncn_alaw_compress(final_pcm[i]);
+        }
+        downlink_payload = downlink_alaw_buf;
+        downlink_payload_size = size;
+    }
+
+    if (running && playback_appsrc != NULL && downlink_payload_size > 0) {
+        GstBuffer *buffer = gst_buffer_new_allocate(NULL, downlink_payload_size, NULL);
+        gst_buffer_fill(buffer, 0, downlink_payload, downlink_payload_size);
         GstFlowReturn ret;
         g_signal_emit_by_name(playback_appsrc, "push-buffer", buffer, &ret);
         gst_buffer_unref(buffer);
         if (should_log) {
-            // Diagnostic only (2026-08-25): logs whether the raw A-law bytes
-            // received actually vary (real audio) or are constant (digital
-            // silence, A-law encodes silence as a constant 0xD5 byte) --
-            // added after a "no audio" report survived a confirmed-working
-            // pipeline/hardware/PulseAudio path, narrowing down whether the
-            // problem is upstream (nothing real being received) or in this
-            // pipeline (real data failing to render).
-            uint8_t min_byte = data[0];
-            uint8_t max_byte = data[0];
-            for (size_t i = 1; i < size; i++) {
-                if (data[i] < min_byte) min_byte = data[i];
-                if (data[i] > max_byte) max_byte = data[i];
+            // Diagnostic only (2026-08-25): logs whether the OUTGOING (post
+            // return-cancel/bandpass/gate as of 2026-09-20) A-law bytes
+            // actually vary (real audio) or are constant (digital silence /
+            // comfort noise reads as varying, true A-law silence is a
+            // constant 0xD5 byte) -- added after a "no audio" report
+            // survived a confirmed-working pipeline/hardware/PulseAudio
+            // path, narrowing down whether the problem is upstream (nothing
+            // real being received) or in this pipeline (real data failing
+            // to render).
+            uint8_t min_byte = downlink_payload[0];
+            uint8_t max_byte = downlink_payload[0];
+            for (size_t i = 1; i < downlink_payload_size; i++) {
+                if (downlink_payload[i] < min_byte) min_byte = downlink_payload[i];
+                if (downlink_payload[i] > max_byte) max_byte = downlink_payload[i];
             }
             syncn_intercom_debug_log(
                 "audio",
                 "handle_play_downlink #%d: pushed %zu bytes, ret=%d, byte range [0x%02x, 0x%02x] (0xd5=A-law silence)",
                 count,
-                size,
+                downlink_payload_size,
                 ret,
                 min_byte,
                 max_byte
             );
         } else if (diag_log) {
-            struct syncn_alaw_buffer_stats stats = syncn_alaw_stats(data, size);
+            struct syncn_alaw_buffer_stats stats = syncn_alaw_stats(downlink_payload, downlink_payload_size);
             syncn_intercom_debug_log(
                 "audio-diag",
                 "handle_play_downlink #%d: pushed %zu bytes, ret=%d, byte range [0x%02x, 0x%02x], distinct=%d, constant=%d",
-                count, size, ret, stats.min_byte, stats.max_byte, stats.distinct_count, stats.is_constant
+                count, downlink_payload_size, ret, stats.min_byte, stats.max_byte, stats.distinct_count, stats.is_constant
             );
         }
     } else if (should_log) {
@@ -1486,10 +1657,10 @@ static void on_method_channel_message(void *userdata, const FlutterPlatformMessa
     } else if (strcmp(object.method, "stop") == 0) {
         pthread_mutex_lock(&self->lock);
         GstElement *playback_pipeline, *capture_pipeline;
-        struct syncn_aec3 *aec3;
-        teardown_locked(self, &playback_pipeline, &capture_pipeline, &aec3);
+        struct syncn_aec3 *aec3, *return_aec3;
+        teardown_locked(self, &playback_pipeline, &capture_pipeline, &aec3, &return_aec3);
         pthread_mutex_unlock(&self->lock);
-        teardown_unlocked(playback_pipeline, capture_pipeline, aec3);
+        teardown_unlocked(playback_pipeline, capture_pipeline, aec3, return_aec3);
         platch_respond_success_std(message->response_handle, NULL);
     } else {
         platch_respond_not_implemented(message->response_handle);
@@ -1563,10 +1734,10 @@ void syncn_intercom_audio_deinit(struct flutterpi *flutterpi, void *userdata) {
 
     pthread_mutex_lock(&self->lock);
     GstElement *playback_pipeline, *capture_pipeline;
-    struct syncn_aec3 *aec3;
-    teardown_locked(self, &playback_pipeline, &capture_pipeline, &aec3);
+    struct syncn_aec3 *aec3, *return_aec3;
+    teardown_locked(self, &playback_pipeline, &capture_pipeline, &aec3, &return_aec3);
     pthread_mutex_unlock(&self->lock);
-    teardown_unlocked(playback_pipeline, capture_pipeline, aec3);
+    teardown_unlocked(playback_pipeline, capture_pipeline, aec3, return_aec3);
 
     pthread_mutex_destroy(&self->lock);
     free(self);
