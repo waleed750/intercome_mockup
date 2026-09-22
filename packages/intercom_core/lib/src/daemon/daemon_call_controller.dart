@@ -63,6 +63,7 @@ final class DaemonCallController extends ChangeNotifier {
 
   bool _wasRinging = false;
   bool _videoActiveForPhase = false;
+  CallPhase? _videoActivePhase;
 
   void refreshIdentity() {
     final id = deviceConfig.identity;
@@ -132,13 +133,39 @@ final class DaemonCallController extends ChangeNotifier {
     final shouldHaveVideo = phase == CallPhase.ringing ||
         phase == CallPhase.connected ||
         phase == CallPhase.previewing;
-    if (shouldHaveVideo && !_videoActiveForPhase) {
+    // A preview -> ringing/connected transition (a real call arriving while
+    // previewing) needs a full stop+restart of the video pipeline, not just
+    // "leave it active": the daemon's preview and the incoming call are two
+    // separate IPC connections server-side (confirmed via panel journal --
+    // "ipc: UI disconnected" fires the moment the real call's socket
+    // replaces the preview's), so the preview's subscribe_video was already
+    // forgotten by the daemon. shouldHaveVideo staying true across that
+    // transition previously left _videoActiveForPhase untouched, so
+    // _video.start()/stop() were never called again and the native
+    // syncn_video.c plugin kept its stale "connected" socket instead of
+    // reconnecting and resubscribing -- every decoded frame during the call
+    // was then silently dropped (dropped_sink) with audio unaffected.
+    // Confirmed on-device 2026-09-22 (panel-v1.4.2): decoder healthy
+    // (errors=0, starved=0) but shown=0 for the whole call.
+    final wasPreviewing = _videoActivePhase == CallPhase.previewing;
+    final enteringCallFromPreview = wasPreviewing &&
+        (phase == CallPhase.ringing || phase == CallPhase.connected);
+    if (shouldHaveVideo && enteringCallFromPreview) {
       _videoActiveForPhase = true;
+      _videoActivePhase = phase;
+      unawaited(_video.stop().then((_) => _video.start()).then((_) =>
+          _setState(_state.copyWith(hasVideoFrames: _video.textureId != null))));
+    } else if (shouldHaveVideo && !_videoActiveForPhase) {
+      _videoActiveForPhase = true;
+      _videoActivePhase = phase;
       unawaited(_video.start().then((_) => _setState(_state.copyWith(
             hasVideoFrames: _video.textureId != null,
           ))));
+    } else if (shouldHaveVideo) {
+      _videoActivePhase = phase;
     } else if (!shouldHaveVideo && _videoActiveForPhase) {
       _videoActiveForPhase = false;
+      _videoActivePhase = null;
       unawaited(_video.stop());
     }
 
