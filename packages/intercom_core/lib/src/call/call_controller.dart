@@ -678,9 +678,22 @@ final class CallController extends ChangeNotifier {
         // call's own state right below.
         if (_state.phase == CallPhase.previewing) {
           debugPrint('Intercom: incoming call during preview -- stopping preview');
+          // stopVideo: true is required here, not just tidiness. The
+          // preview's syncn/video native socket subscribed as one IPC
+          // client; the daemon already dropped that client (this new call
+          // arrived on its own connection -- see the comment above on
+          // closeConnection: false). Without stopping the native plugin
+          // here, its socket looks still-connected to it, so the
+          // _video.start() a few lines below skips connect_daemon() (and
+          // therefore the subscribe_video resend) entirely -- the daemon
+          // then has zero subscribed clients for the rest of the call and
+          // silently drops every decoded frame (dropped_sink). Confirmed
+          // on-device 2026-09-22: audio/call worked, video never appeared,
+          // decoder stats showed shown=0 for the whole call.
           await _teardownCall(
             showEnded: false,
             resumePreview: false,
+            stopVideo: true,
             closeConnection: false,
             closeReason: 'preview replaced by incoming call',
           );
