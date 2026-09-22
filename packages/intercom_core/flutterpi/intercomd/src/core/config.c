@@ -45,7 +45,7 @@ void syncn_config_defaults(syncn_config *cfg)
     cfg->mic_gain_db = 6;
     cfg->aec_tail_ms      = 200;
     cfg->aec_delay_ms     = 80;
-    cfg->jitter_target_ms = 60;
+    cfg->jitter_target_ms = 20;
     cfg->gate_threshold_dbfs = -30.0f;
     cfg->gate_hangover_ms    = 150.0f;
     cfg->uplink_ceiling_dbfs = -1.0f;

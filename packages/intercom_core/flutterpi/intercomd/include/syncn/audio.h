@@ -69,7 +69,7 @@ typedef struct {
     float             presence_db;            /* 3 shipped    */
     int               mic_gain_db;
     int               speaker_gain_db;
-    int               jitter_target_ms; /* 0 -> 60                    */
+    int               jitter_target_ms; /* 0 -> 20                    */
     float             gate_threshold_dbfs; /* half-duplex gate closes above; 0 -> -30 */
     float             gate_hangover_ms;    /* stays closed after far goes quiet; 0 -> 150 */
     float             uplink_ceiling_dbfs; /* peak limiter; 0 disables; -1 typical */

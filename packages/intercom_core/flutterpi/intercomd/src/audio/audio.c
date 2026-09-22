@@ -20,7 +20,7 @@
 #define HOLD_AFTER_TICKS ((int)(300 / SYNCN_AUDIO_FRAME_MS))
 #define HOLD_FOR_TICKS   ((int)(600 / SYNCN_AUDIO_FRAME_MS))
 #define RATE           ((int)SYNCN_AUDIO_RATE)            /* 8000             */
-#define PRIME_PERIODS  3
+#define PRIME_PERIODS  1
 
 /* Fallback for the half-duplex gate when the config gives nothing: -34 dBFS,
  * which ordinary speech trips and room noise does not. The live value comes
@@ -214,7 +214,7 @@ void syncn_audio_config_defaults(syncn_audio_config *cfg)
     cfg->presence_hz      = 2000;
     cfg->presence_db      = 0.0f;   /* +3 was heard as noise; off */
     cfg->duplex           = SYNCN_DUPLEX_FULL;
-    cfg->jitter_target_ms = 60;
+    cfg->jitter_target_ms = 20;
     cfg->near_priority_db = 0.0f;   /* off: see audio.h */
     cfg->denoise          = SYNCN_DENOISE_SPEEX;
     cfg->denoise_downlink = SYNCN_DENOISE_SPEEX;
@@ -887,7 +887,7 @@ syncn_audio *syncn_audio_start(const syncn_audio_config *cfg,
     if (!a->cfg.playback_device)  a->cfg.playback_device = "default";
     if (a->cfg.aec_tail_ms <= 0)  a->cfg.aec_tail_ms     = 200;
     if (a->cfg.aec_delay_ms <= 0) a->cfg.aec_delay_ms    = 80;
-    if (a->cfg.jitter_target_ms <= 0) a->cfg.jitter_target_ms = 60;
+    if (a->cfg.jitter_target_ms <= 0) a->cfg.jitter_target_ms = 20;
 
     a->mic_dbfs      = -96.0f;
     a->uplink_dbfs   = -96.0f;
