@@ -64,6 +64,11 @@ final class DaemonCallController extends ChangeNotifier {
   bool _wasRinging = false;
   bool _videoActiveForPhase = false;
   CallPhase? _videoActivePhase;
+  bool _shutdown = false;
+  Future<void> _videoLifecycle = Future<void>.value();
+  bool _videoWanted = false;
+  CallPhase? _videoWantedPhase;
+  bool _videoRestartWanted = false;
 
   void refreshIdentity() {
     final id = deviceConfig.identity;
@@ -77,6 +82,7 @@ final class DaemonCallController extends ChangeNotifier {
   }
 
   Future<void> shutdown() async {
+    _shutdown = true;
     _client.removeListener(_onDaemonStateChanged);
     await _stopVideoIfActive();
     _client.dispose();
@@ -150,24 +156,10 @@ final class DaemonCallController extends ChangeNotifier {
     final wasPreviewing = _videoActivePhase == CallPhase.previewing;
     final enteringCallFromPreview = wasPreviewing &&
         (phase == CallPhase.ringing || phase == CallPhase.connected);
-    if (shouldHaveVideo && enteringCallFromPreview) {
-      _videoActiveForPhase = true;
-      _videoActivePhase = phase;
-      unawaited(_video.stop().then((_) => _video.start()).then((_) =>
-          _setState(_state.copyWith(hasVideoFrames: _video.textureId != null))));
-    } else if (shouldHaveVideo && !_videoActiveForPhase) {
-      _videoActiveForPhase = true;
-      _videoActivePhase = phase;
-      unawaited(_video.start().then((_) => _setState(_state.copyWith(
-            hasVideoFrames: _video.textureId != null,
-          ))));
-    } else if (shouldHaveVideo) {
-      _videoActivePhase = phase;
-    } else if (!shouldHaveVideo && _videoActiveForPhase) {
-      _videoActiveForPhase = false;
-      _videoActivePhase = null;
-      unawaited(_video.stop());
-    }
+    _videoWanted = shouldHaveVideo;
+    _videoWantedPhase = shouldHaveVideo ? phase : null;
+    _videoRestartWanted = _videoRestartWanted || enteringCallFromPreview;
+    _queueVideoLifecycle();
 
     _setState(_state.copyWith(
       phase: phase,
@@ -180,10 +172,57 @@ final class DaemonCallController extends ChangeNotifier {
   }
 
   Future<void> _stopVideoIfActive() async {
-    if (_videoActiveForPhase) {
+    _videoWanted = false;
+    _videoWantedPhase = null;
+    _videoRestartWanted = false;
+    await (_videoLifecycle = _videoLifecycle.then((_) async {
+      if (_videoActiveForPhase) {
+        await _video.stop();
+        _videoActiveForPhase = false;
+        _videoActivePhase = null;
+      }
+    }));
+  }
+
+  /// Platform-channel stop/start calls must never overlap. The old code
+  /// launched them with `unawaited`, so a quick idle -> ringing -> connected
+  /// sequence could execute `start` before the previous `stop` had released
+  /// the native IPC socket. That left the daemon decoding frames for a dead
+  /// subscriber after the second or third call.
+  void _queueVideoLifecycle() {
+    _videoLifecycle = _videoLifecycle.then((_) async {
+      final wanted = _videoWanted;
+      final phase = _videoWantedPhase;
+      final restart = _videoRestartWanted;
+      _videoRestartWanted = false;
+
+      if (!wanted) {
+        if (_videoActiveForPhase) {
+          await _video.stop();
+          _videoActiveForPhase = false;
+          _videoActivePhase = null;
+        }
+        return;
+      }
+
+      if (restart && _videoActiveForPhase) {
+        await _video.stop();
+        _videoActiveForPhase = false;
+        _videoActivePhase = null;
+      }
+      if (!_videoActiveForPhase) {
+        await _video.start();
+        _videoActiveForPhase = true;
+      }
+      _videoActivePhase = phase;
+      if (!_shutdown) {
+        _setState(_state.copyWith(hasVideoFrames: _video.textureId != null));
+      }
+    }).catchError((Object error, StackTrace stack) {
+      debugPrint('intercom video lifecycle failed: $error\n$stack');
       _videoActiveForPhase = false;
-      await _video.stop();
-    }
+      _videoActivePhase = null;
+    });
   }
 
   Future<void> connectToDoor(String host, {int port = 0}) async {

@@ -51,6 +51,8 @@ struct syncn_call {
     bool  audio_wanted;        /* false for preview   */
     bool  start_talk_sent;
     bool  audio_failed;   /* reported once, not every loop iteration */
+    uint64_t next_audio_retry_ms;
+    unsigned audio_retry_count;
     uint64_t start_talk_due_ms;
     uint64_t next_stats_ms;
 
@@ -367,8 +369,15 @@ static void audio_start(syncn_call *c)
     ac.jitter_target_ms = c->cfg.jitter_target_ms;
 
     c->audio = syncn_audio_start(&ac, on_uplink_audio, c);
-    if (!c->audio)
+    if (!c->audio) {
         LOG_ERR("call: audio failed to start — the call will be video only");
+        c->next_audio_retry_ms = syncn_now_ms() + 500;
+        c->audio_retry_count++;
+    } else {
+        c->next_audio_retry_ms = 0;
+        c->audio_retry_count = 0;
+        c->audio_failed = false;
+    }
 }
 
 static void audio_stop(syncn_call *c)
@@ -440,6 +449,9 @@ static void teardown(syncn_call *c, const char *why)
     c->preview_is_auto = false;
 
     audio_stop(c);
+    c->audio_wanted = false;
+    c->next_audio_retry_ms = 0;
+    c->audio_retry_count = 0;
     stop_video_pipeline(c);
     close_video_dump(c);
     c->video_frames = 0;
@@ -1074,6 +1086,26 @@ void syncn_call_run(syncn_call *c, bool interactive)
             LOG_ERR("call: the audio engine has stopped — the call continues "
                     "with video only");
             publish_state(c);
+            /* Release the failed ALSA handles before the retry. Without this,
+             * audio_start() sees a non-NULL engine and silently refuses to
+             * recreate it for the remainder of the call. */
+            syncn_audio_stop(c->audio);
+            c->audio = NULL;
+            c->next_audio_retry_ms = syncn_now_ms() + 500;
+            c->audio_retry_count++;
+        }
+
+        /* ALSA can still be busy for a short interval after the previous
+         * session closes. Retry a failed audio open while the call remains
+         * connected instead of permanently accepting a video-only call. */
+        if (c->audio_wanted &&
+            c->state == SYNCN_CALL_CONNECTED && !c->audio &&
+            syncn_now_ms() >= c->next_audio_retry_ms &&
+            c->audio_retry_count < 6) {
+            LOG_WARN("call: retrying audio start (%u/6)", c->audio_retry_count + 1);
+            audio_start(c);
+            if (c->audio)
+                publish_state(c);
         }
 
         if (syncn_now_ms() >= c->next_stats_ms) {
