@@ -548,6 +548,24 @@ static void disconnect(void)
         g.pending_fd = -1;
     }
     g.in_len = 0;
+    /*
+     * Free whatever is already sitting in the retired list BEFORE adding
+     * this session's cache to it. Those entries were only ever retired
+     * because a replacement frame had already been imported and handed to
+     * Flutter (see retire_import()'s callers: the geometry-mismatch path in
+     * handle_frame() and the video_reset handler in handle_line()) -- i.e.
+     * Flutter had already moved on to a newer texture by the time each of
+     * those entries got here. Nothing will ever call on_frame_done_task()
+     * for them now (the socket that would have carried frame_done is what
+     * just closed), so the existing "freed once a newer frame comes back"
+     * path (free_retired(), called from on_frame_done_task) would never run
+     * again on this connection, leaking one GL texture + EGL image + DMA-BUF
+     * fd per retirement across every reconnect for the life of the process.
+     * Confirmed on-device 2026-09-22: exactly this leaked flutter-pi's RSS
+     * from ~195MB to 557MB+ within 30 seconds of repeated preview/call churn
+     * on a "syncn_video: daemon socket closed" disconnect.
+     */
+    free_retired();
     /* The daemon reclaims its pool on our disconnect; our imports hold their
      * own references to the memory, so retiring them is safe. */
     sv_cache_clear(&g.cache, retire_import, NULL);
